@@ -643,9 +643,10 @@ class Pi05TorchFrontendRtx:
         # because the buffers are read by the captured graph.
         self._sde = bool(sde)
         # Prefix (SigLIP + Gemma-2B) precision: "fp8" (per-tensor, calibrated)
-        # or "nvfp4" (sm_120a): the FFNs — about 90% of the prefix GEMM work —
-        # run block-scaled 4-bit weights and activations with the quantization
-        # fused into their producers, the attention projections stay FP8.
+        # or "nvfp4" (sm_120a): every SigLIP GEMM and the Gemma FFNs run
+        # block-scaled 4-bit weights and activations with the quantization
+        # fused into their producers; the Gemma attention projections stay
+        # FP8.
         # The decoder is not affected. FLASHRT_PI05_PREFIX_PRECISION
         # overrides the default.
         self._prefix_precision = (prefix_precision
@@ -1199,7 +1200,7 @@ class Pi05TorchFrontendRtx:
         return q, swz, float(gs.item()), sf_lin
 
     def _quantize_ffn_nvfp4(self, inplace: bool = False) -> None:
-        """NVFP4 FFN weights for the prefix: SigLIP up / down (hidden padded
+        """NVFP4 prefix weights: SigLIP QKV / O and up / down (hidden padded
         to a multiple of 128 with zero rows, columns and bias) and the Gemma
         GeGLU — gate and up quantized separately, then row-interleaved
         (gate row i -> column 2i, up row i -> 2i + 1) for the GeGLU-fold GEMM —
@@ -1234,7 +1235,9 @@ class Pi05TorchFrontendRtx:
                 down = torch.zeros(VIS_D, hp, dtype=torch.bfloat16, device="cuda")
                 down[:, :VIS_H] = W["vision_ffn_down_w"][i].t()
                 table["vis"].append({"up": site(f"vu{i}", up), "up_b": keep_bias(f"vub{i}", up_b),
-                                     "down": site(f"vd{i}", down)})
+                                     "down": site(f"vd{i}", down),
+                                     "qkv": site(f"vq{i}", W["vision_attn_qkv_w"][i].t()),
+                                     "o": site(f"vo{i}", W["vision_attn_o_w"][i].t())})
             for i in range(ENC_L):
                 gq, gsf_swz, ga, gsf = self._nvfp4_weight(W["encoder_ffn_gate_w"][i].t())
                 uq, usf_swz, ua, usf = self._nvfp4_weight(W["encoder_ffn_up_w"][i].t())

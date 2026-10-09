@@ -499,6 +499,16 @@ class Pi05BatchedPipeline(Pi05Pipeline):
         Bb = self.bufs
         ap = self._attn_ptrs_b2
 
+        if self._ffn_fp4 and self._vis_attn_fp4 and use_fp8 and self.fp8_calibrated:
+            x_ptr = Bb["vision_x_b2"].ptr.value
+            self._vision_attn_nvfp4(
+                i, m, x_ptr, Bb["vision_QKV_b2"].ptr.value,
+                lambda: fvk.qkv_split(Bb["vision_QKV_b2"].ptr.value, ap["vis_Q"], ap["vis_K"], ap["vis_V"],
+                                      m, VIS_D, VIS_D, VIS_D, stream=stream),
+                lambda: self.attn.run_batched("siglip", i, q_seq=VIS_L, stream=stream), stream)
+            self._vision_ffn_nvfp4(i, m, x_ptr, stream)
+            return
+
         # Attention LayerNorm → x_norm
         fvk.layer_norm(
             Bb["vision_x_b2"].ptr.value,

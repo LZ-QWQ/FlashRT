@@ -1246,6 +1246,9 @@ class Pi05Pipeline:
                    "nvfp4_gemm_bias_res_bf16out", "fp4_swiglu_even_col_compact_v2"):
             if not hasattr(self.fvk, fn):
                 raise RuntimeError(f"prefix_precision='nvfp4' needs a GPU_ARCH=120 build ({fn} missing)")
+        # SigLIP attention projections run NVFP4 too; the Gemma ones stay FP8
+        # (4-bit Q/K at head_dim 256 costs ~0.2 action cosine on real frames).
+        self._vis_attn_fp4 = "qkv" in table["vis"][0]
         self._ffn_fp4_rows = 0
         self._ffn_fp4_ready = False
         self._ffn_fp4_one = CudaBuffer.from_numpy(np.ones(1, dtype=np.float32))
@@ -1305,6 +1308,33 @@ class Pi05Pipeline:
             if capturing.value:
                 raise RuntimeError("NVFP4 FFN scales must be prepared before graph capture")
             self._ffn_fp4_finalize()
+
+    def _vision_attn_nvfp4(self, i: int, m: int, x_ptr: int, qkv_ptr: int, split_fn, attn_fn,
+                           stream: int) -> None:
+        """x += attn(LayerNorm(x)) on NVFP4: pre-attn LayerNorm -> e2m1, QKV
+        GEMM with the bias in its epilogue, head split, attention, attention
+        output -> e2m1, O GEMM with bias and residual in its epilogue."""
+        self._ffn_fp4_check(m, stream)
+        fvk, W, B = self.fvk, self.weights, self.bufs
+        t = W["ffn_nvfp4"]["vis"][i]
+        x4, x4sf = B["ffn4_vis_x"].ptr.value, B["ffn4_vis_x_sf"].ptr.value
+        one = self._ffn_fp4_one.ptr.value
+
+        def _ck(rc, what):
+            if rc != 0:
+                raise RuntimeError(f"SigLIP NVFP4 attention {what} layer {i} failed: status {rc}")
+
+        _ck(fvk.nvfp4_norm_quant(x_ptr, W["vision_pre_attn_norm_w"][i], W["vision_pre_attn_norm_b"][i], 0, 1e-5,
+                                 x4, x4sf, one, m, VIS_D, stream), "norm")
+        w, sf, a = t["qkv"]
+        _ck(fvk.nvfp4_gemm_bias_res_bf16out(x4, w, x4sf, sf, W["vision_attn_qkv_b"][i], 0, qkv_ptr,
+                                            m, 3 * VIS_D, VIS_D, a, 0.0, 0, stream), "qkv")
+        split_fn()
+        o_ptr = attn_fn()
+        _ck(fvk.nvfp4_quant(o_ptr, VIS_D, x4, x4sf, one, m, VIS_D, stream), "o quant")
+        w, sf, a = t["o"]
+        _ck(fvk.nvfp4_gemm_bias_res_bf16out(x4, w, x4sf, sf, W["vision_attn_o_b"][i], x_ptr, x_ptr,
+                                            m, VIS_D, VIS_D, a, 1.0, 0, stream), "o")
 
     def _vision_ffn_nvfp4(self, i: int, m: int, x_ptr: int, stream: int) -> None:
         """x += FFN(LayerNorm(x)) on NVFP4: LayerNorm -> e2m1, up GEMM with
@@ -1509,11 +1539,13 @@ class Pi05Pipeline:
         # Layer-0 pre-attn LayerNorm runs here (the rest are fused into
         # the prior layer's post-FFN bias_residual, so each iteration
         # arrives with vision_x_norm already containing LN of vision_x).
-        fvk.layer_norm(
-            B["vision_x"].ptr.value,
-            W["vision_pre_attn_norm_w"][0], W["vision_pre_attn_norm_b"][0],
-            B["vision_x_norm"].ptr.value,
-            seq, VIS_D, 1e-5, stream=stream)
+        # The NVFP4 layers run their own norm straight to e2m1.
+        if not (self._ffn_fp4 and self._vis_attn_fp4 and use_fp8 and self.fp8_calibrated):
+            fvk.layer_norm(
+                B["vision_x"].ptr.value,
+                W["vision_pre_attn_norm_w"][0], W["vision_pre_attn_norm_b"][0],
+                B["vision_x_norm"].ptr.value,
+                seq, VIS_D, 1e-5, stream=stream)
 
         last = self.vision_num_layers - 1
         for i in range(self.vision_num_layers):
@@ -1548,6 +1580,18 @@ class Pi05Pipeline:
         attn_ptrs = self._attn_ptrs
         use_int8_vis = self.use_int8_vision
         use_int8_vis_static = self.use_int8_vision_static
+
+        if self._ffn_fp4 and self._vis_attn_fp4 and use_fp8 and self.fp8_calibrated:
+            # Whole layer on NVFP4: the pre-attn norm runs here (vision_x_norm
+            # is not used), the next layer runs its own.
+            x_ptr = B["vision_x"].ptr.value
+            self._vision_attn_nvfp4(
+                i, seq, x_ptr, B["vision_QKV"].ptr.value,
+                lambda: fvk.qkv_split(B["vision_QKV"].ptr.value, attn_ptrs["vis_Q"], attn_ptrs["vis_K"],
+                                      attn_ptrs["vis_V"], seq, VIS_D, VIS_D, VIS_D, stream=stream),
+                lambda: self.attn.run("siglip", i, q_seq=VIS_SEQ_PER_VIEW, stream=stream), stream)
+            self._vision_ffn_nvfp4(i, seq, x_ptr, stream)
+            return
 
         # QKV GEMM (static INT8 / dynamic INT8 / FP8 / BF16) → vision_QKV
         if use_int8_vis_static:
