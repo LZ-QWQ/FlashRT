@@ -1208,6 +1208,10 @@ class Pi05TorchFrontendRtx:
         fvk.nvfp4_sf_linear_to_swizzled(sf_lin.data_ptr(), swz.data_ptr(), N, K, True, 0)
         return q, swz, float(gs.item()), sf_lin
 
+    # Opt-in: Gemma attention output projection on NVFP4 too (static global
+    # scale from its FP8 calibration). The Q/K/V projections stay FP8.
+    _ENC_O_NVFP4 = os.environ.get("FLASHRT_PI05_ENC_O_NVFP4", "0") == "1"
+
     def _quantize_ffn_nvfp4(self, inplace: bool = False) -> None:
         """NVFP4 prefix weights: SigLIP QKV / O and up / down (hidden padded
         to a multiple of 128 with zero rows, columns and bias) and the Gemma
@@ -1266,8 +1270,11 @@ class Pi05TorchFrontendRtx:
                                       device="cuda")
                     fvk.nvfp4_sf_linear_to_swizzled(il_sf.data_ptr(), swz.data_ptr(), 2 * ENC_H, ENC_D, False, 0)
                     store[key] = (il, swz, ga, ua)
-                table["enc"].append({"gate_up": (store[key][0].data_ptr(), store[key][1].data_ptr(), ga, ua),
-                                     "down": site(f"ed{i}", W["encoder_ffn_down_w"][i].t())})
+                entry = {"gate_up": (store[key][0].data_ptr(), store[key][1].data_ptr(), ga, ua),
+                         "down": site(f"ed{i}", W["encoder_ffn_down_w"][i].t())}
+                if self._ENC_O_NVFP4:
+                    entry["o"] = site(f"eo{i}", W["encoder_attn_o_w"][i].t())
+                table["enc"].append(entry)
         self._ffn_nvfp4_store = store
         if inplace:
             self._ffn_nvfp4_weights["vis"][:] = table["vis"]

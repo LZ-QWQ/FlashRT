@@ -1250,6 +1250,7 @@ class Pi05Pipeline:
         # SigLIP attention projections run NVFP4 too; the Gemma ones stay FP8
         # (4-bit Q/K at head_dim 256 costs ~0.2 action cosine on real frames).
         self._vis_attn_fp4 = "qkv" in table["vis"][0]
+        self._enc_o_fp4 = "o" in table["enc"][0]
         self._ffn_fp4_rows = 0
         self._ffn_fp4_ready = False
         self._ffn_fp4_one = CudaBuffer.from_numpy(np.ones(1, dtype=np.float32))
@@ -1298,6 +1299,16 @@ class Pi05Pipeline:
                 gs = max(float(buf.download_new((1,), np.float32)[0]), 1e-12)
                 self._ffn_fp4_nc[(kind, i)] = CudaBuffer.from_numpy(np.array([1.0 / gs], dtype=np.float32))
                 self._ffn_fp4_alpha[(kind, i)] = gs * self.weights["ffn_nvfp4"][kind][i]["down"][2]
+        if self._enc_o_fp4:
+            # attention output -> NVFP4 with the static gs of its FP8 calibration
+            self._enc_o_gs = {}
+            for i in range(n_enc):
+                buf = self.fp8_act_scales.get(f"encoder_attn_o_w_{i}")
+                if buf is None:
+                    raise RuntimeError(f"no FP8 calibration scale for encoder_attn_o_w_{i}")
+                gs = max(float(buf.download_new((1,), np.float32)[0]), 1e-12)
+                self._enc_o_gs[i] = CudaBuffer.from_numpy(np.array([gs], dtype=np.float32))
+                self._ffn_fp4_alpha[("enc_o", i)] = gs * self.weights["ffn_nvfp4"]["enc"][i]["o"][2]
         self._ffn_fp4_ready = True
 
     def _ffn_fp4_check(self, rows: int, stream: int) -> None:
@@ -1940,8 +1951,21 @@ class Pi05Pipeline:
         # B2: Attention (GQA) — returns output pointer (no copy).
         enc_o_ptr = self.attn.run("encoder", i, q_seq=seq, stream=stream)
 
-        # B3: Attn output projection → x_norm
-        if use_int8_enc:
+        # B3: Attn output projection → x_norm (NVFP4 when the frontend
+        # quantized it: FLASHRT_PI05_ENC_O_NVFP4=1, ~1% faster, action cosine
+        # min 0.9990 vs 0.9992 on the LIBERO eval frames)
+        if fused and self._ffn_fp4 and self._enc_o_fp4 and self.fp8_calibrated:
+            self._ffn_fp4_check(seq, stream)
+            x4, x4sf = B["ffn4_enc_x"].ptr.value, B["ffn4_enc_x_sf"].ptr.value
+            o_w, o_sf, _ = self.weights["ffn_nvfp4"]["enc"][i]["o"]
+            rc = fvk.nvfp4_quant(enc_o_ptr, ENC_D, x4, x4sf, self._enc_o_gs[i].ptr.value, seq, ENC_D, stream)
+            if rc == 0:
+                rc = fvk.nvfp4_gemm_bias_res_bf16out(x4, o_w, x4sf, o_sf, self._ffn_fp4_zero_bias.ptr.value, 0,
+                                                     B["encoder_x_norm"].ptr.value, seq, ENC_D, ENC_D,
+                                                     self._ffn_fp4_alpha[("enc_o", i)], 0.0, 1, stream)
+            if rc != 0:
+                raise RuntimeError(f"Gemma NVFP4 attention output layer {i} failed: status {rc}")
+        elif use_int8_enc:
             self._enc_int8_gemm(
                 enc_o_ptr, seq * ENC_D,
                 f"encoder_attn_o_w_{i}",
