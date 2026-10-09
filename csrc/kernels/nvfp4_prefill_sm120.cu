@@ -39,12 +39,20 @@ __device__ __forceinline__ float block_sum(float v, float* red) {
 }
 
 __global__ void __launch_bounds__(1024)
-norm_quant_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight,
-                  const __nv_bfloat16* __restrict__ bias, int mode, float eps, uint8_t* __restrict__ out,
-                  uint8_t* __restrict__ out_sf, const float* __restrict__ gs, int dim) {
+norm_quant_kernel(__nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ residual,
+                  const __nv_bfloat16* __restrict__ weight, const __nv_bfloat16* __restrict__ bias, int mode,
+                  float eps, uint8_t* __restrict__ out, uint8_t* __restrict__ out_sf, const float* __restrict__ gs,
+                  int dim) {
     __shared__ float red[32];
     const int row = blockIdx.x, c0 = threadIdx.x * 4;
-    const uint2 xv = *reinterpret_cast<const uint2*>(x + static_cast<size_t>(row) * dim + c0);
+    uint2* xp = reinterpret_cast<uint2*>(x + static_cast<size_t>(row) * dim + c0);
+    uint2 xv = *xp;
+    if (residual != nullptr) {   // x += residual, BF16 residual stream updated in place
+        const uint2 rv = *reinterpret_cast<const uint2*>(residual + static_cast<size_t>(row) * dim + c0);
+        const float2 a = bf2(xv.x), b = bf2(xv.y), ra = bf2(rv.x), rb = bf2(rv.y);
+        xv = make_uint2(pack_bf2(a.x + ra.x, a.y + ra.y), pack_bf2(b.x + rb.x, b.y + rb.y));
+        *xp = xv;
+    }
     const float2 a = bf2(xv.x), b = bf2(xv.y);
     float v[4] = {a.x, a.y, b.x, b.y};
     if (mode == 0) {
@@ -134,12 +142,12 @@ size_t sf_bytes(int rows, int cols) {
     return static_cast<size_t>((rows + 127) / 128) * ((cols / 16 + 3) / 4) * 512;
 }
 
-int norm_quant(const __nv_bfloat16* x, const __nv_bfloat16* weight, const __nv_bfloat16* bias, int mode,
-               float eps, uint8_t* out, uint8_t* out_sf, const float* gs, int rows, int dim,
-               cudaStream_t stream) {
+int norm_quant(__nv_bfloat16* x, const __nv_bfloat16* residual, const __nv_bfloat16* weight,
+               const __nv_bfloat16* bias, int mode, float eps, uint8_t* out, uint8_t* out_sf, const float* gs,
+               int rows, int dim, cudaStream_t stream) {
     if (rows < 1 || dim % 128 != 0 || dim > 4096 || (mode != 0 && mode != 1) || (mode == 1 && bias != nullptr))
         return static_cast<int>(cudaErrorInvalidValue);
-    norm_quant_kernel<<<rows, dim / 4, 0, stream>>>(x, weight, bias, mode, eps, out, out_sf, gs, dim);
+    norm_quant_kernel<<<rows, dim / 4, 0, stream>>>(x, residual, weight, bias, mode, eps, out, out_sf, gs, dim);
     return static_cast<int>(cudaGetLastError());
 }
 

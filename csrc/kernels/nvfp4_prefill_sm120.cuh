@@ -21,10 +21,12 @@ size_t sf_bytes(int rows, int cols);
 
 // Row normalization straight to NVFP4: mode 0 = LayerNorm (weight / bias
 // optional), mode 1 = RMSNorm (weight optional, y = x * rsqrt(mean x^2 + eps) * w).
-// dim % 128 == 0, dim <= 4096; one CTA per row.
-int norm_quant(const __nv_bfloat16* x, const __nv_bfloat16* weight, const __nv_bfloat16* bias, int mode,
-               float eps, uint8_t* out, uint8_t* out_sf, const float* gs, int rows, int dim,
-               cudaStream_t stream);
+// With residual (nullable) the row is first updated in place, x += residual
+// (BF16), and the norm reads the updated row. dim % 128 == 0, dim <= 4096;
+// one CTA per row.
+int norm_quant(__nv_bfloat16* x, const __nv_bfloat16* residual, const __nv_bfloat16* weight,
+               const __nv_bfloat16* bias, int mode, float eps, uint8_t* out, uint8_t* out_sf, const float* gs,
+               int rows, int dim, cudaStream_t stream);
 
 // BF16 [rows, cols] (row stride ld elements) -> NVFP4. cols % 128 == 0.
 int quant(const __nv_bfloat16* x, int ld, uint8_t* out, uint8_t* out_sf, const float* gs, int rows, int cols,

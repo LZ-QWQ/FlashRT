@@ -73,6 +73,7 @@
 #include "gemm/fp4/nvfp4_skinny_gemm_sm120.cuh"
 #include "gemm/fp4/nvfp4_skinny_consumers_sm120.cuh"
 #include "gemm/fp4/cutlass_nvfp4_gemm_bias_res_sm120.cuh"
+#include "gemm/fp4/cutlass_nvfp4_gemm_glu_fp4out_sm120.cuh"
 #include "kernels/nvfp4_prefill_sm120.cuh"
 #endif
 #if defined(ENABLE_CUTLASS_SM120_NVFP4_W4A16) || defined(ENABLE_CUTLASS_SM100_NVFP4_W4A16)
@@ -7628,13 +7629,33 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     m.def("nvfp4_sf_bytes", [](int rows, int cols) { return flash_rt::nvfp4_prefill::sf_bytes(rows, cols); },
           py::arg("rows"), py::arg("cols"));
     m.def("nvfp4_norm_quant", [](uintptr_t x, uintptr_t weight, uintptr_t bias, int mode, float eps, uintptr_t out,
-                                uintptr_t out_sf, uintptr_t gs, int rows, int dim, uintptr_t stream) {
-        return flash_rt::nvfp4_prefill::norm_quant(typed_ptr<__nv_bfloat16>(x), typed_ptr<__nv_bfloat16>(weight),
-                                                   typed_ptr<__nv_bfloat16>(bias), mode, eps, typed_ptr<uint8_t>(out),
-                                                   typed_ptr<uint8_t>(out_sf), typed_ptr<float>(gs), rows, dim,
-                                                   to_stream(stream));
+                                uintptr_t out_sf, uintptr_t gs, int rows, int dim, uintptr_t stream,
+                                uintptr_t residual) {
+        return flash_rt::nvfp4_prefill::norm_quant(typed_ptr<__nv_bfloat16>(x), typed_ptr<__nv_bfloat16>(residual),
+                                                   typed_ptr<__nv_bfloat16>(weight), typed_ptr<__nv_bfloat16>(bias),
+                                                   mode, eps, typed_ptr<uint8_t>(out), typed_ptr<uint8_t>(out_sf),
+                                                   typed_ptr<float>(gs), rows, dim, to_stream(stream));
     }, py::arg("x"), py::arg("weight"), py::arg("bias"), py::arg("mode"), py::arg("eps"), py::arg("out"),
-       py::arg("out_sf"), py::arg("gs"), py::arg("rows"), py::arg("dim"), py::arg("stream") = 0);
+       py::arg("out_sf"), py::arg("gs"), py::arg("rows"), py::arg("dim"), py::arg("stream") = 0,
+       py::arg("residual") = 0);
+    m.def("nvfp4_gemm_bias_gelu_fp4out", [](uintptr_t A, uintptr_t B, uintptr_t SFA, uintptr_t SFB, uintptr_t bias,
+                                           uintptr_t D, uintptr_t SFD, int M, int N, int K, float alpha,
+                                           uintptr_t norm_constant, uintptr_t stream) {
+        return flash_rt::gemm::nvfp4_gemm_bias_gelu_fp4out_sm120(to_ptr(A), to_ptr(B), to_ptr(SFA), to_ptr(SFB),
+                                                                to_ptr(bias), to_ptr(D), to_ptr(SFD), M, N, K, alpha,
+                                                                typed_ptr<float>(norm_constant), to_stream(stream));
+    }, py::arg("A"), py::arg("B"), py::arg("SFA"), py::arg("SFB"), py::arg("bias"), py::arg("D"), py::arg("SFD"),
+       py::arg("M"), py::arg("N"), py::arg("K"), py::arg("alpha"), py::arg("norm_constant"), py::arg("stream") = 0);
+    m.def("nvfp4_gemm_geglu_fold_fp4out", [](uintptr_t A, uintptr_t B_il, uintptr_t SFA, uintptr_t SFB_il,
+                                            uintptr_t D, uintptr_t SFD, int M, int N_il, int K, float alpha_gate,
+                                            float alpha_up, uintptr_t norm_constant, uintptr_t stream) {
+        return flash_rt::gemm::nvfp4_gemm_geglu_fold_fp4out_sm120(to_ptr(A), to_ptr(B_il), to_ptr(SFA),
+                                                                 to_ptr(SFB_il), to_ptr(D), to_ptr(SFD), M, N_il, K,
+                                                                 alpha_gate, alpha_up,
+                                                                 typed_ptr<float>(norm_constant), to_stream(stream));
+    }, py::arg("A"), py::arg("B_il"), py::arg("SFA"), py::arg("SFB_il"), py::arg("D"), py::arg("SFD"), py::arg("M"),
+       py::arg("N_il"), py::arg("K"), py::arg("alpha_gate"), py::arg("alpha_up"), py::arg("norm_constant"),
+       py::arg("stream") = 0);
     m.def("nvfp4_quant", [](uintptr_t x, int ld, uintptr_t out, uintptr_t out_sf, uintptr_t gs, int rows, int cols,
                            uintptr_t stream) {
         return flash_rt::nvfp4_prefill::quant(typed_ptr<__nv_bfloat16>(x), ld, typed_ptr<uint8_t>(out),
