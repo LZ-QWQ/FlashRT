@@ -230,6 +230,8 @@ constexpr Cfg kCfgs[] = {
     {64, 1024, 4}, {128, 1024, 4}, {128, 256, 8}, {256, 256, 8},
     {64, 128, 4},  {32, 512, 4},  {32, 1024, 4}, {256, 512, 8},
     {32, 256, 4},  {32, 128, 4},  {64, 128, 8},  {128, 128, 8},
+    {32, 2048, 4}, {64, 2048, 8}, {128, 2048, 8}, {256, 1024, 8},
+    {64, 1024, 8}, {32, 1024, 2},
 };
 constexpr int kNumCfgs = sizeof(kCfgs) / sizeof(kCfgs[0]);
 
@@ -276,6 +278,12 @@ int dispatch_gemm(const void* A, const void* SFA, const float* a_gs, const void*
         CASE(13, 32, 128, 4);
         CASE(14, 64, 128, 8);
         CASE(15, 128, 128, 8);
+        CASE(16, 32, 2048, 4);
+        CASE(17, 64, 2048, 8);
+        CASE(18, 128, 2048, 8);
+        CASE(19, 256, 1024, 8);
+        CASE(20, 64, 1024, 8);
+        CASE(21, 32, 1024, 2);
         default: return static_cast<int>(cudaErrorInvalidValue);
     }
 #undef CASE

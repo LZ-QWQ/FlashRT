@@ -1053,13 +1053,14 @@ class Pi05Pipeline:
     #   Skinny NVFP4 decoder (sm_120a)
     # ══════════════════════════════════════════════════════════════════
 
-    # Tile configuration per (N, K) for chunk-sized row counts, measured on
-    # RTX 5090 with cold weights (scripted shape sweep, PDL chain).
+    # Tile configuration per (N, K) for chunk-sized row counts, chosen on the
+    # captured decoder graph (RTX 5090): wide K chunks keep the split count -
+    # and with it the partial-sum traffic of the fused consumers - low.
     _DEC_FP4_CFG_SMALL_ROWS = {
-        ((DEC_NH + 2 * DEC_NKV) * DEC_HD, DEC_D): 0,   # qkv     64x256
-        (DEC_D, DEC_NH * DEC_HD): 0,                   # o       64x256
-        (2 * DEC_H, DEC_D): 1,                         # gate_up 64x512
-        (DEC_D, DEC_H): 0,                             # down    64x256
+        ((DEC_NH + 2 * DEC_NKV) * DEC_HD, DEC_D): 5,   # qkv     128x1024 (one split)
+        (DEC_D, DEC_NH * DEC_HD): 6,                   # o       128x256, 8 warps
+        (2 * DEC_H, DEC_D): 5,                         # gate_up 128x1024 (one split)
+        (DEC_D, DEC_H): 5,                             # down    128x1024 (4 splits)
     }
 
     def _init_decoder_nvfp4(self, precision: str) -> bool:

@@ -30,12 +30,13 @@ FF = 6144
 LAYERS = 32
 EPS = 1e-5
 
-# Tile configuration per (N, K) at M = 41 (RTX 5090, cold weights, measured).
+# Tile configuration per (N, K) at M = 41, chosen on the captured DiT graph
+# (RTX 5090): fewer K splits keep the fused consumers' partial reads short.
 SKINNY_CFG = {
-    (3 * D, D): 3,     # fused self-attn QKV  128x512
-    (D, D): 12,        # cross Q, O            32x256
-    (FF, D): 6,        # FFN up               128x256, 8 warps
-    (D, FF): 6,        # FFN down             128x256, 8 warps
+    (3 * D, D): 11,    # fused self-attn QKV  256x512, 8 warps
+    (D, D): 7,         # cross Q, O           256x256, 8 warps
+    (FF, D): 3,        # FFN up               128x512
+    (D, FF): 11,       # FFN down             256x512, 8 warps
 }
 
 
