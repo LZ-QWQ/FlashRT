@@ -72,6 +72,7 @@
 #ifdef FLASHRT_NVFP4_SKINNY_SM120
 #include "gemm/fp4/nvfp4_skinny_gemm_sm120.cuh"
 #include "gemm/fp4/nvfp4_skinny_consumers_sm120.cuh"
+#include "gemm/fp4/nvfp4_skinny_attention_sm120.cuh"
 #include "gemm/fp4/cutlass_nvfp4_gemm_bias_res_sm120.cuh"
 #include "gemm/fp4/cutlass_nvfp4_gemm_glu_fp4out_sm120.cuh"
 #include "kernels/nvfp4_prefill_sm120.cuh"
@@ -7590,6 +7591,18 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
             typed_ptr<__nv_bfloat16>(out2), seg, rows, n, pdl, to_stream(stream));
     }, py::arg("partials"), py::arg("splits"), py::arg("a_gs"), py::arg("w_gs"), py::arg("bias"), py::arg("out0"),
        py::arg("out1"), py::arg("out2"), py::arg("seg"), py::arg("rows"), py::arg("n"), py::arg("pdl") = true,
+       py::arg("stream") = 0);
+    m.def("nvfp4_skinny_partials_attention", [](uintptr_t partials, int splits, uintptr_t a_gs, uintptr_t w_gs,
+                                               uintptr_t bias, int n_proj, uintptr_t k_ext, uintptr_t v_ext,
+                                               int kv_ld, int kv_seq, bool kv_static, uintptr_t out, int rows,
+                                               int heads, int hd, float scale, bool pdl, uintptr_t stream) {
+        return flash_rt::nvfp4_skinny::partials_attention(
+            typed_ptr<float>(partials), splits, typed_ptr<float>(a_gs), typed_ptr<float>(w_gs),
+            typed_ptr<__nv_bfloat16>(bias), n_proj, typed_ptr<__nv_bfloat16>(k_ext), typed_ptr<__nv_bfloat16>(v_ext),
+            kv_ld, kv_seq, kv_static, typed_ptr<__nv_bfloat16>(out), rows, heads, hd, scale, pdl, to_stream(stream));
+    }, py::arg("partials"), py::arg("splits"), py::arg("a_gs"), py::arg("w_gs"), py::arg("bias"), py::arg("n_proj"),
+       py::arg("k_ext"), py::arg("v_ext"), py::arg("kv_ld"), py::arg("kv_seq"), py::arg("kv_static"), py::arg("out"),
+       py::arg("rows"), py::arg("heads"), py::arg("hd"), py::arg("scale"), py::arg("pdl") = true,
        py::arg("stream") = 0);
     m.def("nvfp4_skinny_sum_bias_residual_norm", [](uintptr_t partials, int splits, uintptr_t a_gs, uintptr_t w_gs,
                                                    uintptr_t bias, uintptr_t residual, uintptr_t scale,

@@ -29,6 +29,8 @@ D = 1536
 FF = 6144
 LAYERS = 32
 EPS = 1e-5
+HEADS = 32
+HEAD_DIM = 48
 
 # Tile configuration per (N, K) at M = 41, chosen on the captured DiT graph
 # (RTX 5090): fewer K splits keep the fused consumers' partial reads short.
@@ -91,18 +93,21 @@ def dit_forward_nvfp4(fvk, bufs: dict, weights: dict, dims: dict, *, attn,
         is_self = li % 2 == 1
         j = (li - 1) // 2 if is_self else li // 2
         slots = attn.get_slot_ptrs("dit_self" if is_self else "dit_cross", j)
+        # Attention straight off the projection partials (Q, and K/V for the
+        # self blocks); the cross K/V are per-frame inputs of this graph.
         if is_self:
             site = weights["qkv"][j]
             splits = _gemm(xn, xn_sf, site, 3 * D, D, li, "qkv gemm")
-            _ck(fvk.nvfp4_skinny_sum_bias_store(part, splits, one, site[2], site[3], slots["Q"], slots["K"],
-                                                slots["V"], D, Sa, 3 * D, pdl, stream), "qkv store", li)
-            attn.run("dit_self", j, q_seq=Sa, kv_seq=Sa, stream=stream)
+            _ck(fvk.nvfp4_skinny_partials_attention(part, splits, one, site[2], site[3], 3 * D, 0, 0, 0, Sa,
+                                                    False, slots["O"], Sa, HEADS, HEAD_DIM, HEAD_DIM ** -0.5,
+                                                    pdl, stream), "self attention", li)
         else:
             site = weights["q"][j]
             splits = _gemm(xn, xn_sf, site, D, D, li, "q gemm")
-            _ck(fvk.nvfp4_skinny_sum_bias_store(part, splits, one, site[2], site[3], slots["Q"], 0, 0,
-                                                D, Sa, D, pdl, stream), "q store", li)
-            attn.run("dit_cross", j, q_seq=Sa, kv_seq=Skv_text if li % 4 == 0 else Skv_image, stream=stream)
+            kv = Skv_text if li % 4 == 0 else Skv_image
+            _ck(fvk.nvfp4_skinny_partials_attention(part, splits, one, site[2], site[3], D, slots["K"],
+                                                    slots["V"], D, kv, True, slots["O"], Sa, HEADS, HEAD_DIM,
+                                                    HEAD_DIM ** -0.5, pdl, stream), "cross attention", li)
 
         # O projection (attention output quantized on load) -> bias + residual
         # -> pre-FF LayerNorm (no affine) -> fp4.

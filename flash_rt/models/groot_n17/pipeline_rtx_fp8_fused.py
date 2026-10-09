@@ -111,7 +111,9 @@ def qwen3vl_llm_forward(gemm, fvk, fa2, bufs, weights, dims, scales_dev, *, stre
     causal GQA FA2, SwiGLU, DeepStack injection after layers 0..2).
 
     bufs:    h (fp16 S×D), xn_fp8, qkv (fp16 S×(NHQ+2NHKV)HD), Q/K/V/O (bf16
-             attention operands), lse (fp32), o_out (fp16 S×D), gate_out,
+             attention operands), lse (fp32), optional lse_accum / o_accum
+             (fp32 split-KV scratch for ceil(S/128) splits; the short
+             prefill fills the GPU only when split), o_out (fp16 S×D), gate_out,
              up_out (fp16 S×FF), gu_fp8
     weights: in_ln_w, post_ln_w, q_norm_w, k_norm_w, qkv_w/qkv_ws, o_w/o_ws,
              gate_w/gate_ws, up_w/up_ws, down_w/down_ws; cos, sin;
@@ -123,6 +125,7 @@ def qwen3vl_llm_forward(gemm, fvk, fa2, bufs, weights, dims, scales_dev, *, stre
     NQKV = (NHQ + 2 * NHKV) * HD
     h, xn8, qkv = int(bufs["h"]), int(bufs["xn_fp8"]), int(bufs["qkv"])
     Q, K, V, O, lse = (int(bufs[k]) for k in ("Q", "K", "V", "O", "lse"))
+    lse_acc, o_acc = int(bufs.get("lse_accum", 0)), int(bufs.get("o_accum", 0))
     o_out, gate, up, gu8 = (int(bufs[k]) for k in ("o_out", "gate_out", "up_out", "gu_fp8"))
     cos, sin = int(weights["cos"]), int(weights["sin"])
     inject = weights["deepstack_inject"]
@@ -139,7 +142,7 @@ def qwen3vl_llm_forward(gemm, fvk, fa2, bufs, weights, dims, scales_dev, *, stre
                               1.0, 1.0, int(weights["q_norm_w"][li]), int(weights["k_norm_w"][li]), 1e-6,
                               cos, sin, Q, K, V, True, S, NHQ, NHKV, HD, st), "llm qkv")
         fa2.fwd_bf16_causal(
-            Q=Q, K=K, V=V, O=O, softmax_lse=lse, softmax_lse_accum=0, o_accum=0,
+            Q=Q, K=K, V=V, O=O, softmax_lse=lse, softmax_lse_accum=lse_acc, o_accum=o_acc,
             batch=1, seqlen_q=S, seqlen_k=S, num_heads_q=NHQ, num_heads_kv=NHKV, head_dim=HD,
             q_strides=(S * NHQ * HD, NHQ * HD, HD), k_strides=(S * NHKV * HD, NHKV * HD, HD),
             v_strides=(S * NHKV * HD, NHKV * HD, HD), o_strides=(S * NHQ * HD, NHQ * HD, HD),

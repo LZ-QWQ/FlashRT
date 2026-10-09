@@ -765,6 +765,7 @@ if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
   add_library(nvfp4_skinny_sm120_obj OBJECT
     csrc/gemm/fp4/nvfp4_skinny_gemm_sm120.cu
     csrc/gemm/fp4/nvfp4_skinny_consumers_sm120.cu
+    csrc/gemm/fp4/nvfp4_skinny_attention_sm120.cu
     csrc/kernels/nvfp4_prefill_sm120.cu
     csrc/kernels/fp8_prefill_fp16.cu)
   set_target_properties(nvfp4_skinny_sm120_obj PROPERTIES

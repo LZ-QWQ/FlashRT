@@ -707,6 +707,8 @@ class _GrootN17FP8BackboneMixin:
             "Q": ptr(Se, 16, 128, dtype=_BF16), "K": ptr(Se, 8, 128, dtype=_BF16),
             "V": ptr(Se, 8, 128, dtype=_BF16), "O": ptr(Se, 16, 128, dtype=_BF16),
             "lse": ptr(1, 16, (Se + 127) // 128 * 128, dtype=torch.float32),
+            "lse_accum": ptr((Se + 127) // 128, 1, 16, Se, dtype=torch.float32),
+            "o_accum": ptr((Se + 127) // 128, 1, 16, Se, 128, dtype=torch.float32),
             "o_out": ptr(Se, 2048), "gate_out": ptr(Se, 6144), "up_out": ptr(Se, 6144),
             "gu_fp8": ptr(Se, 6144, dtype=_U8)}
         llm_dims = {"S": Se, "D": 2048, "NHQ": 16, "NHKV": 8, "HD": 128, "FF": 6144}
