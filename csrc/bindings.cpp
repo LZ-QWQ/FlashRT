@@ -75,6 +75,7 @@
 #include "gemm/fp4/cutlass_nvfp4_gemm_bias_res_sm120.cuh"
 #include "gemm/fp4/cutlass_nvfp4_gemm_glu_fp4out_sm120.cuh"
 #include "kernels/nvfp4_prefill_sm120.cuh"
+#include "kernels/fp8_prefill_fp16.cuh"
 #endif
 #if defined(ENABLE_CUTLASS_SM120_NVFP4_W4A16) || defined(ENABLE_CUTLASS_SM100_NVFP4_W4A16)
 #include "quantize/nvfp4_sf_reshape_sm120.cuh"
@@ -7677,6 +7678,44 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         return flash_rt::nvfp4_prefill::scatter_add_rows(typed_ptr<__nv_bfloat16>(h), typed_ptr<__nv_bfloat16>(src),
                                                          typed_ptr<int64_t>(idx), n, dim, to_stream(stream));
     }, py::arg("h"), py::arg("src"), py::arg("idx"), py::arg("n"), py::arg("dim"), py::arg("stream") = 0);
+
+    // FP8 prefill on an FP16 residual stream: fused residual / norm / bias /
+    // activation / RoPE producers and consumers around per-tensor FP8 GEMMs.
+    // See kernels/fp8_prefill_fp16.cuh.
+    m.def("fp8_residual_norm_quant", [](uintptr_t x, uintptr_t delta, uintptr_t delta_bias, uintptr_t delta2,
+                                       uintptr_t x_copy, uintptr_t weight, uintptr_t bias, int mode, float eps,
+                                       uintptr_t out_fp8, uintptr_t scale, uintptr_t out_f16, int rows, int dim,
+                                       uintptr_t stream) {
+        return flash_rt::fp8_prefill::residual_norm_quant(
+            typed_ptr<__half>(x), typed_ptr<__half>(delta), typed_ptr<__half>(delta_bias), typed_ptr<__half>(delta2),
+            typed_ptr<__half>(x_copy), typed_ptr<__half>(weight), typed_ptr<__half>(bias), mode, eps,
+            typed_ptr<__nv_fp8_e4m3>(out_fp8), typed_ptr<float>(scale), typed_ptr<__half>(out_f16), rows, dim,
+            to_stream(stream));
+    }, py::arg("x"), py::arg("delta"), py::arg("delta_bias"), py::arg("delta2"), py::arg("x_copy"),
+       py::arg("weight"), py::arg("bias"), py::arg("mode"), py::arg("eps"), py::arg("out_fp8"), py::arg("scale"),
+       py::arg("out_f16"), py::arg("rows"), py::arg("dim"), py::arg("stream") = 0);
+    m.def("fp8_bias_gelu_quant", [](uintptr_t x, int ld, uintptr_t bias, uintptr_t out, uintptr_t scale, int rows,
+                                   int n, uintptr_t stream) {
+        return flash_rt::fp8_prefill::bias_gelu_quant(typed_ptr<__half>(x), ld, typed_ptr<__half>(bias),
+                                                      typed_ptr<__nv_fp8_e4m3>(out), typed_ptr<float>(scale), rows,
+                                                      n, to_stream(stream));
+    }, py::arg("x"), py::arg("ld"), py::arg("bias"), py::arg("out"), py::arg("scale"), py::arg("rows"),
+       py::arg("n"), py::arg("stream") = 0);
+    m.def("fp8_qkv_split", [](uintptr_t q_in, uintptr_t k_in, uintptr_t v_in, int ld, uintptr_t q_bias,
+                             uintptr_t k_bias, uintptr_t v_bias, float k_mul, float v_mul, uintptr_t q_norm,
+                             uintptr_t k_norm, float eps, uintptr_t cos, uintptr_t sin, uintptr_t q_out,
+                             uintptr_t k_out, uintptr_t v_out, bool out_bf16, int S, int n_q, int n_k, int hd,
+                             uintptr_t stream) {
+        return flash_rt::fp8_prefill::qkv_split(
+            typed_ptr<__half>(q_in), typed_ptr<__half>(k_in), typed_ptr<__half>(v_in), ld, typed_ptr<__half>(q_bias),
+            typed_ptr<__half>(k_bias), typed_ptr<__half>(v_bias), k_mul, v_mul, typed_ptr<__half>(q_norm),
+            typed_ptr<__half>(k_norm), eps, typed_ptr<__half>(cos), typed_ptr<__half>(sin),
+            reinterpret_cast<void*>(q_out), reinterpret_cast<void*>(k_out), reinterpret_cast<void*>(v_out), out_bf16,
+            S, n_q, n_k, hd, to_stream(stream));
+    }, py::arg("q_in"), py::arg("k_in"), py::arg("v_in"), py::arg("ld"), py::arg("q_bias"), py::arg("k_bias"),
+       py::arg("v_bias"), py::arg("k_mul"), py::arg("v_mul"), py::arg("q_norm"), py::arg("k_norm"), py::arg("eps"),
+       py::arg("cos"), py::arg("sin"), py::arg("q_out"), py::arg("k_out"), py::arg("v_out"), py::arg("out_bf16"),
+       py::arg("S"), py::arg("n_q"), py::arg("n_k"), py::arg("hd"), py::arg("stream") = 0);
 #endif  // FLASHRT_NVFP4_SKINNY_SM120
 
 #ifdef FLASHRT_PI05_DECODER_FP4_SM120
