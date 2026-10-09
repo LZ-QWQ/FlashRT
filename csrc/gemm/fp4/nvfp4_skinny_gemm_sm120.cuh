@@ -49,9 +49,11 @@ int pack_weight(const uint8_t* w, const uint8_t* sf, uint8_t* w_packed, uint8_t*
                 cudaStream_t stream);
 
 // Setup time: BF16 [N, K] -> natural NVFP4 with global scale *gs
-// (scales ue4m3_ceil(amax16 / (6 gs))).
+// (scales ue4m3_ceil(amax16 / (6 gs))). mse_steps > 0 additionally tries that
+// many smaller UE4M3 scale codes per block and keeps the one with the least
+// squared error.
 int quantize_weight(const __nv_bfloat16* w, const float* gs, uint8_t* out, uint8_t* out_sf, int N, int K,
-                    cudaStream_t stream);
+                    int mse_steps, cudaStream_t stream);
 
 }  // namespace nvfp4_skinny
 }  // namespace flash_rt

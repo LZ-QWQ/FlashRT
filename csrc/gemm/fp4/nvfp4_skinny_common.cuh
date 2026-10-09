@@ -6,9 +6,10 @@
 // no code for it.
 //
 // NVFP4 numerics used throughout: for a 16-element block of x (already divided
-// by the per-tensor global scale gs), sf = ue4m3_ceil(amax / 6) and
-// q = e2m1_rn_satfinite(x / sf). The ceil keeps every block element within the
-// e2m1 range, so the saturation never clips a block maximum.
+// by the per-tensor global scale gs), sf = ue4m3_rn(amax / 6) for activations
+// (act_scale_code) and q = e2m1_rn_satfinite(x / sf). Weights are quantized
+// once at setup with sf = ue4m3_ceil(amax / 6) or a squared-error search below
+// it (nvfp4_skinny_gemm_sm120.cu).
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
@@ -78,6 +79,17 @@ __device__ __forceinline__ uint8_t ue4m3_ceil(float v) {
     return b;
 }
 
+// Activation block scale: the UE4M3 value nearest to amax / 6 (saturating at
+// 448). A block maximum that rounds above 6 after scaling saturates to 6; on
+// real decoder and DiT activations this gives a lower error than rounding the
+// scale up.
+__device__ __forceinline__ uint8_t act_scale_code(float v) {
+    if (!(v > 0.f)) return 0;
+    if (v >= 448.f) return 0x7E;
+    const __nv_fp8_e4m3 q(v);
+    return q.__x;
+}
+
 __device__ __forceinline__ float ue4m3_value(uint8_t b) {
     __nv_fp8_e4m3 q;
     q.__x = b;
@@ -103,7 +115,7 @@ __device__ __forceinline__ void quant_block16(const float* v, uint8_t* out8, uin
     float amax = 0.f;
 #pragma unroll
     for (int i = 0; i < 16; ++i) amax = fmaxf(amax, fabsf(v[i]));
-    const uint8_t s = ue4m3_ceil(amax * (1.0f / 6.0f));
+    const uint8_t s = act_scale_code(amax * (1.0f / 6.0f));
     const float d = ue4m3_value(s);
     const float inv = d > 0.f ? 1.0f / d : 0.f;
     uint16_t h[4];
@@ -123,7 +135,7 @@ __device__ __forceinline__ void quant_quad4(float v0, float v1, float v2, float 
     float amax = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
     amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
     amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
-    const uint8_t s = ue4m3_ceil(amax * (1.0f / 6.0f));
+    const uint8_t s = act_scale_code(amax * (1.0f / 6.0f));
     const float d = ue4m3_value(s);
     const float inv = d > 0.f ? 1.0f / d : 0.f;
     *reinterpret_cast<uint16_t*>(out2) = e2m1x4(v0 * inv, v1 * inv, v2 * inv, v3 * inv);

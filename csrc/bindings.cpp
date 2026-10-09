@@ -7561,12 +7561,12 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("w"), py::arg("sf"), py::arg("w_packed"), py::arg("sf_packed"), py::arg("N"), py::arg("K"),
        py::arg("stream") = 0);
     m.def("nvfp4_skinny_quantize_weight", [](uintptr_t w, uintptr_t gs, uintptr_t out, uintptr_t out_sf,
-                                            int N, int K, uintptr_t stream) {
+                                            int N, int K, uintptr_t stream, int mse_steps) {
         return flash_rt::nvfp4_skinny::quantize_weight(typed_ptr<__nv_bfloat16>(w), typed_ptr<float>(gs),
                                                       typed_ptr<uint8_t>(out), typed_ptr<uint8_t>(out_sf),
-                                                      N, K, to_stream(stream));
+                                                      N, K, mse_steps, to_stream(stream));
     }, py::arg("w"), py::arg("gs"), py::arg("out"), py::arg("out_sf"), py::arg("N"), py::arg("K"),
-       py::arg("stream") = 0);
+       py::arg("stream") = 0, py::arg("mse_steps") = 0);
     m.def("nvfp4_skinny_layer_norm", [](uintptr_t x, uintptr_t scale, uintptr_t shift, uintptr_t out,
                                        uintptr_t out_sf, uintptr_t out_gs, uintptr_t out_bf16, int rows, int dim,
                                        float eps, bool pdl, uintptr_t stream) {

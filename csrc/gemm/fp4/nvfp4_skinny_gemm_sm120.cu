@@ -170,18 +170,58 @@ __global__ void pack_weight_kernel(const uint8_t* __restrict__ w, const uint8_t*
     }
 }
 
-// One thread per 16-element block of a BF16 [N, K] weight.
+__device__ __forceinline__ float e2m1_value(float x) {
+    // value of the e2m1 code that cvt.rn.satfinite selects for x
+    const float a = fminf(fabsf(x), 6.0f);
+    const float q = a < 2.0f ? rintf(a * 2.0f) * 0.5f : (a < 4.0f ? rintf(a) : rintf(a * 0.5f) * 2.0f);
+    return copysignf(q, x);
+}
+
+// One thread per 16-element block of a BF16 [N, K] weight. With mse_steps > 0
+// the block scale is also tried mse_steps UE4M3 codes below the ceil scale
+// (clipping the block maximum) and the code with the smallest squared error
+// is kept.
 __global__ void quantize_weight_kernel(const __nv_bfloat16* __restrict__ w, const float* __restrict__ gs,
-                                       uint8_t* __restrict__ out, uint8_t* __restrict__ out_sf, int N, int K) {
+                                       uint8_t* __restrict__ out, uint8_t* __restrict__ out_sf, int N, int K,
+                                       int mse_steps) {
     const size_t blocks = static_cast<size_t>(N) * (K / 16);
     const size_t b = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (b >= blocks) return;
     const float inv_gs = 1.0f / (*gs);
     const __nv_bfloat16* src = w + b * 16;
     float v[16];
+    float amax = 0.f;
 #pragma unroll
-    for (int i = 0; i < 16; ++i) v[i] = __bfloat162float(src[i]) * inv_gs;
-    quant_block16(v, out + b * 8, out_sf + b);
+    for (int i = 0; i < 16; ++i) {
+        v[i] = __bfloat162float(src[i]) * inv_gs;
+        amax = fmaxf(amax, fabsf(v[i]));
+    }
+    const uint8_t base = ue4m3_ceil(amax * (1.0f / 6.0f));
+    uint8_t best = base;
+    if (mse_steps > 0 && base > 1) {
+        float best_err = 3.4e38f;
+        for (int k = 0; k <= mse_steps && base - k >= 1; ++k) {
+            const uint8_t code = static_cast<uint8_t>(base - k);
+            const float d = ue4m3_value(code);
+            const float inv = 1.0f / d;
+            float err = 0.f;
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                const float e = v[i] - e2m1_value(v[i] * inv) * d;
+                err += e * e;
+            }
+            if (err < best_err) { best_err = err; best = code; }
+        }
+    }
+    const float d = ue4m3_value(best);
+    const float inv = d > 0.f ? 1.0f / d : 0.f;
+    uint16_t h[4];
+#pragma unroll
+    for (int q = 0; q < 4; ++q)
+        h[q] = e2m1x4(v[4 * q] * inv, v[4 * q + 1] * inv, v[4 * q + 2] * inv, v[4 * q + 3] * inv);
+    *reinterpret_cast<uint2*>(out + b * 8) = make_uint2(h[0] | (static_cast<uint32_t>(h[1]) << 16),
+                                                        h[2] | (static_cast<uint32_t>(h[3]) << 16));
+    out_sf[b] = best;
 }
 
 struct Cfg { int bn, kc, nw; };
@@ -270,10 +310,11 @@ int pack_weight(const uint8_t* w, const uint8_t* sf, uint8_t* w_packed, uint8_t*
 }
 
 int quantize_weight(const __nv_bfloat16* w, const float* gs, uint8_t* out, uint8_t* out_sf, int N, int K,
-                    cudaStream_t stream) {
-    if (N < 1 || K % 16 != 0) return static_cast<int>(cudaErrorInvalidValue);
+                    int mse_steps, cudaStream_t stream) {
+    if (N < 1 || K % 16 != 0 || mse_steps < 0 || mse_steps > 16) return static_cast<int>(cudaErrorInvalidValue);
     const size_t blocks = static_cast<size_t>(N) * (K / 16);
-    quantize_weight_kernel<<<static_cast<unsigned>((blocks + 255) / 256), 256, 0, stream>>>(w, gs, out, out_sf, N, K);
+    quantize_weight_kernel<<<static_cast<unsigned>((blocks + 255) / 256), 256, 0, stream>>>(w, gs, out, out_sf, N, K,
+                                                                                            mse_steps);
     return static_cast<int>(cudaGetLastError());
 }
 
