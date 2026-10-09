@@ -62,27 +62,6 @@ layer_norm_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __re
 }
 
 template <bool PDL>
-__global__ void __launch_bounds__(256)
-sum_bias_store_kernel(const float* __restrict__ partials, int splits, const float* __restrict__ a_gs,
-                      const float* __restrict__ w_gs, const __nv_bfloat16* __restrict__ bias,
-                      __nv_bfloat16* __restrict__ out0, __nv_bfloat16* __restrict__ out1,
-                      __nv_bfloat16* __restrict__ out2, int seg, int rows, int n) {
-    if constexpr (PDL) pdl_prologue();
-    const int index = blockIdx.x * blockDim.x + threadIdx.x;   // one column pair
-    const int pairs = n >> 1;
-    if (index >= rows * pairs) return;
-    const int row = index / pairs;
-    const int col = (index % pairs) * 2;
-    const float alpha = (*a_gs) * (*w_gs);
-    const float2 x = sum_pair(partials, splits, static_cast<size_t>(rows) * n, index, alpha);
-    const float2 bv = bf2(*reinterpret_cast<const uint32_t*>(bias + col));
-    const int s = col / seg;
-    __nv_bfloat16* out = s == 0 ? out0 : (s == 1 ? out1 : out2);
-    *reinterpret_cast<uint32_t*>(out + static_cast<size_t>(row) * seg + (col - s * seg)) =
-        pack_bf2(x.x + bv.x, x.y + bv.y);
-}
-
-template <bool PDL>
 __global__ void __launch_bounds__(1024)
 sum_bias_residual_norm_kernel(const float* __restrict__ partials, int splits, const float* __restrict__ a_gs,
                               const float* __restrict__ w_gs, const __nv_bfloat16* __restrict__ bias,
@@ -158,18 +137,6 @@ int layer_norm_fp4(const __nv_bfloat16* x, const __nv_bfloat16* scale, const __n
     const void* fn = pdl ? (const void*)layer_norm_kernel<true> : (const void*)layer_norm_kernel<false>;
     return launch_ex(fn, dim3(rows), dim3(dim / 4), stream, pdl, x, scale, shift, out, out_sf, out_gs, out_bf16,
                      dim, eps);
-}
-
-int sum_bias_store(const float* partials, int splits, const float* a_gs, const float* w_gs,
-                   const __nv_bfloat16* bias, __nv_bfloat16* out0, __nv_bfloat16* out1, __nv_bfloat16* out2,
-                   int seg, int rows, int n, bool pdl, cudaStream_t stream) {
-    if (rows < 1 || seg < 2 || seg % 2 != 0 || n % seg != 0 || n / seg > 3 || (n / seg > 1 && !out1) ||
-        (n / seg > 2 && !out2))
-        return static_cast<int>(cudaErrorInvalidValue);
-    const int total = rows * (n >> 1);
-    const void* fn = pdl ? (const void*)sum_bias_store_kernel<true> : (const void*)sum_bias_store_kernel<false>;
-    return launch_ex(fn, dim3((total + 255) / 256), dim3(256), stream, pdl, partials, splits, a_gs, w_gs, bias,
-                     out0, out1, out2, seg, rows, n);
 }
 
 int sum_bias_residual_norm(const float* partials, int splits, const float* a_gs, const float* w_gs,

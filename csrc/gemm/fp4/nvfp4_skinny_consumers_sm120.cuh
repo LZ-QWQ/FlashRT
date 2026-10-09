@@ -25,12 +25,6 @@ int layer_norm_fp4(const __nv_bfloat16* x, const __nv_bfloat16* scale, const __n
                    uint8_t* out, uint8_t* out_sf, const float* out_gs, __nv_bfloat16* out_bf16, int rows,
                    int dim, float eps, bool pdl, cudaStream_t stream);
 
-// y = bf16(bf16(alpha * sum partials) + bias); column c of row r goes to
-// out[c / seg][r * seg + c % seg] (up to three segments: fused Q | K | V).
-int sum_bias_store(const float* partials, int splits, const float* a_gs, const float* w_gs,
-                   const __nv_bfloat16* bias, __nv_bfloat16* out0, __nv_bfloat16* out1, __nv_bfloat16* out2,
-                   int seg, int rows, int n, bool pdl, cudaStream_t stream);
-
 // residual += bf16(bf16(alpha * sum partials) + bias), then the LayerNorm
 // (no affine) of the updated row with optional modulation.
 int sum_bias_residual_norm(const float* partials, int splits, const float* a_gs, const float* w_gs,

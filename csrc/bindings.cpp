@@ -7583,16 +7583,6 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("x"), py::arg("scale"), py::arg("shift"), py::arg("out"), py::arg("out_sf"), py::arg("out_gs"),
        py::arg("out_bf16"), py::arg("rows"), py::arg("dim"), py::arg("eps"), py::arg("pdl") = true,
        py::arg("stream") = 0);
-    m.def("nvfp4_skinny_sum_bias_store", [](uintptr_t partials, int splits, uintptr_t a_gs, uintptr_t w_gs,
-                                           uintptr_t bias, uintptr_t out0, uintptr_t out1, uintptr_t out2, int seg,
-                                           int rows, int n, bool pdl, uintptr_t stream) {
-        return flash_rt::nvfp4_skinny::sum_bias_store(
-            typed_ptr<float>(partials), splits, typed_ptr<float>(a_gs), typed_ptr<float>(w_gs),
-            typed_ptr<__nv_bfloat16>(bias), typed_ptr<__nv_bfloat16>(out0), typed_ptr<__nv_bfloat16>(out1),
-            typed_ptr<__nv_bfloat16>(out2), seg, rows, n, pdl, to_stream(stream));
-    }, py::arg("partials"), py::arg("splits"), py::arg("a_gs"), py::arg("w_gs"), py::arg("bias"), py::arg("out0"),
-       py::arg("out1"), py::arg("out2"), py::arg("seg"), py::arg("rows"), py::arg("n"), py::arg("pdl") = true,
-       py::arg("stream") = 0);
     m.def("nvfp4_skinny_partials_attention", [](uintptr_t partials, int splits, uintptr_t a_gs, uintptr_t w_gs,
                                                uintptr_t bias, int n_proj, uintptr_t k_ext, uintptr_t v_ext,
                                                int kv_ld, int kv_seq, bool kv_static, uintptr_t out, int rows,
