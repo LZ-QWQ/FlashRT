@@ -426,5 +426,88 @@ class GrootN17TorchFrontendRtxFP4(GrootN17TorchFrontendRtxFP8):
 
     def _dit_nvfp4_skinny_step(self, step: int, weights: dict, dims: dict, stream: int) -> None:
         from flash_rt.models.groot_n17 import pipeline_rtx_nvfp4 as P
+        if hasattr(self, "_ck_nvfp4"):
+            dims = dict(dims, kv_ld=self._ck_nvfp4["kv_ld"])
         P.dit_forward_nvfp4(self._fvk, self._dit_nvfp4_bufs, weights, dims, attn=self._dit_attn,
                             stream=int(stream), pdl=os.environ.get("FLASHRT_GROOT_N17_DIT_PDL", "1") != "0")
+
+    # ── Cross K/V ─────────────────────────────────────────────────────
+    #
+    # The 16 cross-attention blocks project the same two per-frame sources
+    # (the backbone's text rows for the even cross blocks, its image rows for
+    # the odd ones) to K and V. On NVFP4 they run as two GEMMs, one per source,
+    # over the concatenated K|V weights of its 8 blocks (N = 8 * 2 * 1536),
+    # with the bias in the epilogue; each block's K / V is a column slice of
+    # the output, which the DiT attention reads with its row stride.
+
+    _CK_NVFP4 = os.environ.get("FLASHRT_GROOT_N17_CK_NVFP4", "1") != "0"
+
+    def _setup_cross_kv_kernel(self) -> None:
+        fresh = not hasattr(self, "_ck_text_idx")
+        super()._setup_cross_kv_kernel()
+        if fresh and self._CK_NVFP4 and hasattr(self._fvk, "nvfp4_gemm_bias_res_bf16out"):
+            self._setup_cross_kv_nvfp4()
+
+    def _setup_cross_kv_nvfp4(self) -> None:
+        fvk = self._fvk
+        dev = self.device
+        D, Kd = 1536, 2048
+        keep: list = []
+        groups = {}
+        with torch.no_grad():
+            for name, src, rows in (("text", self._ck_text_src, self._ck_nt),
+                                    ("image", self._ck_image_src, self._ck_ni)):
+                blocks = [j for j in range(16) if ((2 * j) % 4 == 0) == (name == "text")]
+                w = torch.cat([self._ckpt_bf16_tensor(_BLOCK.format(2 * j, f"attn1.to_{kv}.weight"))
+                               for j in blocks for kv in ("k", "v")], 0).contiguous()        # [N, K]
+                b = torch.cat([getattr(self, f"_dit_{kv}_b")[2 * j].to(torch.bfloat16)
+                               for j in blocks for kv in ("k", "v")]).contiguous()
+                N = w.shape[0]
+                w_gs = (w.float().abs().amax() / (6.0 * 448.0)).clamp_min(1e-12).reshape(1).contiguous()
+                q = torch.empty(N, Kd // 2, dtype=torch.uint8, device=dev)
+                sf_lin = torch.empty(N, Kd // 16, dtype=torch.uint8, device=dev)
+                rc = fvk.nvfp4_skinny_quantize_weight(w.data_ptr(), w_gs.data_ptr(), q.data_ptr(), sf_lin.data_ptr(),
+                                                      N, Kd, 0, self._DIT_WEIGHT_MSE_STEPS)
+                if rc != 0:
+                    raise RuntimeError(f"N1.7 cross-KV NVFP4 weight quantization failed: cudaError {rc}")
+                sfb = torch.zeros(fvk.nvfp4_sf_swizzled_bytes(N, Kd), dtype=torch.uint8, device=dev)
+                fvk.nvfp4_sf_linear_to_swizzled(sf_lin.data_ptr(), sfb.data_ptr(), N, Kd, True, 0)
+                # static activation global scale from the set_prompt frame
+                # (amax / 448: 6x headroom before the block scales saturate)
+                a_gs = (src.float().abs().amax() / 448.0).clamp_min(1e-12).reshape(1).contiguous()
+                a = torch.empty(rows, Kd // 2, dtype=torch.uint8, device=dev)
+                sfa = torch.zeros(fvk.nvfp4_sf_bytes(rows, Kd), dtype=torch.uint8, device=dev)
+                out = torch.empty(rows, N, dtype=torch.bfloat16, device=dev)
+                keep += [q, sfb, b, w_gs, a_gs, a, sfa, out]
+                groups[name] = {"src": src, "rows": rows, "N": N, "w": q, "sfb": sfb, "b": b, "a": a, "sfa": sfa,
+                                "a_gs": a_gs, "alpha": float(a_gs.item() * w_gs.item()), "out": out,
+                                "blocks": blocks}
+                del w
+        for g in groups.values():
+            for t, j in enumerate(g["blocks"]):
+                self._dit_cross_K[j] = g["out"][:, 2 * t * D:(2 * t + 1) * D]
+                self._dit_cross_V[j] = g["out"][:, (2 * t + 1) * D:(2 * t + 2) * D]
+        self._ck_nvfp4 = {"groups": groups, "keep": keep, "kv_ld": groups["text"]["N"]}
+        if hasattr(self, "_dit_attn"):
+            delattr(self, "_dit_attn")
+        self._cross_kv_fwd(0)
+
+    def _cross_kv_fwd(self, s: int) -> None:
+        if not hasattr(self, "_ck_nvfp4"):
+            return super()._cross_kv_fwd(s)
+        K = self._fvk
+        S = self.Se
+        K.cast_fp16_to_bf16(self._ck_bb_src.data_ptr(), self._ck_bb.data_ptr(), S * 2048, s)
+        K.embedding_lookup_bf16(self._ck_text_idx.data_ptr(), self._ck_bb.data_ptr(),
+                                self._ck_text_src.data_ptr(), self._ck_nt, 2048, s)
+        K.embedding_lookup_bf16(self._ck_image_idx.data_ptr(), self._ck_bb.data_ptr(),
+                                self._ck_image_src.data_ptr(), self._ck_ni, 2048, s)
+        for name, g in self._ck_nvfp4["groups"].items():
+            rc = K.nvfp4_quant(g["src"].data_ptr(), 2048, g["a"].data_ptr(), g["sfa"].data_ptr(),
+                               g["a_gs"].data_ptr(), g["rows"], 2048, s)
+            if rc == 0:
+                rc = K.nvfp4_gemm_bias_res_bf16out(g["a"].data_ptr(), g["w"].data_ptr(), g["sfa"].data_ptr(),
+                                                   g["sfb"].data_ptr(), g["b"].data_ptr(), 0, g["out"].data_ptr(),
+                                                   g["rows"], g["N"], 2048, g["alpha"], 0.0, 0, s)
+            if rc != 0:
+                raise RuntimeError(f"N1.7 cross-KV NVFP4 {name} failed: status {rc}")

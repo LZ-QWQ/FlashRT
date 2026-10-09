@@ -63,12 +63,14 @@ def dit_forward_nvfp4(fvk, bufs: dict, weights: dict, dims: dict, *, attn,
             AdaLN), and the step-invariant NVFP4 sites ``qkv`` (16 self
             layers), ``q`` (16 cross layers), ``o``, ``ff_up``, ``ff_down``
             (32 layers), each entry ``(w_packed, sf_packed, w_gs, bias)``.
-        dims: ``Sa``, ``Skv_text``, ``Skv_image``.
+        dims: ``Sa``, ``Skv_text``, ``Skv_image``, optional ``kv_ld`` (row
+            stride of the cross K / V, default ``D``).
     """
     cfg = cfg or SKINNY_CFG
     Sa = int(dims["Sa"])
     Skv_text = int(dims["Skv_text"])
     Skv_image = int(dims["Skv_image"])
+    kv_ld = int(dims.get("kv_ld", D))   # row stride of the cross K / V
     h = int(bufs["h"])
     xn, xn_sf = int(bufs["xn"]), int(bufs["xn_sf"])
     hid, hid_sf = int(bufs["hid"]), int(bufs["hid_sf"])
@@ -106,7 +108,7 @@ def dit_forward_nvfp4(fvk, bufs: dict, weights: dict, dims: dict, *, attn,
             splits = _gemm(xn, xn_sf, site, D, D, li, "q gemm")
             kv = Skv_text if li % 4 == 0 else Skv_image
             _ck(fvk.nvfp4_skinny_partials_attention(part, splits, one, site[2], site[3], D, slots["K"],
-                                                    slots["V"], D, kv, True, slots["O"], Sa, HEADS, HEAD_DIM,
+                                                    slots["V"], kv_ld, kv, True, slots["O"], Sa, HEADS, HEAD_DIM,
                                                     HEAD_DIM ** -0.5, pdl, stream), "cross attention", li)
 
         # O projection (attention output quantized on load) -> bias + residual
