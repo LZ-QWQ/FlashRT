@@ -129,3 +129,154 @@ def dit_forward_nvfp4(fvk, bufs: dict, weights: dict, dims: dict, *, attn,
             _ck(fvk.nvfp4_skinny_sum_bias_residual_norm(
                 part, splits, one, site[2], site[3], h, int(weights["out_scale"]), int(weights["out_shift"]),
                 0, 0, 0, hmod, Sa, D, EPS, pdl, stream), "ffn residual out-norm", li)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Backbone on NVFP4 (ViT taps + DeepStack, LLM, VLLN + VL self-attention)
+# ─────────────────────────────────────────────────────────────────────────
+#
+# Every projection is a CUTLASS SM120 block-scaled W4A4 GEMM whose epilogue
+# carries the bias, the residual add (C = D = residual stream), GELU / SwiGLU
+# with an NVFP4 output, so the only non-GEMM launches per layer are the norm
+# that emits the next NVFP4 operand, RoPE (fused with the per-head q/k norm)
+# on the fused QKV output, attention reading Q/K/V in place, and the NVFP4
+# quantization of the attention output. Residual streams are BF16;
+# activation block scales are dynamic (global scale 1).
+
+VIT_TAPS = (5, 11, 17)
+
+
+class NvFp4Linear:
+    """Packed NVFP4 weight + swizzled scales + per-tensor alpha + bias."""
+
+    __slots__ = ("w", "sf", "alpha", "bias", "n", "k")
+
+    def __init__(self, w: int, sf: int, alpha: float, bias: int, n: int, k: int):
+        self.w, self.sf, self.alpha, self.bias, self.n, self.k = w, sf, float(alpha), bias, n, k
+
+
+def _ck(rc: int, what: str) -> None:
+    if rc != 0:
+        raise RuntimeError(f"N1.7 NVFP4 backbone {what} failed: status {rc}")
+
+
+def _schedule(lin: NvFp4Linear) -> int:
+    # stream-K for the long-K projections (down / fc2 at K >= 6144), whose
+    # persistent tiling otherwise leaves SMs idle at these row counts.
+    return 1 if lin.k >= 6144 else 0
+
+
+def linear_bf16(fvk, a, a_sf, lin: NvFp4Linear, out, M, stream, *, residual: bool = False) -> None:
+    """out = a @ W^T * alpha + bias (+ out when residual)."""
+    _ck(fvk.nvfp4_gemm_bias_res_bf16out(a, lin.w, a_sf, lin.sf, lin.bias, out if residual else 0, out,
+                                        M, lin.n, lin.k, lin.alpha, 1.0 if residual else 0.0,
+                                        _schedule(lin), stream), f"gemm {M}x{lin.n}x{lin.k}")
+
+
+def linear_gelu_fp4(fvk, a, a_sf, lin: NvFp4Linear, out, out_sf, M, stream) -> None:
+    """NVFP4 out = quant(gelu(a @ W^T * alpha + bias)); M must be a multiple of
+    128 (the block-scale-factor epilogue runs whole tiles: pass the padded row
+    count of zero-padded operands)."""
+    fvk.fp4_w4a16_gemm_bias_gelu_fp4out_sm120(a, lin.w, a_sf, lin.sf, lin.bias, out, out_sf,
+                                             M, lin.n, lin.k, lin.alpha, stream)
+
+
+def attention(fa2, q, k, v, o, lse, *, batch, seqlen, hq, hkv, hd, ld_qkv, ld_o, causal, num_sms, stream):
+    fwd = fa2.fwd_bf16_causal if causal else fa2.fwd_bf16
+    fwd(Q=q, K=k, V=v, O=o, softmax_lse=lse, softmax_lse_accum=0, o_accum=0,
+        batch=batch, seqlen_q=seqlen, seqlen_k=seqlen, num_heads_q=hq, num_heads_kv=hkv, head_dim=hd,
+        q_strides=(seqlen * ld_qkv, ld_qkv, hd), k_strides=(seqlen * ld_qkv, ld_qkv, hd),
+        v_strides=(seqlen * ld_qkv, ld_qkv, hd), o_strides=(seqlen * ld_o, ld_o, hd),
+        softmax_scale=1.0 / (hd ** 0.5), num_sms=num_sms, stream=stream)
+
+
+def vit_forward_nvfp4(fvk, fa2, B: dict, W: dict, dims: dict, *, stream: int, num_sms: int) -> None:
+    """Qwen3-VL ViT layers 0..17 with the three DeepStack mergers run at their
+    taps (the backbone consumes only the taps; the merger of the final layer
+    is not part of the action pipeline)."""
+    S, nv = int(dims["S"]), int(dims["views"])
+    Sper, D, FF, NH, HD = S // nv, 1024, 4096, 16, 64
+    Nout = S // 4
+    h, xq, xsf = B["vit_h"], B["vit_xq"], B["vit_xsf"]
+    qkv, o, lse, hq, hsf = B["vit_qkv"], B["vit_o"], B["vit_lse"], B["vit_hq"], B["vit_hsf"]
+    one = B["one"]
+    for li in range(VIT_TAPS[-1] + 1):
+        L = W["vit"][li]
+        _ck(fvk.nvfp4_norm_quant(h, L["ln1_w"], L["ln1_b"], 0, 1e-6, xq, xsf, one, S, D, stream), "vit ln1")
+        linear_bf16(fvk, xq, xsf, L["qkv"], qkv, S, stream)
+        _ck(fvk.nvfp4_qk_norm_rope(qkv, 3 * D, 0, D, NH, NH, HD, W["vit_cos"], W["vit_sin"], 0, 0, 1e-6,
+                                   S, stream), "vit rope")
+        attention(fa2, qkv, qkv + 2 * D, qkv + 4 * D, o, lse, batch=nv, seqlen=Sper, hq=NH, hkv=NH, hd=HD,
+                  ld_qkv=3 * D, ld_o=D, causal=False, num_sms=num_sms, stream=stream)
+        _ck(fvk.nvfp4_quant(o, D, xq, xsf, one, S, D, stream), "vit o quant")
+        linear_bf16(fvk, xq, xsf, L["o"], h, S, stream, residual=True)
+        _ck(fvk.nvfp4_norm_quant(h, L["ln2_w"], L["ln2_b"], 0, 1e-6, xq, xsf, one, S, D, stream), "vit ln2")
+        linear_gelu_fp4(fvk, xq, xsf, L["fc1"], hq, hsf, S, stream)
+        linear_bf16(fvk, hq, hsf, L["fc2"], h, S, stream, residual=True)
+        if li in VIT_TAPS:
+            j = VIT_TAPS.index(li)
+            M = W["ds"][j]
+            # spatial-merge groups of 4 consecutive patch tokens: [S, D] viewed as [S/4, 4D]
+            _ck(fvk.nvfp4_norm_quant(h, M["ln_w"], M["ln_b"], 0, 1e-6, B["ds_xq"], B["ds_xsf"], one,
+                                     Nout, 4 * D, stream), "deepstack ln")
+            linear_gelu_fp4(fvk, B["ds_xq"], B["ds_xsf"], M["fc1"], B["ds_hq"], B["ds_hsf"], Nout, stream)
+            linear_bf16(fvk, B["ds_hq"], B["ds_hsf"], M["fc2"], B["ds_out"][j], Nout, stream)
+
+
+def llm_forward_nvfp4(fvk, fa2, B: dict, W: dict, dims: dict, *, stream: int, num_sms: int) -> None:
+    """16 truncated Qwen3-VL decoder layers (causal GQA, q/k norm, M-RoPE,
+    SwiGLU), DeepStack features added at the visual rows after layers 0..2."""
+    S, D, FF, NHQ, NHKV, HD = int(dims["S"]), 2048, 6144, 16, 8, 128
+    Sp = int(dims["S_pad"])
+    QKV = (NHQ + 2 * NHKV) * HD
+    h, xq, xsf = B["llm_h"], B["llm_xq"], B["llm_xsf"]
+    qkv, o, lse, gq, gsf = B["llm_qkv"], B["llm_o"], B["llm_lse"], B["llm_gq"], B["llm_gsf"]
+    one = B["one"]
+    n_vis = int(dims["n_vis"])
+    for li in range(16):
+        L = W["llm"][li]
+        _ck(fvk.nvfp4_norm_quant(h, L["in_ln_w"], 0, 1, 1e-6, xq, xsf, one, S, D, stream), "llm in-norm")
+        linear_bf16(fvk, xq, xsf, L["qkv"], qkv, S, stream)
+        _ck(fvk.nvfp4_qk_norm_rope(qkv, QKV, 0, NHQ * HD, NHQ, NHKV, HD, W["llm_cos"], W["llm_sin"],
+                                   L["q_norm_w"], L["k_norm_w"], 1e-6, S, stream), "llm qk norm rope")
+        attention(fa2, qkv, qkv + 2 * NHQ * HD, qkv + 2 * (NHQ + NHKV) * HD, o, lse, batch=1, seqlen=S,
+                  hq=NHQ, hkv=NHKV, hd=HD, ld_qkv=QKV, ld_o=NHQ * HD, causal=True, num_sms=num_sms,
+                  stream=stream)
+        _ck(fvk.nvfp4_quant(o, NHQ * HD, xq, xsf, one, S, NHQ * HD, stream), "llm o quant")
+        linear_bf16(fvk, xq, xsf, L["o"], h, S, stream, residual=True)
+        _ck(fvk.nvfp4_norm_quant(h, L["post_ln_w"], 0, 1, 1e-6, xq, xsf, one, S, D, stream), "llm post-norm")
+        # SwiGLU fold: one GEMM on the row-interleaved gate|up weight, silu(g)*u
+        # and the NVFP4 block scales in its epilogue (full-width output), then
+        # the even-column compaction into the down projection's operand.
+        gu = L["gate_up"]
+        fvk.fp4_w4a16_dual_gemm_silu_fp4out_sm120(xq, gu.w, gu.w, xsf, gu.sf, gu.sf, B["llm_fold"], gsf,
+                                                 Sp, 2 * FF, D, gu.alpha_gate, gu.alpha_up, stream)
+        fvk.fp4_swiglu_even_col_compact_v2(B["llm_fold"], gq, S, FF, stream)
+        linear_bf16(fvk, gq, gsf, L["down"], h, S, stream, residual=True)
+        if li < 3:
+            _ck(fvk.nvfp4_scatter_add_rows(h, B["ds_out"][li], B["vis_idx"], n_vis, D, stream), "deepstack add")
+
+
+def vlsa_forward_nvfp4(fvk, fa2, B: dict, W: dict, dims: dict, *, stream: int, num_sms: int) -> None:
+    """VLLN, then the 4-layer VL self-attention transformer; the result is
+    written as FP16 into ``out_fp16`` for the DiT cross-KV refresh."""
+    S, D, NH, HD, FF = int(dims["S"]), 2048, 32, 64, 8192
+    Sp = int(dims["S_pad"])
+    h, xq, xsf = B["vlsa_h"], B["vlsa_xq"], B["vlsa_xsf"]
+    qkv, o, lse, hq, hsf = B["vlsa_qkv"], B["vlsa_o"], B["vlsa_lse"], B["vlsa_hq"], B["vlsa_hsf"]
+    one = B["one"]
+    # VLLN: LayerNorm(w, b) == no-affine norm modulated by (1 + (w - 1)) and shift b.
+    _ck(fvk.nvfp4_skinny_layer_norm(B["llm_h"], W["vlln_wm1"], W["vlln_b"], 0, 0, 0, h, S, D, 1e-5,
+                                    False, stream), "vlln")
+    for li in range(4):
+        L = W["vlsa"][li]
+        _ck(fvk.nvfp4_norm_quant(h, L["n1_w"], L["n1_b"], 0, 1e-5, xq, xsf, one, S, D, stream), "vlsa norm1")
+        linear_bf16(fvk, xq, xsf, L["qkv"], qkv, S, stream)
+        attention(fa2, qkv, qkv + 2 * D, qkv + 4 * D, o, lse, batch=1, seqlen=S, hq=NH, hkv=NH, hd=HD,
+                  ld_qkv=3 * D, ld_o=D, causal=False, num_sms=num_sms, stream=stream)
+        _ck(fvk.nvfp4_quant(o, D, xq, xsf, one, S, D, stream), "vlsa o quant")
+        linear_bf16(fvk, xq, xsf, L["o"], h, S, stream, residual=True)
+        _ck(fvk.nvfp4_norm_quant(h, L["n3_w"], L["n3_b"], 0, 1e-5, xq, xsf, one, S, D, stream), "vlsa norm3")
+        linear_gelu_fp4(fvk, xq, xsf, L["fc1"], hq, hsf, Sp, stream)
+        linear_bf16(fvk, hq, hsf, L["fc2"], h, S, stream, residual=True)
+    fvk.cast_bf16_to_fp16(h, B["out_fp16"], S * D, stream)

@@ -741,7 +741,8 @@ if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
     csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_bf16out_sm120.cu
     csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_fp4out_sm120.cu
     csrc/gemm/fp4/cutlass_nvfp4_gemm_dn_streamk_bias_sm120.cu
-    csrc/gemm/fp4/cutlass_nvfp4_dual_gemm_silu_fp4out_sm120.cu)
+    csrc/gemm/fp4/cutlass_nvfp4_dual_gemm_silu_fp4out_sm120.cu
+    csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_res_sm120.cu)
   set_target_properties(sm120_nvfp4_ffn_obj PROPERTIES
     CUDA_STANDARD 17
     POSITION_INDEPENDENT_CODE ON
@@ -762,12 +763,14 @@ if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
   # small-row weight-streaming shapes: action decoders and DiT heads).
   add_library(nvfp4_skinny_sm120_obj OBJECT
     csrc/gemm/fp4/nvfp4_skinny_gemm_sm120.cu
-    csrc/gemm/fp4/nvfp4_skinny_consumers_sm120.cu)
+    csrc/gemm/fp4/nvfp4_skinny_consumers_sm120.cu
+    csrc/kernels/nvfp4_prefill_sm120.cu)
   set_target_properties(nvfp4_skinny_sm120_obj PROPERTIES
     CUDA_STANDARD 17
     POSITION_INDEPENDENT_CODE ON
   )
   target_include_directories(nvfp4_skinny_sm120_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm/fp4
   )
   target_compile_options(nvfp4_skinny_sm120_obj PRIVATE

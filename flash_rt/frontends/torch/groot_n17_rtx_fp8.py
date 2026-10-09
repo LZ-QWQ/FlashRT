@@ -356,11 +356,16 @@ class _GrootN17FP8BackboneMixin:
             return cb
         dcap = [mk_cb(l) for l in tap_layers]
 
+        # Only the DeepStack taps leave the ViT on this path (the LLM input
+        # embeddings arrive in aux), so the layers after the last tap are
+        # skipped: their output has no consumer.
+        vit_layers = range(tap_layers[-1] + 1)
         P.qwen3vl_vit_forward(
             gemm=gemm, fvk=fvkm, bufs=vit_bufs, weights=vw, scales_dev=vit_scales,
             dims={"S": Sv, "D": 1024, "NH": 16, "HD": 64,
                   "ff_inner": 4096, "Sper_view": Sv // nv},
-            attn=attn, deepstack_taps=tap_layers, deepstack_capture=dcap)
+            attn=attn, layers_subset=vit_layers, deepstack_taps=tap_layers,
+            deepstack_capture=dcap)
 
         # ═══ DeepStack (3 mergers) ═══
         Nout = Sv // 4
@@ -515,8 +520,8 @@ class _GrootN17FP8BackboneMixin:
             P.qwen3vl_vit_forward(
                 gemm=gemm, fvk=fvkm, bufs=vit_bufs, weights=vw,
                 scales_dev=vit_scales, dims=vit_dims, attn=attn,
-                deepstack_taps=tap_layers, deepstack_capture=dcap,
-                stream=stream)
+                layers_subset=vit_layers, deepstack_taps=tap_layers,
+                deepstack_capture=dcap, stream=stream)
             P.deepstack_merge_forward(
                 gemm=gemm, fvk=fvkm, bufs=ds_bufs, weights=dsw,
                 scales_dev=ds_scales, dims=ds_dims, stream=stream)
