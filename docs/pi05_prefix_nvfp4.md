@@ -1,78 +1,94 @@
-# Pi0.5 prefix on NVFP4 (RTX 5090, sm_120a): an optional tier
+# Pi0.5 on NVFP4 (RTX 5090, sm_120a): an optional tier
 
-Build with `-DFLASHRT_ENABLE_PI05_NVFP4=ON` to use this optional tier.
-The option defaults to OFF and requires `GPU_ARCH=120`.
+Build with `-DGPU_ARCH=120 -DFLASHRT_ENABLE_PI05_SKINNY=ON
+-DFLASHRT_ENABLE_PI05_NVFP4=ON` to use this optional tier. Both options
+default to OFF.
 
-This optional tier runs the Pi0.5 prefix (SigLIP-L over two views plus the
-Gemma-2B encoder) on NVFP4 weights and activations. It can be combined with
-the explicitly selected skinny decoder (`docs/pi05_decoder_skinny.md`).
+The tier runs the Pi0.5 vision tower, the Gemma-2B FFNs and the action
+decoder on NVFP4 (e2m1 values, UE4M3 scales per 16 elements, a per-tensor
+global scale). Every quantization happens inside the kernel that produces the
+operand — a norm, a GEMM epilogue or a decoder consumer — so the graph has no
+standalone quantize or dequantize pass around the 4-bit GEMMs.
 
-It is a tier, not the default: 4-bit operands cost about 2.5e-3 of cosine
-against the BF16 engine on real frames where FP8 costs 5e-5. Use it where
-that is acceptable (off-policy data collection, evaluation sweeps) and
-qualify it per task.
+It is a tier, not the default: against the FP8 skinny profile it trades about
+1e-4 of action cosine (vs the FP16 engine) for ~1.46x lower E2E latency.
+Qualify it per task before deploying.
 
 ## Use
 
 ```python
-rt = Pi05TorchFrontendRtx(ckpt, num_views=2, prefix_precision="nvfp4")   # default "fp8"
+model = flash_rt.load_model(ckpt, config="pi05", framework="torch",
+                            hardware="rtx_sm120", num_views=2, use_fp4=True)
 ```
 
-or `FLASHRT_PI05_PREFIX_PRECISION=nvfp4`. Needs the FP8 frontend
-(`use_fp8=True`), an sm_120a kernel build and a Blackwell GPU; the decoder
-keeps its FP8 path (calibrated as before). `reload_weights` re-quantizes the
-NVFP4 weights in place.
+`use_fp4=True` on `rtx_sm120` selects both halves of the tier. They can also be
+chosen separately on the frontend:
+
+```python
+rt = Pi05TorchFrontendRtx(ckpt, num_views=2,
+                          prefix_precision="nvfp4",    # default "fp8"
+                          decoder_precision="nvfp4")   # default "fp8"
+```
+
+or with `FLASHRT_PI05_PREFIX_PRECISION` / `FLASHRT_PI05_DECODER_PRECISION`.
+The tier needs the FP8 frontend (`use_fp8=True`): its calibration supplies the
+static global scales below. `reload_weights` re-quantizes in place.
 
 ## What runs where
 
-- Weights: every vision and encoder GEMM (SigLIP qkv/o/up/down, the
-  multimodal projector, Gemma qkv/o/gate|up/down) is quantized at load to
-  e2m1 with per-16 UE4M3 block scales in the swizzled layout and a
-  per-tensor global scale (`bf16_weight_to_nvfp4_swizzled`), laid out
-  [N, K]. SigLIP FFN down has K = 4304, which the GEMM does not accept; its
-  weight is padded to K = 4352 with zero columns and the activation is
-  staged into a zero-tailed buffer by a strided device copy.
-- Activations: quantized per call to e2m1 with per-16 UE4M3 scales
-  (`quantize_bf16_to_nvfp4_swizzled_v2`); no calibration. The encoder FFN
-  tail uses one fused kernel, `pi05_geglu_merged_to_nvfp4_swizzled`, that reads
-  the merged [gate | up] buffer once, applies GeGLU and quantizes (bit
-  identical to the unfused GeGLU + quantizer pair).
-- GEMM: `fp4_w4a16_gemm_sm120_bf16out_pingpong` (the pingpong schedule
-  won every prefix shape in the standalone sweep).
-- Dispatch: the pipeline's `_fp8_gemm` (single) and `_fp8_gemm_b2`
-  (batched) route a site to NVFP4 when its name is in the frontend's
-  NVFP4 table; the encoder's fused FP8 norm→GEMM branch and the FP8
-  autotuning of prefix shapes are skipped in this tier. The FP8 copies of
-  the prefix weights are still built (1.8 GB) so the calibration and
-  fallback paths stay as they are; dropping them is a later cleanup.
+| stage | precision | kernels per layer |
+|---|---|---|
+| SigLIP attention (27 layers) | NVFP4 | LayerNorm → e2m1; QKV GEMM with the bias in its epilogue; attention read straight from the QKV rows (`fused_qkv_attention`, head_dim 72 padded to 80, no head-split pass); output → e2m1; O GEMM with bias + residual in its epilogue |
+| SigLIP FFN | NVFP4 | LayerNorm → e2m1; up GEMM with bias + GELU → e2m1 epilogue (hidden padded 4304 → 4352); down GEMM with bias + residual |
+| Gemma attention (18 layers) | FP8 | 4-bit Q/K at head_dim 256 costs ~0.2 action cosine on real frames, so Q/K/V/O stay FP8; FA2 runs unsplit on SM120 |
+| Gemma FFN | NVFP4 | residual + RMSNorm → e2m1; gate\|up GEMM over row-interleaved weights with GeGLU → e2m1 in the epilogue; even-column compaction; down GEMM (stream-K) |
+| decoder (10 steps x 18 layers) | NVFP4 | skinny W4A4 family: weights prefetched into registers before the programmatic-dependent-launch wait, K-split partials, fused consumers (residual + AdaRMSNorm → e2m1, gate GELU → e2m1, Q/K RoPE) |
+
+Static global scales: the inputs of the down projections are GELU / GeGLU
+outputs whose range reaches ~1e4 in late Gemma layers, beyond the 2688 that a
+global scale of 1 can represent. Their global scale is the FP8 calibration's
+`amax / 448`, applied as the producing epilogue's norm constant and folded into
+the down GEMM's alpha. Normalized inputs run with a global scale of 1. Weights
+use `amax / (6 * 448)`; the prefix weights also search the block scale for the
+least squared error (on the decoder that search measured slightly worse, so its
+block scales round up).
+
+`FLASHRT_PI05_ENC_O_NVFP4=1` (opt-in) moves the Gemma attention output
+projection to NVFP4 as well: ~1% faster, action cosine min 0.9992 → 0.9990 on
+the frames below.
 
 ## Numbers
 
-Measure synchronized observation-to-final-action E2E with
-`tools/bench_pi05_e2e.py --profile nvfp4`, using the same checkpoint,
-observation fixture, input contract and container as `--profile skinny`.
-Both profiles explicitly select skinny; only the prefix precision differs.
-See the skinny documentation for the complete timing boundary. Kernel and
-partial graph timings are not E2E results.
+RTX 5090, 2 views, `pi05_libero_pytorch`, synchronized observation-to-final-
+action E2E with `tools/bench_pi05_e2e.py` (state in the prompt every frame,
+200 iterations, 8 LIBERO frames, one container and fixture for all rows):
 
-Agreement on real LIBERO frames, same prompt and noise (six frames):
+| `--profile` | prefix | decoder | p50 | p95 |
+|---|---|---|---:|---:|
+| `default` | FP8 | FP8 | 20.89 ms | 21.11 ms |
+| `skinny` | FP8 | FP8 skinny | 15.13 ms | 15.41 ms |
+| `nvfp4` | NVFP4 | FP8 skinny | 11.23 ms | 11.53 ms |
+| `nvfp4-full` | NVFP4 | NVFP4 skinny | 10.37 ms | 10.63 ms |
 
-| comparison | cosine min | median |
+The captured graph of the `nvfp4-full` tier replays in 8.24 ms (vision 1.75,
+encoder 3.3, decoder 3.25 ms under CUPTI); the rest of the E2E is the host-side
+tokenization, image upload and action download.
+
+Agreement on 24 real LIBERO frames, same prompt and pinned noise, against the
+FP16 frontend:
+
+| tier | action cosine mean | min |
 |---|---:|---:|
-| FP8 prefix vs BF16 engine | 0.99968 | 0.99995 |
-| NVFP4 prefix vs BF16 engine | 0.99568 | 0.99755 |
-| NVFP4 prefix vs FP8 prefix | 0.99542 | 0.99735 |
-| batched B = 4 vs single, NVFP4, per slot | 0.99798 | 0.99986 |
+| FP8 prefix + FP8 skinny decoder | 0.99998 | 0.99997 |
+| NVFP4 prefix + NVFP4 decoder | 0.99986 | 0.99915 |
 
-Replays are bit-identical. `tests/test_pi05_prefix_nvfp4.py` gates the
-fused quantizer bit-for-bit against the unfused pair, the tier against FP8
-on synthetic frames (0.99-0.998 there), the batched pipeline and a reload.
+Replays are bit-identical. `tests/test_pi05_prefix_nvfp4.py` gates the tier
+against FP8, the NVFP4 decoder, the batched pipeline and a weight reload.
 
-## Limits and next steps
+## Limits
 
 - sm_120a only.
-- The activation quantizer for K = 4352 (SigLIP down) falls back to the
-  row-per-CTA kernel. Writing the FFN up projection into a padded buffer
-  could remove the strided staging copy.
-- Per-task success-rate qualification decides whether a deployment uses
-  this tier; the numbers above are the engineering gate only.
+- The Gemma attention (FP8 projections, FA2 at head_dim 256, ~31 us per layer)
+  is now the largest prefix cost after the GEMMs.
+- The numbers above are the engineering gate; closed-loop success rates decide
+  per task whether a deployment uses the tier.

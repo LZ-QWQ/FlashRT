@@ -131,6 +131,7 @@ Baseline comparisons and source methodology live in [Benchmark Comparison](docs/
 | Jetson AGX Thor | OpenPI FP8, 2 cameras | **40.71 ms** | **24.6 Hz** | [Verified results](docs/thor/pi05.md#4-check-the-result) |
 | Jetson AGX Thor | OpenPI NVFP4 + FA4, 2 cameras | **20.33 ms** | **49.2 Hz** | [Verified results](docs/thor/pi05.md#4-check-the-result) |
 | RTX 5090 | FP8, 2-view | **17.58 ms** | **57 Hz** | [Blackwell VLA](examples/blackwell/README.md#vla-latency-rtx-5090) |
+| RTX 5090 | NVFP4 tier (`use_fp4=True`), 2-view, state in prompt | **10.37 ms** | **96 Hz** | [Pi0.5 NVFP4](docs/pi05_prefix_nvfp4.md#numbers) (FP8 on the same harness: 15.13 ms) |
 | AMD Instinct MI350X | FP8, CDNA4 | **16.4 ms** | **61 Hz** | [AMD Pi0.5](docs/deployment_amd_pi05.md) |
 
 The Thor rows use OpenPI `pi05_libero`, two cameras and 10 denoising steps.
@@ -170,7 +171,8 @@ Using OpenPI's `pi05_libero` model, FlashRT achieved **94.29% success on LIBERO-
 | Jetson AGX Thor | NVFP4 + FA4, LIBERO `libero_10`, 1 camera | **23.23 ms** | **43.0 Hz** | [Reproduce](docs/thor/groot-n17.md) |
 | Jetson AGX Thor | NVFP4 + FA4, DROID 2-view feature graph | **29.60 ms** | **33 Hz** | — |
 | Jetson AGX Thor | FP8, DROID 2-view feature graph | **48.94 ms** | **20.4 Hz** | — |
-| RTX 5090 | FP8, 2-view base, full graph | **16.6 ms** | **60 Hz** | [GROOT N1.7 API](#groot-n17-rtx) |
+| RTX 5090 | FP8, 2-view base, full graph | **14.0 ms** | **71 Hz** | [GROOT N1.7 API](#groot-n17-rtx) |
+| RTX 5090 | NVFP4 action head + fused FP8 backbone, 2-view, full graph | **8.64 ms** | **116 Hz** | [GROOT N1.7 NVFP4](docs/groot_n17_rtx_nvfp4.md) |
 | AMD Instinct MI350X | FP8 backbone + BF16 DiT, full frame | **16.0 ms** | **62 Hz** | [AMD deployment](docs/deployment_amd.md) |
 
 The LIBERO row uses four denoising steps, batch 1 and two CPU threads. Latency
@@ -667,6 +669,11 @@ graph, covering the complete backbone-to-action execution without rebuilding
 per-call scratch buffers. Omitting `aux` keeps the original eager backbone from
 `set_prompt()` and does not capture the optional graph. See
 [USAGE.md](USAGE.md#groot-n17-rtx).
+
+On `rtx_sm120`, `use_fp4=True` selects the NVFP4 tier: the DiT action head and
+its cross-attention K/V run on NVFP4 with fused producers and consumers, the
+backbone stays FP8 (8.64 ms vs 14.01 ms per `infer(aux=...)` on DROID 2-view
+frames). See [GROOT N1.7 NVFP4](docs/groot_n17_rtx_nvfp4.md).
 
 ### Autotune
 
