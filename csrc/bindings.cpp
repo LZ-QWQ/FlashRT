@@ -77,6 +77,7 @@
 #include "gemm/fp4/cutlass_nvfp4_gemm_glu_fp4out_sm120.cuh"
 #include "kernels/nvfp4_prefill_sm120.cuh"
 #include "kernels/fp8_prefill_fp16.cuh"
+#include "kernels/fused_qkv_attention.cuh"
 #endif
 #if defined(ENABLE_CUTLASS_SM120_NVFP4_W4A16) || defined(ENABLE_CUTLASS_SM100_NVFP4_W4A16)
 #include "quantize/nvfp4_sf_reshape_sm120.cuh"
@@ -7695,6 +7696,20 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     // FP8 prefill on an FP16 residual stream: fused residual / norm / bias /
     // activation / RoPE producers and consumers around per-tensor FP8 GEMMs.
     // See kernels/fp8_prefill_fp16.cuh.
+    // Non-causal prefill attention straight from projection rows (bias /
+    // RoPE on load). See kernels/fused_qkv_attention.cuh.
+    m.def("fused_qkv_attention", [](int dtype, uintptr_t q, uintptr_t k, uintptr_t v, int ld, uintptr_t q_bias,
+                                   uintptr_t k_bias, uintptr_t v_bias, uintptr_t cos, uintptr_t sin, uintptr_t out,
+                                   int out_ld, int batches, int S, int heads, int hd, float scale, uintptr_t stream) {
+        return flash_rt::prefill_attention::fused_qkv_attention(
+            dtype, reinterpret_cast<const void*>(q), reinterpret_cast<const void*>(k),
+            reinterpret_cast<const void*>(v), ld, reinterpret_cast<const void*>(q_bias),
+            reinterpret_cast<const void*>(k_bias), reinterpret_cast<const void*>(v_bias),
+            reinterpret_cast<const void*>(cos), reinterpret_cast<const void*>(sin), reinterpret_cast<void*>(out),
+            out_ld, batches, S, heads, hd, scale, to_stream(stream));
+    }, py::arg("dtype"), py::arg("q"), py::arg("k"), py::arg("v"), py::arg("ld"), py::arg("q_bias"),
+       py::arg("k_bias"), py::arg("v_bias"), py::arg("cos"), py::arg("sin"), py::arg("out"), py::arg("out_ld"),
+       py::arg("batches"), py::arg("S"), py::arg("heads"), py::arg("hd"), py::arg("scale"), py::arg("stream") = 0);
     m.def("fp8_residual_norm_quant", [](uintptr_t x, uintptr_t delta, uintptr_t delta_bias, uintptr_t delta2,
                                        uintptr_t x_copy, uintptr_t weight, uintptr_t bias, int mode, float eps,
                                        uintptr_t out_fp8, uintptr_t scale, uintptr_t out_f16, int rows, int dim,

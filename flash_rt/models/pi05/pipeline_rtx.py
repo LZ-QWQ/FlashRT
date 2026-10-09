@@ -1311,10 +1311,13 @@ class Pi05Pipeline:
             self._ffn_fp4_finalize()
 
     def _vision_attn_nvfp4(self, i: int, m: int, x_ptr: int, qkv_ptr: int, split_fn, attn_fn,
-                           stream: int) -> None:
+                           stream: int, o_ptr: int = 0, views: int = 0) -> None:
         """x += attn(LayerNorm(x)) on NVFP4: pre-attn LayerNorm -> e2m1, QKV
-        GEMM with the bias in its epilogue, head split, attention, attention
-        output -> e2m1, O GEMM with bias and residual in its epilogue."""
+        GEMM with the bias in its epilogue, attention, attention output ->
+        e2m1, O GEMM with bias and residual in its epilogue. With ``o_ptr``
+        the attention reads the per-view heads straight from the QKV rows
+        (``fused_qkv_attention``, into o_ptr); otherwise ``split_fn`` lays
+        the heads out and ``attn_fn`` runs the backend attention."""
         self._ffn_fp4_check(m, stream)
         fvk, W, B = self.fvk, self.weights, self.bufs
         t = W["ffn_nvfp4"]["vis"][i]
@@ -1330,8 +1333,13 @@ class Pi05Pipeline:
         w, sf, a = t["qkv"]
         _ck(fvk.nvfp4_gemm_bias_res_bf16out(x4, w, x4sf, sf, W["vision_attn_qkv_b"][i], 0, qkv_ptr,
                                             m, 3 * VIS_D, VIS_D, a, 0.0, 0, stream), "qkv")
-        split_fn()
-        o_ptr = attn_fn()
+        if o_ptr and hasattr(fvk, "fused_qkv_attention"):
+            _ck(fvk.fused_qkv_attention(1, qkv_ptr, qkv_ptr + 2 * VIS_D, qkv_ptr + 4 * VIS_D, 3 * VIS_D, 0, 0, 0,
+                                        0, 0, o_ptr, VIS_D, views, m // views, VIS_NH, VIS_HD, VIS_HD ** -0.5,
+                                        stream), "attention")
+        else:
+            split_fn()
+            o_ptr = attn_fn()
         _ck(fvk.nvfp4_quant(o_ptr, VIS_D, x4, x4sf, one, m, VIS_D, stream), "o quant")
         w, sf, a = t["o"]
         _ck(fvk.nvfp4_gemm_bias_res_bf16out(x4, w, x4sf, sf, W["vision_attn_o_b"][i], x_ptr, x_ptr,
@@ -1590,7 +1598,8 @@ class Pi05Pipeline:
                 i, seq, x_ptr, B["vision_QKV"].ptr.value,
                 lambda: fvk.qkv_split(B["vision_QKV"].ptr.value, attn_ptrs["vis_Q"], attn_ptrs["vis_K"],
                                       attn_ptrs["vis_V"], seq, VIS_D, VIS_D, VIS_D, stream=stream),
-                lambda: self.attn.run("siglip", i, q_seq=VIS_SEQ_PER_VIEW, stream=stream), stream)
+                lambda: self.attn.run("siglip", i, q_seq=VIS_SEQ_PER_VIEW, stream=stream), stream,
+                o_ptr=self.attn._vis_O72.data_ptr(), views=seq // VIS_SEQ_PER_VIEW)
             self._vision_ffn_nvfp4(i, seq, x_ptr, stream)
             return
 
