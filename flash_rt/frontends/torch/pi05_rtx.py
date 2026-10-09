@@ -1250,7 +1250,7 @@ class Pi05TorchFrontendRtx:
         kernels stream. With ``inplace=True`` the existing buffers are
         refilled (weight reload)."""
         from flash_rt import flash_rt_kernels as fvk
-        if not hasattr(fvk, "pi05_dec_fp4_gemm"):
+        if not hasattr(fvk, "nvfp4_skinny_gemm"):
             raise RuntimeError("decoder_precision='nvfp4' needs a GPU_ARCH=120 build with "
                                "FLASHRT_ENABLE_PI05_NVFP4=ON")
         W = self._ckpt_bf16
@@ -1283,9 +1283,9 @@ class Pi05TorchFrontendRtx:
                 gs.copy_((w_nk.float().abs().amax() / (6.0 * 448.0)).clamp_min(1e-12).reshape(1))
                 q = torch.empty(N, K // 2, dtype=torch.uint8, device="cuda")
                 sf = torch.empty(N, K // 16, dtype=torch.uint8, device="cuda")
-                _check(fvk.pi05_dec_fp4_quantize_weight(w_nk.data_ptr(), gs.data_ptr(), q.data_ptr(),
+                _check(fvk.nvfp4_skinny_quantize_weight(w_nk.data_ptr(), gs.data_ptr(), q.data_ptr(),
                                                         sf.data_ptr(), N, K, 0), "quantize", name)
-                _check(fvk.pi05_dec_fp4_pack_weight(q.data_ptr(), sf.data_ptr(), packed.data_ptr(),
+                _check(fvk.nvfp4_skinny_pack_weight(q.data_ptr(), sf.data_ptr(), packed.data_ptr(),
                                                     sf_packed.data_ptr(), N, K, 0), "pack", name)
                 if not inplace:
                     index[name] = len(store)

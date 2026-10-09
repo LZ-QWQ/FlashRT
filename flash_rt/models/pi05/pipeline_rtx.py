@@ -913,7 +913,7 @@ class Pi05Pipeline:
             splits = k // self.fvk.pi05_dec_skinny_config_k_chunk(cfg)
             elems = max(elems, splits * rows * n)
         for (n, k), cfg in getattr(self, "_dec_fp4_cfg", {}).items():
-            splits = k // self.fvk.pi05_dec_fp4_config_k_chunk(cfg)
+            splits = k // self.fvk.nvfp4_skinny_config_k_chunk(cfg)
             elems = max(elems, splits * rows * n)
         self._skinny_partials = CudaBuffer.device_zeros(elems, FP32)
         self._skinny_partials_rows = rows
@@ -1073,7 +1073,7 @@ class Pi05Pipeline:
                 "decoder_precision='nvfp4' runs on the skinny decoder family: it needs "
                 "decoder_kernel='skinny', the calibrated FP8 decoder and a "
                 "FLASHRT_ENABLE_PI05_SKINNY=ON build")
-        if not hasattr(self.fvk, "pi05_dec_fp4_gemm"):
+        if not hasattr(self.fvk, "nvfp4_skinny_gemm"):
             raise RuntimeError("decoder_precision='nvfp4' needs a GPU_ARCH=120 build with "
                                "FLASHRT_ENABLE_PI05_NVFP4=ON")
         table = self.weights.get("dec_nvfp4") or {}
@@ -1087,7 +1087,7 @@ class Pi05Pipeline:
             if env in os.environ:
                 self._dec_fp4_cfg[key] = int(os.environ[env])
         for (n, k), cfg in self._dec_fp4_cfg.items():
-            if not self.fvk.pi05_dec_fp4_config_supports(cfg, n, k):
+            if not self.fvk.nvfp4_skinny_config_supports(cfg, n, k):
                 raise ValueError(f"NVFP4 decoder config {cfg} does not tile N={n}, K={k}")
         self._skinny_partials_rows = 0
         self._skinny_ensure_partials(self.chunk_size)
@@ -1106,7 +1106,7 @@ class Pi05Pipeline:
 
     def _dec_fp4_shape(self, n: int, k: int) -> tuple[int, int]:
         cfg = self._dec_fp4_cfg[(n, k)]
-        return cfg, k // self.fvk.pi05_dec_fp4_config_k_chunk(cfg)
+        return cfg, k // self.fvk.nvfp4_skinny_config_k_chunk(cfg)
 
     def _decoder_layer_skinny_fp4(self, i: int, step: int, enc_seq: int, ds: int,
                                   skip_c1: bool, stream: int, *,
@@ -1162,7 +1162,7 @@ class Pi05Pipeline:
         w, wsf, wgs = Wq[qkv_name]
         n_qkv = (DEC_NH + 2 * DEC_NKV) * DEC_HD
         cfg, splits = self._dec_fp4_shape(n_qkv, DEC_D)
-        _check(fvk.pi05_dec_fp4_gemm(act, act_sf, w, wsf, part, m, n_qkv, DEC_D, cfg, pdl, stream), "qkv gemm")
+        _check(fvk.nvfp4_skinny_gemm(act, act_sf, w, wsf, part, m, n_qkv, DEC_D, cfg, pdl, stream), "qkv gemm")
         if kv_ptrs is None:
             if self._fixed_shape:
                 kv_ptrs = self._enc_kv_layer_ptrs(i, offset_tokens=0)
@@ -1194,7 +1194,7 @@ class Pi05Pipeline:
         # gated residual + adaptive norm -> NVFP4 for gate_up.
         w, wsf, wgs = Wq[o_name]
         cfg, splits = self._dec_fp4_shape(DEC_D, DEC_NH * DEC_HD)
-        _check(fvk.pi05_dec_fp4_gemm_bf16_act(dec_o_ptr, gs_o, w, wsf, part, m, DEC_D,
+        _check(fvk.nvfp4_skinny_gemm_bf16_act(dec_o_ptr, gs_o, w, wsf, part, m, DEC_D,
                                               DEC_NH * DEC_HD, cfg, pdl, stream), "o gemm")
         _check(fvk.pi05_dec_fp4_residual_ada_norm(
             part, splits, gs_o, wgs, x_ptr, gate, ones,
@@ -1204,7 +1204,7 @@ class Pi05Pipeline:
         # gate_up -> GeGLU -> NVFP4 for down.
         w, wsf, wgs = Wq[gu_name]
         cfg, splits = self._dec_fp4_shape(2 * DEC_H, DEC_D)
-        _check(fvk.pi05_dec_fp4_gemm(act, act_sf, w, wsf, part, m, 2 * DEC_H, DEC_D, cfg, pdl, stream),
+        _check(fvk.nvfp4_skinny_gemm(act, act_sf, w, wsf, part, m, 2 * DEC_H, DEC_D, cfg, pdl, stream),
                "gate_up gemm")
         _check(fvk.pi05_dec_fp4_gate_gelu(part, splits, gs_gu, wgs, act_large, act_sf_large,
                                           m, DEC_H, gs_down, pdl, stream), "geglu")
@@ -1213,7 +1213,7 @@ class Pi05Pipeline:
         # final adaptive norm (BF16 into x_normed_buf) on the last layer.
         w, wsf, wgs = Wq[down_name]
         cfg, splits = self._dec_fp4_shape(DEC_D, DEC_H)
-        _check(fvk.pi05_dec_fp4_gemm(act_large, act_sf_large, w, wsf, part, m, DEC_D, DEC_H, cfg, pdl, stream),
+        _check(fvk.nvfp4_skinny_gemm(act_large, act_sf_large, w, wsf, part, m, DEC_D, DEC_H, cfg, pdl, stream),
                "down gemm")
         if i < DEC_L - 1:
             next_gs = self._fp8_static_scale_ptr(f"decoder_attn_qkv_w_{i + 1}")
