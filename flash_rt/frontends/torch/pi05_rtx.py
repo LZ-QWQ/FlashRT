@@ -844,7 +844,8 @@ class Pi05TorchFrontendRtx:
             num_views=self.num_views,
             encoder_seq_max=enc_seq_max,
             chunk_size=self.chunk_size,
-            num_encoder_layers=ENC_L)
+            num_encoder_layers=ENC_L,
+            encoder_splitkv=self._encoder_splitkv())
 
         # ── fvk module + GemmRunner ──
         from flash_rt import flash_rt_kernels as fvk
@@ -870,6 +871,13 @@ class Pi05TorchFrontendRtx:
             "Pi05TorchFrontendRtx initialised (num_views=%d, chunk=%d, fp8_layout=%s)",
             self.num_views, self.chunk_size, self.fp8_layout)
 
+    @staticmethod
+    def _encoder_splitkv() -> bool:
+        """Split-KV for the prefix attention: on SM120 (RTX 50) the unsplit
+        FA2 kernel is faster at Pi0.5 prefix lengths (~31 vs ~37 us per
+        layer at 2 views)."""
+        return torch.cuda.get_device_capability()[0] != 12
+
     def _ensure_prompt_capacity(self, required_prompt_len: int) -> None:
         """Grow RTX attention buffers before building longer prompt pipelines."""
         if required_prompt_len <= self.max_prompt_len:
@@ -880,7 +888,8 @@ class Pi05TorchFrontendRtx:
             num_views=self.num_views,
             encoder_seq_max=enc_seq_max,
             chunk_size=self.chunk_size,
-            num_encoder_layers=ENC_L)
+            num_encoder_layers=ENC_L,
+            encoder_splitkv=self._encoder_splitkv())
         self._prompt_pipeline_cache.clear()
         self._fixed_pipeline = None
         self.pipeline = None
