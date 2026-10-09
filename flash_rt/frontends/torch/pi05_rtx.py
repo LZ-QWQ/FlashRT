@@ -633,7 +633,8 @@ class Pi05TorchFrontendRtx:
                  prefix_features: bool = False,
                  decoder_kernel: Optional[str] = None,
                  prefix_precision: Optional[str] = None,
-                 sde: bool = False):
+                 sde: bool = False,
+                 decoder_precision: Optional[str] = None):
         checkpoint_dir = pathlib.Path(checkpoint_dir)
         # Stochastic sampler: pipelines take a per-step noise scale and
         # per-step noise (infer(..., sde_sigma=, step_noise=)); with no
@@ -656,6 +657,20 @@ class Pi05TorchFrontendRtx:
         self._reload_failed = False
         self._decoder_kernel = (decoder_kernel
                                 or os.environ.get("FLASHRT_PI05_DECODER_KERNEL", "cublaslt"))
+        # Decoder GEMM precision: "fp8" (per-tensor, calibrated) or "nvfp4"
+        # (block-scaled 4-bit weights and activations on the skinny decoder
+        # family, sm_120a only; activation global scales reuse the FP8
+        # calibration). FLASHRT_PI05_DECODER_PRECISION overrides the default.
+        self._decoder_precision = (decoder_precision
+                                   or os.environ.get("FLASHRT_PI05_DECODER_PRECISION", "fp8")).lower()
+        if self._decoder_precision not in ("fp8", "nvfp4"):
+            raise ValueError(f"decoder_precision must be fp8 or nvfp4, got {self._decoder_precision!r}")
+        if self._decoder_precision == "nvfp4":
+            if decoder_kernel is None and "FLASHRT_PI05_DECODER_KERNEL" not in os.environ:
+                self._decoder_kernel = "skinny"
+            elif self._decoder_kernel != "skinny":
+                raise ValueError("decoder_precision='nvfp4' runs on the skinny decoder family "
+                                 f"(decoder_kernel='skinny'), got decoder_kernel={self._decoder_kernel!r}")
         # Batched-mode width; set_batched_mode(batch_size=N) changes it.
         self._batch_size = PI05_BATCH_SIZE
         # Prefix features: pipelines export the encoder's final hidden
@@ -801,6 +816,12 @@ class Pi05TorchFrontendRtx:
             if not (self.use_fp8 and not self._force_bf16 and not self._force_int8_decoder):
                 raise ValueError("prefix_precision='nvfp4' needs the FP8 frontend (use_fp8=True)")
             self._quantize_prefix_nvfp4()
+        self._dec_nvfp4_weights: dict = {}
+        self._dec_nvfp4_store: list = []
+        if self._decoder_precision == "nvfp4":
+            if not (self.use_fp8 and not self._force_bf16 and not self._force_int8_decoder):
+                raise ValueError("decoder_precision='nvfp4' needs the FP8 frontend (use_fp8=True)")
+            self._quantize_decoder_nvfp4()
         if self._force_int8_decoder:
             self._quantize_decoder_int8()
         if self._use_int8_encoder:
@@ -870,6 +891,7 @@ class Pi05TorchFrontendRtx:
         kwargs = self._pipeline_precision_kwargs_base()
         kwargs["decoder_kernel"] = self._decoder_kernel
         kwargs["prefix_precision"] = self._prefix_precision
+        kwargs["decoder_precision"] = self._decoder_precision
         return kwargs
 
     def _pipeline_precision_kwargs_base(self) -> dict:
@@ -993,7 +1015,8 @@ class Pi05TorchFrontendRtx:
         # On the "kn" layout keep a transposed copy of the decoder weights
         # under "<name>__nk" (same values, same per-tensor scale); the
         # calibration and fallback paths keep using the "kn" tensors.
-        if self.fp8_layout == "kn" and self._skinny_weights_wanted():
+        if (self.fp8_layout == "kn" and self._skinny_weights_wanted()
+                and self._decoder_precision != "nvfp4"):
             n_copies = 0
             for i in range(DEC_L):
                 for base in ("decoder_attn_qkv_w", "decoder_attn_o_w",
@@ -1120,6 +1143,8 @@ class Pi05TorchFrontendRtx:
                 self._quantize_all_fp8(inplace=True)
             if self._nvfp4_weights:
                 self._quantize_prefix_nvfp4(inplace=True)
+            if self._dec_nvfp4_weights:
+                self._quantize_decoder_nvfp4(inplace=True)
             torch.cuda.synchronize(); phases["quantize"] = time.perf_counter() - t0 - sum(phases.values())
             self._precomputed_styles = _precompute_decoder_styles(
                 self._ckpt_bf16, self.chunk_size, num_steps=self._num_steps)
@@ -1215,6 +1240,59 @@ class Pi05TorchFrontendRtx:
             pipe._nvfp4 = self._nvfp4_weights
         if not inplace:
             logger.info("NVFP4 prefix weights: %d tensors", len(self._nvfp4_weights))
+
+    _DEC_NVFP4_SITES = ("decoder_attn_qkv_w", "decoder_attn_o_w", "decoder_ffn_gate_up_w", "decoder_ffn_down_w")
+
+    def _quantize_decoder_nvfp4(self, inplace: bool = False) -> None:
+        """Quantize the decoder GEMM weights to NVFP4 for the skinny family:
+        [N, K] e2m1 with per-16 UE4M3 scales and a per-tensor global scale
+        (amax / (6 * 448)), repacked into the fragment-major layout the
+        kernels stream. With ``inplace=True`` the existing buffers are
+        refilled (weight reload)."""
+        from flash_rt import flash_rt_kernels as fvk
+        if not hasattr(fvk, "pi05_dec_fp4_gemm"):
+            raise RuntimeError("decoder_precision='nvfp4' needs a GPU_ARCH=120 build with "
+                               "FLASHRT_ENABLE_PI05_NVFP4=ON")
+        W = self._ckpt_bf16
+        store = self._dec_nvfp4_store
+        if inplace:
+            index = self._dec_nvfp4_store_index
+        else:
+            index = {}
+            self._dec_nvfp4_store_index = index
+
+        def _check(rc: int, what: str, name: str) -> None:
+            if rc != 0:
+                raise RuntimeError(f"decoder NVFP4 {what} failed for {name}: cudaError {rc}")
+
+        for i in range(DEC_L):
+            for base in self._DEC_NVFP4_SITES:
+                name = f"{base}_{i}"
+                if base == "decoder_ffn_gate_up_w":
+                    w_kn = torch.cat([W["decoder_ffn_gate_w"][i], W["decoder_ffn_up_w"][i]], dim=1)
+                else:
+                    w_kn = W[base][i]
+                w_nk = w_kn.t().contiguous().to(torch.bfloat16)
+                N, K = w_nk.shape
+                if inplace:
+                    packed, sf_packed, gs = (store[index[name] + j] for j in range(3))
+                else:
+                    packed = torch.empty(N * K // 2, dtype=torch.uint8, device="cuda")
+                    sf_packed = torch.empty(N * K // 16, dtype=torch.uint8, device="cuda")
+                    gs = torch.empty(1, dtype=torch.float32, device="cuda")
+                gs.copy_((w_nk.float().abs().amax() / (6.0 * 448.0)).clamp_min(1e-12).reshape(1))
+                q = torch.empty(N, K // 2, dtype=torch.uint8, device="cuda")
+                sf = torch.empty(N, K // 16, dtype=torch.uint8, device="cuda")
+                _check(fvk.pi05_dec_fp4_quantize_weight(w_nk.data_ptr(), gs.data_ptr(), q.data_ptr(),
+                                                        sf.data_ptr(), N, K, 0), "quantize", name)
+                _check(fvk.pi05_dec_fp4_pack_weight(q.data_ptr(), sf.data_ptr(), packed.data_ptr(),
+                                                    sf_packed.data_ptr(), N, K, 0), "pack", name)
+                if not inplace:
+                    index[name] = len(store)
+                    store.extend((packed, sf_packed, gs))
+                self._dec_nvfp4_weights[name] = (packed.data_ptr(), sf_packed.data_ptr(), gs.data_ptr())
+        if not inplace:
+            logger.info("NVFP4 decoder weights: %d tensors", len(self._dec_nvfp4_weights))
 
     def _skinny_weights_wanted(self) -> bool:
         """Whether the FP8 decoder may run on the skinny GEMM family."""
@@ -1392,6 +1470,7 @@ class Pi05TorchFrontendRtx:
             "fp8": self._fp8_weights,
             # NVFP4 prefix weights: name -> (packed, swizzled SF, alpha, K padded, K)
             "nvfp4": self._nvfp4_weights,
+            "dec_nvfp4": self._dec_nvfp4_weights,
             "int8": self._int8_weights,
             "fp8_layout": self.fp8_layout,
             "hardware": self.hardware,

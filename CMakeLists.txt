@@ -1980,6 +1980,27 @@ if(FLASHRT_ENABLE_PI05_NVFP4)
   message(STATUS "Pi0.5 NVFP4 prefix kernels: ENABLED (SM120, runtime opt-in)")
   target_sources(flash_rt_kernels PRIVATE csrc/kernels/pi05/pi05_geglu_nvfp4_quant.cu)
   target_compile_definitions(flash_rt_kernels PRIVATE ENABLE_PI05_NVFP4=1)
+  # Skinny NVFP4 (W4A4) decoder family: sm_120a only (mma.kind::mxf4nvf4).
+  add_library(pi05_decoder_skinny_fp4_sm120_obj OBJECT
+    csrc/kernels/pi05/pi05_decoder_skinny_fp4_sm120.cu)
+  set_target_properties(pi05_decoder_skinny_fp4_sm120_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(pi05_decoder_skinny_fp4_sm120_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels
+  )
+  target_compile_options(pi05_decoder_skinny_fp4_sm120_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3
+      --ftz=true --prec-div=false --prec-sqrt=false
+      ${GPU_GENCODE}
+    >
+  )
+  target_sources(flash_rt_kernels PRIVATE
+    $<TARGET_OBJECTS:pi05_decoder_skinny_fp4_sm120_obj>)
+  target_compile_definitions(flash_rt_kernels PRIVATE
+    FLASHRT_PI05_DECODER_FP4_SM120=1)
 else()
   message(STATUS "Pi0.5 NVFP4 prefix kernels: DISABLED")
 endif()

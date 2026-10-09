@@ -191,7 +191,8 @@ class Pi05Pipeline:
                  prefix_export: bool = False,
                  decoder_kernel: str = "cublaslt",
                  prefix_precision: str = "fp8",
-                 sde: bool = False):
+                 sde: bool = False,
+                 decoder_precision: str = "fp8"):
         self.gemm = gemm
         self.fvk = fvk
         self.attn = attn_backend
@@ -320,6 +321,9 @@ class Pi05Pipeline:
         # ``decoder_kernel`` ("auto" | "skinny" | "cublaslt"); only the
         # calibrated FP8 decoder path uses it, everything else is unchanged.
         self._skinny = self._init_skinny_decoder(decoder_kernel)
+        # NVFP4 decoder: the skinny family's GEMMs on block-scaled 4-bit
+        # weights and activations; the consumers emit NVFP4 directly.
+        self._dec_fp4 = self._init_decoder_nvfp4(decoder_precision)
         # NVFP4 prefix: the vision and encoder GEMM sites listed in
         # weights["nvfp4"] run on block-scaled 4-bit operands (activations
         # quantized per call, no calibration); everything else unchanged.
@@ -854,7 +858,8 @@ class Pi05Pipeline:
         fp8_weights = self.weights.get("fp8", {})
         if "decoder_attn_qkv_w_0__nk" in fp8_weights:
             self._skinny_weight_suffix = "__nk"
-        elif self.fp8_layout == "nk":
+        elif self.fp8_layout == "nk" or self.weights.get("dec_nvfp4"):
+            # NVFP4 decoder weights carry their own [N, K] layout.
             self._skinny_weight_suffix = ""
         else:
             if mode == "skinny":
@@ -907,6 +912,9 @@ class Pi05Pipeline:
         for (n, k), cfg in self._skinny_cfg.items():
             splits = k // self.fvk.pi05_dec_skinny_config_k_chunk(cfg)
             elems = max(elems, splits * rows * n)
+        for (n, k), cfg in getattr(self, "_dec_fp4_cfg", {}).items():
+            splits = k // self.fvk.pi05_dec_fp4_config_k_chunk(cfg)
+            elems = max(elems, splits * rows * n)
         self._skinny_partials = CudaBuffer.device_zeros(elems, FP32)
         self._skinny_partials_rows = rows
 
@@ -931,6 +939,13 @@ class Pi05Pipeline:
         The last layer's consumer also performs the final adaptive norm
         into ``x_normed_buf`` so the caller skips its own.
         """
+        if self._dec_fp4:
+            self._decoder_layer_skinny_fp4(
+                i, step, enc_seq, ds, skip_c1, stream, rows=rows, suffix=suffix,
+                attn_ptrs=attn_ptrs, kv_ptrs=kv_ptrs, kv_base_ptrs=kv_base_ptrs,
+                devpos_ptr=devpos_ptr, kv_sample_stride=kv_sample_stride,
+                dec_o_ptr_fn=dec_o_ptr_fn)
+            return
         fvk = self.fvk
         B = self.bufs
         m = rows if rows is not None else ds
@@ -1031,6 +1046,184 @@ class Pi05Pipeline:
         else:
             _check(fvk.pi05_dec_skinny_residual_ada_norm(
                 part, splits, act_scale_down, ws_down, x_ptr, gate, ones,
+                self._style_slice_ptr("decoder_style_final", step),
+                0, x_normed, 0, gate, m, DEC_D, 1e-6, pdl, stream), "final norm")
+
+    # ══════════════════════════════════════════════════════════════════
+    #   Skinny NVFP4 decoder (sm_120a)
+    # ══════════════════════════════════════════════════════════════════
+
+    # Tile configuration per (N, K) for chunk-sized row counts, measured on
+    # RTX 5090 with cold weights (scripted shape sweep, PDL chain).
+    _DEC_FP4_CFG_SMALL_ROWS = {
+        ((DEC_NH + 2 * DEC_NKV) * DEC_HD, DEC_D): 0,   # qkv     64x256
+        (DEC_D, DEC_NH * DEC_HD): 0,                   # o       64x256
+        (2 * DEC_H, DEC_D): 1,                         # gate_up 64x512
+        (DEC_D, DEC_H): 0,                             # down    64x256
+    }
+
+    def _init_decoder_nvfp4(self, precision: str) -> bool:
+        precision = (precision or "fp8").lower()
+        if precision == "fp8":
+            return False
+        if precision != "nvfp4":
+            raise ValueError(f"decoder_precision must be fp8 or nvfp4, got {precision!r}")
+        if not self._skinny:
+            raise RuntimeError(
+                "decoder_precision='nvfp4' runs on the skinny decoder family: it needs "
+                "decoder_kernel='skinny', the calibrated FP8 decoder and a "
+                "FLASHRT_ENABLE_PI05_SKINNY=ON build")
+        if not hasattr(self.fvk, "pi05_dec_fp4_gemm"):
+            raise RuntimeError("decoder_precision='nvfp4' needs a GPU_ARCH=120 build with "
+                               "FLASHRT_ENABLE_PI05_NVFP4=ON")
+        table = self.weights.get("dec_nvfp4") or {}
+        if f"decoder_ffn_down_w_{DEC_L - 1}" not in table:
+            raise RuntimeError("decoder_precision='nvfp4' but the frontend provided no NVFP4 decoder weights")
+        self._dec_fp4_cfg: dict[tuple[int, int], int] = dict(self._DEC_FP4_CFG_SMALL_ROWS)
+        for env, key in (("FLASHRT_PI05_DEC_FP4_CFG_QKV", ((DEC_NH + 2 * DEC_NKV) * DEC_HD, DEC_D)),
+                         ("FLASHRT_PI05_DEC_FP4_CFG_O", (DEC_D, DEC_NH * DEC_HD)),
+                         ("FLASHRT_PI05_DEC_FP4_CFG_GU", (2 * DEC_H, DEC_D)),
+                         ("FLASHRT_PI05_DEC_FP4_CFG_DOWN", (DEC_D, DEC_H))):
+            if env in os.environ:
+                self._dec_fp4_cfg[key] = int(os.environ[env])
+        for (n, k), cfg in self._dec_fp4_cfg.items():
+            if not self.fvk.pi05_dec_fp4_config_supports(cfg, n, k):
+                raise ValueError(f"NVFP4 decoder config {cfg} does not tile N={n}, K={k}")
+        self._skinny_partials_rows = 0
+        self._skinny_ensure_partials(self.chunk_size)
+        self._dec_fp4_ensure_sf("", self.chunk_size)
+        return True
+
+    def _dec_fp4_ensure_sf(self, suffix: str, rows: int) -> None:
+        """NVFP4 activation scale buffers for ``rows`` decoder rows (before
+        capture). The e2m1 data reuses the FP8 activation scratch, which is
+        twice as large as needed."""
+        B = self.bufs
+        for name, cols in (("dec_act_sf", DEC_D // 16), ("dec_act_sf_large", DEC_H // 16)):
+            key = name + suffix
+            if key not in B or B[key].nbytes < rows * cols:
+                B[key] = CudaBuffer.device_zeros(rows * cols, INT8)
+
+    def _dec_fp4_shape(self, n: int, k: int) -> tuple[int, int]:
+        cfg = self._dec_fp4_cfg[(n, k)]
+        return cfg, k // self.fvk.pi05_dec_fp4_config_k_chunk(cfg)
+
+    def _decoder_layer_skinny_fp4(self, i: int, step: int, enc_seq: int, ds: int,
+                                  skip_c1: bool, stream: int, *,
+                                  rows: int | None = None, suffix: str = "",
+                                  attn_ptrs: dict | None = None,
+                                  kv_ptrs: tuple[int, int] | None = None,
+                                  kv_base_ptrs: tuple[int, int] | None = None,
+                                  devpos_ptr: int = 0, kv_sample_stride: int = 0,
+                                  dec_o_ptr_fn=None) -> None:
+        """One decoder layer on the skinny NVFP4 family.
+
+        Same structure as :meth:`_decoder_layer_skinny`: 4 K-split GEMMs on
+        e2m1 operands, each followed by one fused consumer. The consumers
+        that feed a GEMM (gated residual + adaptive norm, GeGLU) emit NVFP4
+        with the FP8 calibration scale as global scale; the attention output
+        is quantized on load inside the output-projection GEMM. No
+        standalone quantize launch remains.
+        """
+        if not skip_c1:
+            raise RuntimeError("NVFP4 decoder layers expect the previous consumer to emit their input")
+        fvk = self.fvk
+        B = self.bufs
+        m = rows if rows is not None else ds
+        pdl = self._skinny_pdl
+        part = self._skinny_partials.ptr.value
+        ap = attn_ptrs if attn_ptrs is not None else self._attn_ptrs
+        x_ptr = B["decoder_x" + suffix].ptr.value
+        act = B["dec_act_fp8" + suffix].ptr.value
+        act_large = B["dec_act_fp8_large" + suffix].ptr.value
+        if "dec_act_sf" + suffix not in B:
+            raise RuntimeError(f"NVFP4 decoder scale buffers for {suffix!r} were not allocated before capture")
+        act_sf = B["dec_act_sf" + suffix].ptr.value
+        act_sf_large = B["dec_act_sf_large" + suffix].ptr.value
+        gate = B["gate_buf" + suffix].ptr.value
+        x_normed = B["x_normed_buf" + suffix].ptr.value
+        ones = self._rms_ones_dec.ptr.value
+        Wq = self.weights["dec_nvfp4"]
+
+        qkv_name = f"decoder_attn_qkv_w_{i}"
+        o_name = f"decoder_attn_o_w_{i}"
+        gu_name = f"decoder_ffn_gate_up_w_{i}"
+        down_name = f"decoder_ffn_down_w_{i}"
+        gs_qkv = self._fp8_static_scale_ptr(qkv_name)
+        gs_o = self._fp8_static_scale_ptr(o_name)
+        gs_gu = self._fp8_static_scale_ptr(gu_name)
+        gs_down = self._fp8_static_scale_ptr(down_name)
+
+        def _check(rc: int, what: str) -> None:
+            if rc != 0:
+                raise RuntimeError(f"NVFP4 decoder {what} failed: cudaError {rc}")
+
+        # QKV projection -> RoPE + K/V cache append (FP8 family consumer).
+        w, wsf, wgs = Wq[qkv_name]
+        n_qkv = (DEC_NH + 2 * DEC_NKV) * DEC_HD
+        cfg, splits = self._dec_fp4_shape(n_qkv, DEC_D)
+        _check(fvk.pi05_dec_fp4_gemm(act, act_sf, w, wsf, part, m, n_qkv, DEC_D, cfg, pdl, stream), "qkv gemm")
+        if kv_ptrs is None:
+            if self._fixed_shape:
+                kv_ptrs = self._enc_kv_layer_ptrs(i, offset_tokens=0)
+                devpos_ptr = self.attn.dec_devpos.data_ptr()
+            else:
+                kv_ptrs = self._enc_kv_layer_ptrs(i, offset_tokens=enc_seq)
+        _check(fvk.pi05_dec_skinny_sum_rope(
+            part, splits, gs_qkv, wgs,
+            B["decoder_rope_weights"].ptr.value, ap["dec_Q"], kv_ptrs[0], kv_ptrs[1],
+            devpos_ptr, m, DEC_NH * DEC_HD, DEC_NKV * DEC_HD, DEC_NKV * DEC_HD, DEC_HD,
+            ds, kv_sample_stride, pdl, stream), "qkv rope")
+
+        if self._skinny_attn:
+            samples = m // ds
+            k_base, v_base = kv_base_ptrs if kv_base_ptrs is not None else self._enc_kv_layer_ptrs(i, 0)
+            seqused_ptr = self.attn.dec_seqused.data_ptr() if self._fixed_shape else 0
+            dec_o_ptr = ap["dec_O"]
+            _check(fvk.pi05_dec_skinny_attn(
+                ap["dec_Q"], k_base, v_base, dec_o_ptr, ds, samples, DEC_NH, DEC_NH * DEC_HD,
+                enc_seq + ds, seqused_ptr, kv_sample_stride, 1.0 / math.sqrt(DEC_HD),
+                self._skinny_attn_scratch.ptr.value, self._skinny_attn_counters.ptr.value,
+                pdl, stream), "attention")
+        elif dec_o_ptr_fn is not None:
+            dec_o_ptr = dec_o_ptr_fn()
+        else:
+            dec_o_ptr = self.attn.run("decoder", i, q_seq=ds, kv_seq=enc_seq + ds, stream=stream)
+
+        # Output projection (BF16 attention output quantized on load) ->
+        # gated residual + adaptive norm -> NVFP4 for gate_up.
+        w, wsf, wgs = Wq[o_name]
+        cfg, splits = self._dec_fp4_shape(DEC_D, DEC_NH * DEC_HD)
+        _check(fvk.pi05_dec_fp4_gemm_bf16_act(dec_o_ptr, gs_o, w, wsf, part, m, DEC_D,
+                                              DEC_NH * DEC_HD, cfg, pdl, stream), "o gemm")
+        _check(fvk.pi05_dec_fp4_residual_ada_norm(
+            part, splits, gs_o, wgs, x_ptr, gate, ones,
+            self._style_slice_ptr("decoder_style_ffn", step, i),
+            act, act_sf, gs_gu, gate, m, DEC_D, 1e-6, pdl, stream), "o norm")
+
+        # gate_up -> GeGLU -> NVFP4 for down.
+        w, wsf, wgs = Wq[gu_name]
+        cfg, splits = self._dec_fp4_shape(2 * DEC_H, DEC_D)
+        _check(fvk.pi05_dec_fp4_gemm(act, act_sf, w, wsf, part, m, 2 * DEC_H, DEC_D, cfg, pdl, stream),
+               "gate_up gemm")
+        _check(fvk.pi05_dec_fp4_gate_gelu(part, splits, gs_gu, wgs, act_large, act_sf_large,
+                                          m, DEC_H, gs_down, pdl, stream), "geglu")
+
+        # down -> gated residual + next layer's adaptive norm (NVFP4), or the
+        # final adaptive norm (BF16 into x_normed_buf) on the last layer.
+        w, wsf, wgs = Wq[down_name]
+        cfg, splits = self._dec_fp4_shape(DEC_D, DEC_H)
+        _check(fvk.pi05_dec_fp4_gemm(act_large, act_sf_large, w, wsf, part, m, DEC_D, DEC_H, cfg, pdl, stream),
+               "down gemm")
+        if i < DEC_L - 1:
+            next_gs = self._fp8_static_scale_ptr(f"decoder_attn_qkv_w_{i + 1}")
+            _check(fvk.pi05_dec_fp4_residual_ada_norm(
+                part, splits, gs_down, wgs, x_ptr, gate, ones,
+                self._style_slice_ptr("decoder_style_attn", step, i + 1),
+                act, act_sf, next_gs, gate, m, DEC_D, 1e-6, pdl, stream), "down norm")
+        else:
+            _check(fvk.pi05_dec_skinny_residual_ada_norm(
+                part, splits, gs_down, wgs, x_ptr, gate, ones,
                 self._style_slice_ptr("decoder_style_final", step),
                 0, x_normed, 0, gate, m, DEC_D, 1e-6, pdl, stream), "final norm")
 
@@ -1808,7 +2001,19 @@ class Pi05Pipeline:
                 self._fp8_current_decoder_step = step
                 self._copy_rtc_prefix(rtc_prefix_len, stream)
                 skinny_step = fused and self._skinny
-                if skinny_step:
+                if skinny_step and self._dec_fp4:
+                    # C0 + C1 of layer 0 in one launch, the norm emitting NVFP4.
+                    rc = fvk.pi05_dec_fp4_action_in_norm(
+                        B["diffusion_noise"].ptr.value,
+                        W["decoder_action_in_proj_w"], W["decoder_action_in_proj_b"],
+                        B["decoder_x"].ptr.value, self._rms_ones_dec.ptr.value,
+                        self._style_slice_ptr("decoder_style_attn", step, 0),
+                        B["dec_act_fp8"].ptr.value, B["dec_act_sf"].ptr.value, B["gate_buf"].ptr.value,
+                        self._fp8_static_scale_ptr("decoder_attn_qkv_w_0"),
+                        ds, 1e-6, self._skinny_pdl, stream)
+                    if rc != 0:
+                        raise RuntimeError(f"NVFP4 decoder action_in failed: cudaError {rc}")
+                elif skinny_step:
                     # C0 + C1 of layer 0 in one launch: action input
                     # projection with bias into the residual stream, then
                     # the first adaptive norm to FP8.

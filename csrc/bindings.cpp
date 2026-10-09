@@ -66,6 +66,9 @@
 #ifdef FLASHRT_PI05_DECODER_SKINNY_SM120
 #include "kernels/pi05/pi05_decoder_skinny_fp8_sm120.cuh"
 #endif
+#ifdef FLASHRT_PI05_DECODER_FP4_SM120
+#include "kernels/pi05/pi05_decoder_skinny_fp4_sm120.cuh"
+#endif
 #if defined(ENABLE_CUTLASS_SM120_NVFP4_W4A16) || defined(ENABLE_CUTLASS_SM100_NVFP4_W4A16)
 #include "quantize/nvfp4_sf_reshape_sm120.cuh"
 #endif
@@ -7520,6 +7523,81 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
        py::arg("pdl") = true, py::arg("stream") = 0);
 #endif  // ENABLE_PI05_SDE
 #endif  // FLASHRT_PI05_DECODER_SKINNY_SM120
+
+#ifdef FLASHRT_PI05_DECODER_FP4_SM120
+    // Skinny NVFP4 (W4A4) decoder family (sm_120a): fragment-major packed weights,
+    // K-split partials, consumers that emit NVFP4 directly. See
+    // kernels/pi05/pi05_decoder_skinny_fp4_sm120.cuh.
+    m.def("pi05_dec_fp4_config_count", []() { return flash_rt::pi05_dec_skinny_fp4::config_count(); });
+    m.def("pi05_dec_fp4_config_k_chunk", [](int cfg) { return flash_rt::pi05_dec_skinny_fp4::config_k_chunk(cfg); },
+          py::arg("cfg"));
+    m.def("pi05_dec_fp4_config_supports", [](int cfg, int N, int K) {
+        return flash_rt::pi05_dec_skinny_fp4::config_supports(cfg, N, K);
+    }, py::arg("cfg"), py::arg("N"), py::arg("K"));
+    m.def("pi05_dec_fp4_gemm", [](uintptr_t A, uintptr_t SFA, uintptr_t W, uintptr_t SFB, uintptr_t partials,
+                                 int M, int N, int K, int cfg, bool pdl, uintptr_t stream) {
+        return flash_rt::pi05_dec_skinny_fp4::gemm(to_ptr(A), to_ptr(SFA), to_ptr(W), to_ptr(SFB),
+                                                   typed_ptr<float>(partials), M, N, K, cfg, pdl, to_stream(stream));
+    }, py::arg("A"), py::arg("SFA"), py::arg("W"), py::arg("SFB"), py::arg("partials"), py::arg("M"),
+       py::arg("N"), py::arg("K"), py::arg("cfg"), py::arg("pdl") = true, py::arg("stream") = 0);
+    m.def("pi05_dec_fp4_gemm_bf16_act", [](uintptr_t A, uintptr_t a_gs, uintptr_t W, uintptr_t SFB,
+                                          uintptr_t partials, int M, int N, int K, int cfg, bool pdl,
+                                          uintptr_t stream) {
+        return flash_rt::pi05_dec_skinny_fp4::gemm_bf16_act(typed_ptr<__nv_bfloat16>(A), typed_ptr<float>(a_gs),
+                                                            to_ptr(W), to_ptr(SFB), typed_ptr<float>(partials),
+                                                            M, N, K, cfg, pdl, to_stream(stream));
+    }, py::arg("A"), py::arg("a_gs"), py::arg("W"), py::arg("SFB"), py::arg("partials"), py::arg("M"),
+       py::arg("N"), py::arg("K"), py::arg("cfg"), py::arg("pdl") = true, py::arg("stream") = 0);
+    m.def("pi05_dec_fp4_residual_ada_norm", [](uintptr_t partials, int splits, uintptr_t a_gs, uintptr_t w_gs,
+                                              uintptr_t residual, uintptr_t gate, uintptr_t weight, uintptr_t style,
+                                              uintptr_t out, uintptr_t out_sf, uintptr_t out_gs, uintptr_t gate_out,
+                                              int rows, int dim, float eps, bool pdl, uintptr_t stream) {
+        return flash_rt::pi05_dec_skinny_fp4::residual_ada_norm(
+            typed_ptr<float>(partials), splits, typed_ptr<float>(a_gs), typed_ptr<float>(w_gs),
+            typed_ptr<__nv_bfloat16>(residual), typed_ptr<__nv_bfloat16>(gate), typed_ptr<__nv_bfloat16>(weight),
+            typed_ptr<__nv_bfloat16>(style), typed_ptr<uint8_t>(out), typed_ptr<uint8_t>(out_sf),
+            typed_ptr<float>(out_gs), typed_ptr<__nv_bfloat16>(gate_out), rows, dim, eps, pdl, to_stream(stream));
+    }, py::arg("partials"), py::arg("splits"), py::arg("a_gs"), py::arg("w_gs"), py::arg("residual"),
+       py::arg("gate"), py::arg("weight"), py::arg("style"), py::arg("out"), py::arg("out_sf"), py::arg("out_gs"),
+       py::arg("gate_out"), py::arg("rows"), py::arg("dim"), py::arg("eps"), py::arg("pdl") = true,
+       py::arg("stream") = 0);
+    m.def("pi05_dec_fp4_gate_gelu", [](uintptr_t partials, int splits, uintptr_t a_gs, uintptr_t w_gs,
+                                      uintptr_t out, uintptr_t out_sf, int rows, int half, uintptr_t out_gs,
+                                      bool pdl, uintptr_t stream) {
+        return flash_rt::pi05_dec_skinny_fp4::gate_gelu(
+            typed_ptr<float>(partials), splits, typed_ptr<float>(a_gs), typed_ptr<float>(w_gs),
+            typed_ptr<uint8_t>(out), typed_ptr<uint8_t>(out_sf), rows, half, typed_ptr<float>(out_gs), pdl,
+            to_stream(stream));
+    }, py::arg("partials"), py::arg("splits"), py::arg("a_gs"), py::arg("w_gs"), py::arg("out"),
+       py::arg("out_sf"), py::arg("rows"), py::arg("half"), py::arg("out_gs"), py::arg("pdl") = true,
+       py::arg("stream") = 0);
+    m.def("pi05_dec_fp4_action_in_norm", [](uintptr_t noise, uintptr_t w_in, uintptr_t b_in, uintptr_t x,
+                                           uintptr_t weight, uintptr_t style, uintptr_t out, uintptr_t out_sf,
+                                           uintptr_t gate_out, uintptr_t out_gs, int rows, float eps, bool pdl,
+                                           uintptr_t stream) {
+        return flash_rt::pi05_dec_skinny_fp4::action_in_norm(
+            typed_ptr<__nv_bfloat16>(noise), typed_ptr<__nv_bfloat16>(w_in), typed_ptr<__nv_bfloat16>(b_in),
+            typed_ptr<__nv_bfloat16>(x), typed_ptr<__nv_bfloat16>(weight), typed_ptr<__nv_bfloat16>(style),
+            typed_ptr<uint8_t>(out), typed_ptr<uint8_t>(out_sf), typed_ptr<__nv_bfloat16>(gate_out),
+            typed_ptr<float>(out_gs), rows, eps, pdl, to_stream(stream));
+    }, py::arg("noise"), py::arg("w_in"), py::arg("b_in"), py::arg("x"), py::arg("weight"), py::arg("style"),
+       py::arg("out"), py::arg("out_sf"), py::arg("gate_out"), py::arg("out_gs"), py::arg("rows"),
+       py::arg("eps"), py::arg("pdl") = true, py::arg("stream") = 0);
+    m.def("pi05_dec_fp4_pack_weight", [](uintptr_t w, uintptr_t sf, uintptr_t w_packed, uintptr_t sf_packed,
+                                        int N, int K, uintptr_t stream) {
+        return flash_rt::pi05_dec_skinny_fp4::pack_weight(typed_ptr<uint8_t>(w), typed_ptr<uint8_t>(sf),
+                                                         typed_ptr<uint8_t>(w_packed), typed_ptr<uint8_t>(sf_packed),
+                                                         N, K, to_stream(stream));
+    }, py::arg("w"), py::arg("sf"), py::arg("w_packed"), py::arg("sf_packed"), py::arg("N"), py::arg("K"),
+       py::arg("stream") = 0);
+    m.def("pi05_dec_fp4_quantize_weight", [](uintptr_t w, uintptr_t gs, uintptr_t out, uintptr_t out_sf,
+                                            int N, int K, uintptr_t stream) {
+        return flash_rt::pi05_dec_skinny_fp4::quantize_weight(typed_ptr<__nv_bfloat16>(w), typed_ptr<float>(gs),
+                                                             typed_ptr<uint8_t>(out), typed_ptr<uint8_t>(out_sf),
+                                                             N, K, to_stream(stream));
+    }, py::arg("w"), py::arg("gs"), py::arg("out"), py::arg("out_sf"), py::arg("N"), py::arg("K"),
+       py::arg("stream") = 0);
+#endif  // FLASHRT_PI05_DECODER_FP4_SM120
 
 #ifdef ENABLE_DECODE_GEMV_M1
     // Dedicated M=1 GEMV (FP8 + BF16), warp-per-output-row, no MMA padding tax.
