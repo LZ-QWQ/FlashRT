@@ -11,8 +11,8 @@ copy launch remains:
 
     AdaLN(h) -> fp4                       (layer 0 only; later layers get it
                                            from the previous layer's consumer)
-    QKV / Q GEMM -> bias, split into the attention Q | K | V slots
-    attention (RTX FA2 backend)
+    QKV / Q GEMM -> attention straight off the partials (bias added on
+      load; cross blocks read the frame's cross K/V)
     O GEMM (BF16 attention output quantized on load)
       -> bias + residual into h, pre-FF LayerNorm -> fp4
     FFN up GEMM -> bias + tanh-GELU -> fp4
@@ -21,6 +21,9 @@ copy launch remains:
 
 Activations use NVFP4 with per-16 dynamic block scales and global scale 1
 (no calibration); weights carry a per-tensor global scale.
+
+The backbone functions further down are the experimental NVFP4 backbone
+(``FLASHRT_GROOT_N17_BB_NVFP4``); the default backbone is the FP8 one.
 """
 
 from __future__ import annotations
@@ -140,7 +143,9 @@ def dit_forward_nvfp4(fvk, bufs: dict, weights: dict, dims: dict, *, attn,
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Backbone on NVFP4 (ViT taps + DeepStack, LLM, VLLN + VL self-attention)
+# Backbone on NVFP4 (ViT taps + DeepStack, LLM, VLLN + VL self-attention).
+# Experimental, opt-in (FLASHRT_GROOT_N17_BB_NVFP4): W4A4 error compounds
+# through these stages, so the default backbone stays FP8.
 # ─────────────────────────────────────────────────────────────────────────
 #
 # Every projection is a CUTLASS SM120 block-scaled W4A4 GEMM whose epilogue
@@ -155,12 +160,14 @@ VIT_TAPS = (5, 11, 17)
 
 
 class NvFp4Linear:
-    """Packed NVFP4 weight + swizzled scales + per-tensor alpha + bias."""
+    """Packed NVFP4 weight + swizzled scales + per-tensor alpha (host value
+    and the device fp32 scalar the CUTLASS bias / residual GEMM reads) + bias."""
 
-    __slots__ = ("w", "sf", "alpha", "bias", "n", "k")
+    __slots__ = ("w", "sf", "alpha", "alpha_ptr", "bias", "n", "k")
 
-    def __init__(self, w: int, sf: int, alpha: float, bias: int, n: int, k: int):
-        self.w, self.sf, self.alpha, self.bias, self.n, self.k = w, sf, float(alpha), bias, n, k
+    def __init__(self, w: int, sf: int, alpha: float, alpha_ptr: int, bias: int, n: int, k: int):
+        self.w, self.sf, self.alpha, self.alpha_ptr = w, sf, float(alpha), alpha_ptr
+        self.bias, self.n, self.k = bias, n, k
 
 
 def _ck(rc: int, what: str) -> None:
@@ -177,7 +184,7 @@ def _schedule(lin: NvFp4Linear) -> int:
 def linear_bf16(fvk, a, a_sf, lin: NvFp4Linear, out, M, stream, *, residual: bool = False) -> None:
     """out = a @ W^T * alpha + bias (+ out when residual)."""
     _ck(fvk.nvfp4_gemm_bias_res_bf16out(a, lin.w, a_sf, lin.sf, lin.bias, out if residual else 0, out,
-                                        M, lin.n, lin.k, lin.alpha, 1.0 if residual else 0.0,
+                                        M, lin.n, lin.k, lin.alpha_ptr, 1.0 if residual else 0.0,
                                         _schedule(lin), stream), f"gemm {M}x{lin.n}x{lin.k}")
 
 

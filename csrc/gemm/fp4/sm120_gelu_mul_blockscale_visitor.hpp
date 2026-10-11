@@ -56,8 +56,9 @@ struct Sm120GeluMulBlockScaleFactorRowStore {
     // Avoids generating small FP4 values.
     ElementCompute const* norm_constant_ptr = {};
     NormalConstStrideMNL norm_constant_stride = {};
-    ElementCompute alpha_gate = ElementCompute(1);
-    ElementCompute alpha_up = ElementCompute(1);
+    // per-projection scales, device scalars (null = 1)
+    ElementCompute const* alpha_gate_ptr = nullptr;
+    ElementCompute const* alpha_up_ptr = nullptr;
   };
 
   using Params = Arguments;
@@ -144,6 +145,8 @@ struct Sm120GeluMulBlockScaleFactorRowStore {
           TileCoordMN tile_coord_mn_,
           ElementType norm_constant_,
           ElementType norm_constant_scaled_down_,
+          ElementType alpha_gate_,
+          ElementType alpha_up_,
           int thread_idx_,
           TiledCopy_ const&)
       : tC_rSFD(cute::forward<RTensor>(tC_rSFD_))
@@ -154,6 +157,8 @@ struct Sm120GeluMulBlockScaleFactorRowStore {
       , params_ptr(params_ptr_)
       , norm_constant(norm_constant_)
       , norm_constant_scaled_down(norm_constant_scaled_down_)
+      , alpha_gate(alpha_gate_)
+      , alpha_up(alpha_up_)
       , tile_coord_mn(tile_coord_mn_)
       , thread_idx(thread_idx_) {}
 
@@ -166,6 +171,8 @@ struct Sm120GeluMulBlockScaleFactorRowStore {
     Params const* params_ptr;
     ElementCompute norm_constant;
     ElementCompute norm_constant_scaled_down;
+    ElementCompute alpha_gate;
+    ElementCompute alpha_up;
     TileCoordMN tile_coord_mn;
     int thread_idx;
     static constexpr int NumCollaboratingThreads = decltype(size(TiledCopy_{}))::value;
@@ -188,12 +195,10 @@ struct Sm120GeluMulBlockScaleFactorRowStore {
       // output; M2b compacts the store to half width).
       cutlass::epilogue::thread::GELU_taylor<ElementCompute> silu_op;
       Array<ElementInput, FragmentSize> r;
-      ElementCompute ag = params_ptr->alpha_gate;
-      ElementCompute au = params_ptr->alpha_up;
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < FragmentSize; i += 2) {
-        ElementCompute g = ag * static_cast<ElementCompute>(frg_input[i]);
-        ElementCompute u = au * static_cast<ElementCompute>(frg_input[i + 1]);
+        ElementCompute g = alpha_gate * static_cast<ElementCompute>(frg_input[i]);
+        ElementCompute u = alpha_up * static_cast<ElementCompute>(frg_input[i + 1]);
         ElementCompute sm = silu_op(g) * u;
         r[i]     = static_cast<ElementInput>(sm);
         r[i + 1] = static_cast<ElementInput>(sm);
@@ -472,6 +477,8 @@ struct Sm120GeluMulBlockScaleFactorRowStore {
     ElementCompute fp_max = ElementCompute(cutlass::platform::numeric_limits<ElementOutput>::max());
     ElementCompute scale_down_factor = cutlass::reciprocal_approximate_ftz<ElementCompute>{}(fp_max);
     ElementCompute norm_constant_scaled_down = cutlass::multiplies<ElementCompute>{}(norm_constant, scale_down_factor);
+    ElementCompute alpha_gate = params_ptr->alpha_gate_ptr ? *params_ptr->alpha_gate_ptr : ElementCompute(1);
+    ElementCompute alpha_up = params_ptr->alpha_up_ptr ? *params_ptr->alpha_up_ptr : ElementCompute(1);
 
     Tensor sAmaxs = make_tensor(
       make_smem_ptr(smem_aux),
@@ -488,6 +495,8 @@ struct Sm120GeluMulBlockScaleFactorRowStore {
       tile_coord_mn,
       norm_constant,
       norm_constant_scaled_down,
+      alpha_gate,
+      alpha_up,
       args.thread_idx,
       args.tiled_copy);
 
@@ -548,9 +557,9 @@ struct FusionCallbacks<
     using StrideBeta  = Stride<_0,_0,int64_t>;
     StrideAlpha dAlpha = {_0{}, _0{}, 0};
     StrideBeta  dBeta  = {_0{}, _0{}, 0};
-    // SwiGLU per-projection scales (applied in visit()).
-    ElementCompute alpha_gate = ElementCompute(1);
-    ElementCompute alpha_up   = ElementCompute(1);
+    // Per-projection scales (device scalars, applied in visit()).
+    ElementCompute const* alpha_gate_ptr = nullptr;
+    ElementCompute const* alpha_up_ptr = nullptr;
 
     operator typename Impl::Arguments() const {
       return
@@ -566,8 +575,8 @@ struct FusionCallbacks<
             {}
           },
           // store-node args: ptr_scale_factor, norm_constant_ptr,
-          // norm_constant_stride, alpha_gate, alpha_up
-          {block_scale_factor_ptr, norm_constant_ptr, dNormConst, alpha_gate, alpha_up}
+          // norm_constant_stride, alpha_gate_ptr, alpha_up_ptr
+          {block_scale_factor_ptr, norm_constant_ptr, dNormConst, alpha_gate_ptr, alpha_up_ptr}
         };
     }
   };

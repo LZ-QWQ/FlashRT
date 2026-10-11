@@ -1260,6 +1260,15 @@ class Pi05Pipeline:
         self._ffn_fp4_rows = 0
         self._ffn_fp4_ready = False
         self._ffn_fp4_one = CudaBuffer.from_numpy(np.ones(1, dtype=np.float32))
+        # Every GEMM alpha / output global scale of the tier lives in one
+        # persistent device array: the captured graphs read it at run time,
+        # so _ffn_fp4_finalize can rewrite it in place (weight reload).
+        keys = [("vis", i, f) for i in range(self.vision_num_layers) for f in ("qkv", "o", "up", "down", "nc")]
+        keys += [("enc", i, f) for i in range(ENC_L) for f in ("gate", "up", "down", "nc")]
+        if self._enc_o_fp4:
+            keys += [("enc_o", i, f) for i in range(ENC_L) for f in ("gs", "alpha")]
+        self._ffn_fp4_slot = {k: n for n, k in enumerate(keys)}
+        self._ffn_fp4_scalars = CudaBuffer.device_zeros(len(keys), np.float32)
         self._ffn_fp4_zero_bias = CudaBuffer.device_zeros(ENC_D, BF16)
         self._ffn_fp4_ensure(max(self.vision_seq, self.encoder_seq_len))
         return True
@@ -1283,39 +1292,61 @@ class Pi05Pipeline:
         self._ffn_fp4_rows = rows
 
     def _ffn_fp4_finalize(self) -> None:
-        """Static global scales of the down-projection inputs (the GELU /
-        GeGLU outputs, whose range reaches 1e4 in late Gemma layers) from the
-        FP8 calibration: gs = amax / 448. They enter as the producing
-        epilogue's norm constant (1 / gs, device scalar) and the down GEMM's
+        """Write the tier's scalars into the persistent device array.
+
+        Static global scales of the down-projection inputs (the GELU /
+        GeGLU outputs, whose range reaches 1e4 in late Gemma layers) come
+        from the FP8 calibration: gs = amax / 448. They enter as the
+        producing epilogue's norm constant (1 / gs) and the down GEMM's
         alpha (gs * weight scale). The first-GEMM inputs are normalized rows
-        and run with global scale 1."""
+        and run with global scale 1, so their alpha is the weight scale."""
         if self._ffn_fp4_ready:
             return
         if not self.fp8_calibrated:
             raise RuntimeError("the NVFP4 FFN tier needs the FP8 calibration first")
-        self._ffn_fp4_nc = {}
-        self._ffn_fp4_alpha = {}
+        table = self.weights["ffn_nvfp4"]
+        vals = np.zeros(len(self._ffn_fp4_slot), dtype=np.float32)
+
+        def put(key, v):
+            if key in self._ffn_fp4_slot:
+                vals[self._ffn_fp4_slot[key]] = v
+
+        def act_gs(name):
+            buf = self.fp8_act_scales.get(name)
+            if buf is None:
+                raise RuntimeError(f"no FP8 calibration scale for {name}")
+            return max(float(buf.download_new((1,), np.float32)[0]), 1e-12)
+
         # the last encoder layer stops at its K/V write unless the prefix is exported
         n_enc = ENC_L if self.prefix_export else ENC_L - 1
-        for kind, prefix, n in (("vis", "vision", self.vision_num_layers), ("enc", "encoder", n_enc)):
-            for i in range(n):
-                buf = self.fp8_act_scales.get(f"{prefix}_ffn_down_w_{i}")
-                if buf is None:
-                    raise RuntimeError(f"no FP8 calibration scale for {prefix}_ffn_down_w_{i}")
-                gs = max(float(buf.download_new((1,), np.float32)[0]), 1e-12)
-                self._ffn_fp4_nc[(kind, i)] = CudaBuffer.from_numpy(np.array([1.0 / gs], dtype=np.float32))
-                self._ffn_fp4_alpha[(kind, i)] = gs * self.weights["ffn_nvfp4"][kind][i]["down"][2]
-        if self._enc_o_fp4:
-            # attention output -> NVFP4 with the static gs of its FP8 calibration
-            self._enc_o_gs = {}
-            for i in range(n_enc):
-                buf = self.fp8_act_scales.get(f"encoder_attn_o_w_{i}")
-                if buf is None:
-                    raise RuntimeError(f"no FP8 calibration scale for encoder_attn_o_w_{i}")
-                gs = max(float(buf.download_new((1,), np.float32)[0]), 1e-12)
-                self._enc_o_gs[i] = CudaBuffer.from_numpy(np.array([gs], dtype=np.float32))
-                self._ffn_fp4_alpha[("enc_o", i)] = gs * self.weights["ffn_nvfp4"]["enc"][i]["o"][2]
+        for i in range(self.vision_num_layers):
+            t = table["vis"][i]
+            gs = act_gs(f"vision_ffn_down_w_{i}")
+            put(("vis", i, "qkv"), t["qkv"][2]); put(("vis", i, "o"), t["o"][2]); put(("vis", i, "up"), t["up"][2])
+            put(("vis", i, "down"), gs * t["down"][2]); put(("vis", i, "nc"), 1.0 / gs)
+        for i in range(n_enc):
+            t = table["enc"][i]
+            gs = act_gs(f"encoder_ffn_down_w_{i}")
+            put(("enc", i, "gate"), t["gate_up"][2]); put(("enc", i, "up"), t["gate_up"][3])
+            put(("enc", i, "down"), gs * t["down"][2]); put(("enc", i, "nc"), 1.0 / gs)
+            if self._enc_o_fp4:
+                # attention output -> NVFP4 with the static gs of its FP8 calibration
+                go = act_gs(f"encoder_attn_o_w_{i}")
+                put(("enc_o", i, "gs"), go); put(("enc_o", i, "alpha"), go * t["o"][2])
+        self._ffn_fp4_scalars.upload(vals)
         self._ffn_fp4_ready = True
+
+    def _ffn_fp4_refresh(self) -> None:
+        """After a weight reload: rewrite the scalars the captured graphs read
+        (no re-capture). Before the first calibration they are written when
+        the graph is recorded."""
+        self._ffn_fp4_ready = False
+        if self.fp8_calibrated:
+            self._ffn_fp4_finalize()
+
+    def _ffn_fp4_s(self, key) -> int:
+        """Device pointer of one tier scalar."""
+        return self._ffn_fp4_scalars.ptr.value + 4 * self._ffn_fp4_slot[key]
 
     def _ffn_fp4_check(self, rows: int, stream: int) -> None:
         if rows > self._ffn_fp4_rows:
@@ -1347,9 +1378,10 @@ class Pi05Pipeline:
 
         _ck(fvk.nvfp4_norm_quant(x_ptr, W["vision_pre_attn_norm_w"][i], W["vision_pre_attn_norm_b"][i], 0, 1e-5,
                                  x4, x4sf, one, m, VIS_D, stream), "norm")
-        w, sf, a = t["qkv"]
+        w, sf, _ = t["qkv"]
         _ck(fvk.nvfp4_gemm_bias_res_bf16out(x4, w, x4sf, sf, W["vision_attn_qkv_b"][i], 0, qkv_ptr,
-                                            m, 3 * VIS_D, VIS_D, a, 0.0, 0, stream), "qkv")
+                                            m, 3 * VIS_D, VIS_D, self._ffn_fp4_s(("vis", i, "qkv")), 0.0, 0,
+                                            stream), "qkv")
         if o_ptr and hasattr(fvk, "fused_qkv_attention"):
             _ck(fvk.fused_qkv_attention(1, qkv_ptr, qkv_ptr + 2 * VIS_D, qkv_ptr + 4 * VIS_D, 3 * VIS_D, 0, 0, 0,
                                         0, 0, o_ptr, VIS_D, views, m // views, VIS_NH, VIS_HD, VIS_HD ** -0.5,
@@ -1358,9 +1390,9 @@ class Pi05Pipeline:
             split_fn()
             o_ptr = attn_fn()
         _ck(fvk.nvfp4_quant(o_ptr, VIS_D, x4, x4sf, one, m, VIS_D, stream), "o quant")
-        w, sf, a = t["o"]
+        w, sf, _ = t["o"]
         _ck(fvk.nvfp4_gemm_bias_res_bf16out(x4, w, x4sf, sf, W["vision_attn_o_b"][i], x_ptr, x_ptr,
-                                            m, VIS_D, VIS_D, a, 1.0, 0, stream), "o")
+                                            m, VIS_D, VIS_D, self._ffn_fp4_s(("vis", i, "o")), 1.0, 0, stream), "o")
 
     def _vision_ffn_nvfp4(self, i: int, m: int, x_ptr: int, stream: int) -> None:
         """x += FFN(LayerNorm(x)) on NVFP4: LayerNorm -> e2m1, up GEMM with
@@ -1380,12 +1412,14 @@ class Pi05Pipeline:
 
         _ck(fvk.nvfp4_norm_quant(x_ptr, W["vision_pre_ffn_norm_w"][i], W["vision_pre_ffn_norm_b"][i], 0, 1e-5,
                                  x4, x4sf, self._ffn_fp4_one.ptr.value, m, VIS_D, stream), "norm")
-        up_w, up_sf, up_a = t["up"]
-        _ck(fvk.nvfp4_gemm_bias_gelu_fp4out(x4, up_w, x4sf, up_sf, t["up_b"], h4, h4sf, mp, hp, VIS_D, up_a,
-                                            self._ffn_fp4_nc[("vis", i)].ptr.value, stream), "up")
+        up_w, up_sf, _ = t["up"]
+        _ck(fvk.nvfp4_gemm_bias_gelu_fp4out(x4, up_w, x4sf, up_sf, t["up_b"], h4, h4sf, mp, hp, VIS_D,
+                                            self._ffn_fp4_s(("vis", i, "up")), self._ffn_fp4_s(("vis", i, "nc")),
+                                            stream), "up")
         dn_w, dn_sf, _ = t["down"]
         _ck(fvk.nvfp4_gemm_bias_res_bf16out(h4, dn_w, h4sf, dn_sf, W["vision_ffn_down_b"][i], x_ptr, x_ptr,
-                                            m, VIS_D, hp, self._ffn_fp4_alpha[("vis", i)], 1.0, 0, stream), "down")
+                                            m, VIS_D, hp, self._ffn_fp4_s(("vis", i, "down")), 1.0, 0, stream),
+            "down")
 
     def _encoder_ffn_nvfp4(self, i: int, m: int, x_ptr: int, x_norm_ptr: int, stream: int) -> None:
         """x += x_norm (the attention projection), then x_norm = FFN(RMS(x))
@@ -1406,13 +1440,14 @@ class Pi05Pipeline:
 
         _ck(fvk.nvfp4_norm_quant(x_ptr, 0, 0, 1, 1e-6, x4, x4sf, self._ffn_fp4_one.ptr.value, m, ENC_D, stream,
                                  residual=x_norm_ptr), "residual norm")
-        gu_w, gu_sf, ag, au = t["gate_up"]
-        _ck(fvk.nvfp4_gemm_geglu_fold_fp4out(x4, gu_w, x4sf, gu_sf, fold, h4sf, mp, 2 * ENC_H, ENC_D, ag, au,
-                                             self._ffn_fp4_nc[("enc", i)].ptr.value, stream), "gate_up")
+        gu_w, gu_sf = t["gate_up"][:2]
+        _ck(fvk.nvfp4_gemm_geglu_fold_fp4out(x4, gu_w, x4sf, gu_sf, fold, h4sf, mp, 2 * ENC_H, ENC_D,
+                                             self._ffn_fp4_s(("enc", i, "gate")), self._ffn_fp4_s(("enc", i, "up")),
+                                             self._ffn_fp4_s(("enc", i, "nc")), stream), "gate_up")
         fvk.fp4_swiglu_even_col_compact_v2(fold, h4, m, ENC_H, stream)
         dn_w, dn_sf, _ = t["down"]
         _ck(fvk.nvfp4_gemm_bias_res_bf16out(h4, dn_w, h4sf, dn_sf, self._ffn_fp4_zero_bias.ptr.value, 0, x_norm_ptr,
-                                            m, ENC_D, ENC_H, self._ffn_fp4_alpha[("enc", i)], 0.0, 1, stream),
+                                            m, ENC_D, ENC_H, self._ffn_fp4_s(("enc", i, "down")), 0.0, 1, stream),
             "down")
 
     def _fp8_gemm(self, act_bf16_ptr: int, act_n: int, weight_name: str,
@@ -1964,11 +1999,11 @@ class Pi05Pipeline:
             self._ffn_fp4_check(seq, stream)
             x4, x4sf = B["ffn4_enc_x"].ptr.value, B["ffn4_enc_x_sf"].ptr.value
             o_w, o_sf, _ = self.weights["ffn_nvfp4"]["enc"][i]["o"]
-            rc = fvk.nvfp4_quant(enc_o_ptr, ENC_D, x4, x4sf, self._enc_o_gs[i].ptr.value, seq, ENC_D, stream)
+            rc = fvk.nvfp4_quant(enc_o_ptr, ENC_D, x4, x4sf, self._ffn_fp4_s(("enc_o", i, "gs")), seq, ENC_D, stream)
             if rc == 0:
                 rc = fvk.nvfp4_gemm_bias_res_bf16out(x4, o_w, x4sf, o_sf, self._ffn_fp4_zero_bias.ptr.value, 0,
                                                      B["encoder_x_norm"].ptr.value, seq, ENC_D, ENC_D,
-                                                     self._ffn_fp4_alpha[("enc_o", i)], 0.0, 1, stream)
+                                                     self._ffn_fp4_s(("enc_o", i, "alpha")), 0.0, 1, stream)
             if rc != 0:
                 raise RuntimeError(f"Gemma NVFP4 attention output layer {i} failed: status {rc}")
         elif use_int8_enc:

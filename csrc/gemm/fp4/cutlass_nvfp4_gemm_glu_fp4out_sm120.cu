@@ -104,7 +104,7 @@ void* workspace(int M, int N, int K, int s, size_t need) {
 
 template <class Gemm>
 typename Gemm::Arguments make_args(const void* A, const void* B, const void* SFA, const void* SFB, void* D, int M,
-                                   int N, int K, float alpha) {
+                                   int N, int K) {
     using GK = typename Gemm::GemmKernel;
     auto strA = cutlass::make_cute_packed_stride(typename GK::StrideA{}, cute::make_shape(M, K, 1));
     auto strB = cutlass::make_cute_packed_stride(typename GK::StrideB{}, cute::make_shape(N, K, 1));
@@ -119,7 +119,7 @@ typename Gemm::Arguments make_args(const void* A, const void* B, const void* SFA
         {reinterpret_cast<ArrayA const*>(A), strA, reinterpret_cast<ArrayB const*>(B), strB,
          reinterpret_cast<ElementSF const*>(SFA), Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(problem),
          reinterpret_cast<ElementSF const*>(SFB), Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(problem)},
-        {{alpha, 0.0f}, nullptr, strC, reinterpret_cast<ElementD*>(D), strD}};
+        {{1.0f, 0.0f}, nullptr, strC, reinterpret_cast<ElementD*>(D), strD}};
 }
 
 template <class Gemm>
@@ -141,10 +141,11 @@ bool shape_ok(int M, int N, int K) { return M > 0 && M % 128 == 0 && N % 32 == 0
 
 int nvfp4_gemm_bias_gelu_fp4out_sm120(const void* A, const void* B, const void* SFA, const void* SFB,
                                       const void* bias, void* D_packed, void* SFD, int M, int N, int K,
-                                      float alpha, const float* norm_constant, cudaStream_t stream) {
-    if (!A || !B || !SFA || !SFB || !bias || !D_packed || !SFD || !norm_constant || !shape_ok(M, N, K))
+                                      const float* alpha, const float* norm_constant, cudaStream_t stream) {
+    if (!A || !B || !SFA || !SFB || !bias || !D_packed || !SFD || !alpha || !norm_constant || !shape_ok(M, N, K))
         return static_cast<int>(cutlass::Status::kErrorInvalidProblem);
-    auto args = make_args<GeluGemm>(A, B, SFA, SFB, D_packed, M, N, K, alpha);
+    auto args = make_args<GeluGemm>(A, B, SFA, SFB, D_packed, M, N, K);
+    args.epilogue.thread.alpha_ptr = alpha;
     args.epilogue.thread.bias_ptr = reinterpret_cast<ElementBias const*>(bias);
     args.epilogue.thread.block_scale_factor_ptr = reinterpret_cast<ElementSFD*>(SFD);
     args.epilogue.thread.norm_constant_ptr = norm_constant;
@@ -152,16 +153,16 @@ int nvfp4_gemm_bias_gelu_fp4out_sm120(const void* A, const void* B, const void* 
 }
 
 int nvfp4_gemm_geglu_fold_fp4out_sm120(const void* A, const void* B_il, const void* SFA, const void* SFB_il,
-                                       void* D_packed, void* SFD, int M, int N_il, int K, float alpha_gate,
-                                       float alpha_up, const float* norm_constant, cudaStream_t stream) {
-    if (!A || !B_il || !SFA || !SFB_il || !D_packed || !SFD || !norm_constant || !shape_ok(M, N_il, K) ||
-        N_il % 64 != 0)
+                                       void* D_packed, void* SFD, int M, int N_il, int K, const float* alpha_gate,
+                                       const float* alpha_up, const float* norm_constant, cudaStream_t stream) {
+    if (!A || !B_il || !SFA || !SFB_il || !D_packed || !SFD || !alpha_gate || !alpha_up || !norm_constant ||
+        !shape_ok(M, N_il, K) || N_il % 64 != 0)
         return static_cast<int>(cutlass::Status::kErrorInvalidProblem);
-    auto args = make_args<GegluGemm>(A, B_il, SFA, SFB_il, D_packed, M, N_il, K, 1.0f);
+    auto args = make_args<GegluGemm>(A, B_il, SFA, SFB_il, D_packed, M, N_il, K);
     args.epilogue.thread.block_scale_factor_ptr = reinterpret_cast<ElementSFD*>(SFD);
     args.epilogue.thread.norm_constant_ptr = norm_constant;
-    args.epilogue.thread.alpha_gate = alpha_gate;
-    args.epilogue.thread.alpha_up = alpha_up;
+    args.epilogue.thread.alpha_gate_ptr = alpha_gate;
+    args.epilogue.thread.alpha_up_ptr = alpha_up;
     return launch<GegluGemm>(args, M, N_il, K, 1, stream);
 }
 

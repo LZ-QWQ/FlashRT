@@ -1280,7 +1280,8 @@ class Pi05TorchFrontendRtx:
             self._ffn_nvfp4_weights["vis"][:] = table["vis"]
             self._ffn_nvfp4_weights["enc"][:] = table["enc"]
             for pipe in self._live_pipelines():
-                pipe._ffn_fp4_ready = False
+                if getattr(pipe, "_ffn_fp4", False):
+                    pipe._ffn_fp4_refresh()
         else:
             self._ffn_nvfp4_weights = table
             logger.info("NVFP4 FFN weights: %d SigLIP + %d encoder layers", VIS_L, ENC_L)

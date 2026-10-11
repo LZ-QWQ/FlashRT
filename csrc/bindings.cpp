@@ -7623,11 +7623,12 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     // row kernels producing / routing its operands (swizzled UE4M3 scales).
     // See gemm/fp4/cutlass_nvfp4_gemm_bias_res_sm120.cuh, kernels/nvfp4_prefill_sm120.cuh.
     m.def("nvfp4_gemm_bias_res_bf16out", [](uintptr_t A, uintptr_t B, uintptr_t SFA, uintptr_t SFB, uintptr_t bias,
-                                           uintptr_t C, uintptr_t D, int M, int N, int K, float alpha, float beta,
-                                           int schedule, uintptr_t stream) {
+                                           uintptr_t C, uintptr_t D, int M, int N, int K, uintptr_t alpha,
+                                           float beta, int schedule, uintptr_t stream) {
         return flash_rt::gemm::nvfp4_gemm_bias_res_bf16out_sm120(to_ptr(A), to_ptr(B), to_ptr(SFA), to_ptr(SFB),
-                                                                to_ptr(bias), to_ptr(C), to_ptr(D), M, N, K, alpha,
-                                                                beta, schedule, to_stream(stream));
+                                                                to_ptr(bias), to_ptr(C), to_ptr(D), M, N, K,
+                                                                typed_ptr<float>(alpha), beta, schedule,
+                                                                to_stream(stream));
     }, py::arg("A"), py::arg("B"), py::arg("SFA"), py::arg("SFB"), py::arg("bias"), py::arg("C"), py::arg("D"),
        py::arg("M"), py::arg("N"), py::arg("K"), py::arg("alpha"), py::arg("beta"), py::arg("schedule") = 0,
        py::arg("stream") = 0);
@@ -7644,19 +7645,21 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
        py::arg("out_sf"), py::arg("gs"), py::arg("rows"), py::arg("dim"), py::arg("stream") = 0,
        py::arg("residual") = 0);
     m.def("nvfp4_gemm_bias_gelu_fp4out", [](uintptr_t A, uintptr_t B, uintptr_t SFA, uintptr_t SFB, uintptr_t bias,
-                                           uintptr_t D, uintptr_t SFD, int M, int N, int K, float alpha,
+                                           uintptr_t D, uintptr_t SFD, int M, int N, int K, uintptr_t alpha,
                                            uintptr_t norm_constant, uintptr_t stream) {
         return flash_rt::gemm::nvfp4_gemm_bias_gelu_fp4out_sm120(to_ptr(A), to_ptr(B), to_ptr(SFA), to_ptr(SFB),
-                                                                to_ptr(bias), to_ptr(D), to_ptr(SFD), M, N, K, alpha,
-                                                                typed_ptr<float>(norm_constant), to_stream(stream));
+                                                                to_ptr(bias), to_ptr(D), to_ptr(SFD), M, N, K,
+                                                                typed_ptr<float>(alpha), typed_ptr<float>(norm_constant),
+                                                                to_stream(stream));
     }, py::arg("A"), py::arg("B"), py::arg("SFA"), py::arg("SFB"), py::arg("bias"), py::arg("D"), py::arg("SFD"),
        py::arg("M"), py::arg("N"), py::arg("K"), py::arg("alpha"), py::arg("norm_constant"), py::arg("stream") = 0);
     m.def("nvfp4_gemm_geglu_fold_fp4out", [](uintptr_t A, uintptr_t B_il, uintptr_t SFA, uintptr_t SFB_il,
-                                            uintptr_t D, uintptr_t SFD, int M, int N_il, int K, float alpha_gate,
-                                            float alpha_up, uintptr_t norm_constant, uintptr_t stream) {
+                                            uintptr_t D, uintptr_t SFD, int M, int N_il, int K, uintptr_t alpha_gate,
+                                            uintptr_t alpha_up, uintptr_t norm_constant, uintptr_t stream) {
         return flash_rt::gemm::nvfp4_gemm_geglu_fold_fp4out_sm120(to_ptr(A), to_ptr(B_il), to_ptr(SFA),
                                                                  to_ptr(SFB_il), to_ptr(D), to_ptr(SFD), M, N_il, K,
-                                                                 alpha_gate, alpha_up,
+                                                                 typed_ptr<float>(alpha_gate),
+                                                                 typed_ptr<float>(alpha_up),
                                                                  typed_ptr<float>(norm_constant), to_stream(stream));
     }, py::arg("A"), py::arg("B_il"), py::arg("SFA"), py::arg("SFB_il"), py::arg("D"), py::arg("SFD"), py::arg("M"),
        py::arg("N_il"), py::arg("K"), py::arg("alpha_gate"), py::arg("alpha_up"), py::arg("norm_constant"),

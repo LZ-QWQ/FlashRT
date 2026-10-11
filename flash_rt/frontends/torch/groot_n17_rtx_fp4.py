@@ -1,22 +1,25 @@
-"""GROOT N1.7 RTX frontend on NVFP4 (SM120): backbone and DiT action head.
+"""GROOT N1.7 RTX frontend with an NVFP4 action head (SM120).
 
-``GrootN17TorchFrontendRtxFP4`` runs every backbone and DiT GEMM as a
-block-scaled W4A4 GEMM (see ``flash_rt.models.groot_n17.pipeline_rtx_nvfp4``):
+``GrootN17TorchFrontendRtxFP4`` (``use_fp4=True`` on ``rtx_sm120``) keeps the
+FP8 backbone of :class:`GrootN17TorchFrontendRtxFP8` (fused FP8 producers,
+calibrated activation scales) and runs the action head on block-scaled W4A4
+GEMMs (see ``flash_rt.models.groot_n17.pipeline_rtx_nvfp4``):
 
-* Backbone (ViT taps + DeepStack, LLM, VLLN + VL self-attention): CUTLASS
-  SM120 NVFP4 GEMMs whose epilogues carry bias, residual, GELU / SwiGLU with
-  NVFP4 output; the norms emit NVFP4 directly, RoPE (with the per-head q/k
-  norm) rewrites the fused QKV in place and attention reads it there. BF16
-  residual streams.
-* DiT (M = 41): the skinny NVFP4 family; the consumers of its K-split
+* DiT (M = 41): the skinny NVFP4 family. The consumers of its K-split
   partials apply bias, GELU, residual and (Ada)LayerNorm and emit the next
-  NVFP4 operand.
+  NVFP4 operand; self / cross attention reads the Q / QKV projection
+  partials directly.
+* Cross-attention K/V: two CUTLASS SM120 NVFP4 GEMMs per frame (text rows,
+  image rows) over the concatenated K|V weights of their blocks, with the
+  bias in the epilogue; activation global scale from the set_prompt frame.
 
-No standalone elementwise, bias or copy launch remains, and the only
-quantize launches are the attention outputs of the backbone. All weights are
-quantized from the checkpoint's BF16 tensors (not from the FP8-rounded copies
-the shared loader keeps) with a squared-error block-scale search; activation
-block scales are dynamic (global scale 1), so no activation calibration runs.
+DiT and cross-K/V weights are quantized from the checkpoint's BF16 tensors
+(not from the FP8-rounded copies the shared loader keeps) with a
+squared-error block-scale search.
+
+``FLASHRT_GROOT_N17_BB_NVFP4`` additionally builds NVFP4 backbone stages
+(``vit``, ``llm``, ``vlsa``) for experiments only: W4A4 errors compound
+through the ViT and the LLM, so the default backbone stays FP8.
 """
 
 from __future__ import annotations
@@ -118,8 +121,8 @@ class GrootN17TorchFrontendRtxFP4(GrootN17TorchFrontendRtxFP8):
         if bias is None:
             bias = self._kbb_zero_bias[:N]
         bias = bias.to(torch.bfloat16).contiguous()
-        self._kbb_keep += [q, swz, bias]
-        return P.NvFp4Linear(q.data_ptr(), swz.data_ptr(), float(gs.item()), bias.data_ptr(), N, K)
+        self._kbb_keep += [q, swz, bias, gs]
+        return P.NvFp4Linear(q.data_ptr(), swz.data_ptr(), float(gs.item()), gs.data_ptr(), bias.data_ptr(), N, K)
 
     def _nvfp4_swiglu_linear(self, gate_nk: torch.Tensor, up_nk: torch.Tensor):
         """Gate / up weights quantized separately, then row-interleaved
@@ -478,10 +481,10 @@ class GrootN17TorchFrontendRtxFP4(GrootN17TorchFrontendRtxFP8):
                 a = torch.empty(rows, Kd // 2, dtype=torch.uint8, device=dev)
                 sfa = torch.zeros(fvk.nvfp4_sf_bytes(rows, Kd), dtype=torch.uint8, device=dev)
                 out = torch.empty(rows, N, dtype=torch.bfloat16, device=dev)
-                keep += [q, sfb, b, w_gs, a_gs, a, sfa, out]
+                alpha = (a_gs * w_gs).contiguous()          # device scalar the GEMM epilogue reads
+                keep += [q, sfb, b, w_gs, a_gs, alpha, a, sfa, out]
                 groups[name] = {"src": src, "rows": rows, "N": N, "w": q, "sfb": sfb, "b": b, "a": a, "sfa": sfa,
-                                "a_gs": a_gs, "alpha": float(a_gs.item() * w_gs.item()), "out": out,
-                                "blocks": blocks}
+                                "a_gs": a_gs, "alpha": alpha, "out": out, "blocks": blocks}
                 del w
         for g in groups.values():
             for t, j in enumerate(g["blocks"]):
@@ -508,6 +511,6 @@ class GrootN17TorchFrontendRtxFP4(GrootN17TorchFrontendRtxFP8):
             if rc == 0:
                 rc = K.nvfp4_gemm_bias_res_bf16out(g["a"].data_ptr(), g["w"].data_ptr(), g["sfa"].data_ptr(),
                                                    g["sfb"].data_ptr(), g["b"].data_ptr(), 0, g["out"].data_ptr(),
-                                                   g["rows"], g["N"], 2048, g["alpha"], 0.0, 0, s)
+                                                   g["rows"], g["N"], 2048, g["alpha"].data_ptr(), 0.0, 0, s)
             if rc != 0:
                 raise RuntimeError(f"N1.7 cross-KV NVFP4 {name} failed: status {rc}")

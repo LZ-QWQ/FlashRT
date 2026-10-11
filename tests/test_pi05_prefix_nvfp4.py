@@ -9,7 +9,8 @@ Invariants covered:
     block-scaled 4-bit kernels (SigLIP hidden padded to 4352, attention
     projections on FP8) and agrees with the FP8 tier on the same prompt,
     images and noise; replays are bit-identical; the tier is faster than
-    FP8; a weight reload re-quantizes the NVFP4 weights;
+    FP8; a weight reload re-quantizes the NVFP4 weights, and one that changes
+    the NVFP4 global scales matches an instance that captured the new weights;
   - ``decoder_precision="nvfp4"`` runs the action expert on the skinny NVFP4
     family and agrees with the FP8 decoder;
   - the batched pipeline runs the prefix tier and matches the single one per
@@ -136,6 +137,57 @@ def test_nvfp4_prefix_matches_fp8_and_is_faster():
     after = rt.infer(obs[0], noise=noise)["actions"]
     assert _cos(after, out[0]) > 0.9999
     del rt; gc.collect(); torch.cuda.empty_cache()
+
+
+def _rescaled_state(path):
+    """The checkpoint with every GeGLU up projection x2 / down projection x0.5
+    and every SigLIP value projection x2 / output projection x0.5: the same
+    function, different weight magnitudes (so different NVFP4 global scales)."""
+    from safetensors.torch import load_file
+    sd = load_file(os.path.join(path, "model.safetensors"))
+    for k in list(sd):
+        vis = "vision_model.encoder.layers." in k
+        if k.endswith(".mlp.up_proj.weight") or (vis and ".self_attn.v_proj." in k):
+            sd[k] = sd[k] * 2
+        elif k.endswith(".mlp.down_proj.weight") or (vis and k.endswith(".self_attn.out_proj.weight")):
+            sd[k] = sd[k] * 0.5
+    return sd
+
+
+@requires
+def test_nvfp4_reload_with_new_scales_matches_fresh_capture():
+    """A reload whose weights change the NVFP4 global scales must reach the
+    graphs captured before it: replaying them matches re-recording them with
+    the reloaded weights (bit for bit, same calibration), and an instance that
+    took the same weights before capturing (to its own calibration)."""
+    from flash_rt.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
+    gc.collect(); torch.cuda.empty_cache()
+    obs = [_make_obs(s) for s in range(3)]
+    g = torch.Generator(device="cuda"); g.manual_seed(5)
+    noise = torch.randn(10, 32, generator=g, device="cuda", dtype=torch.bfloat16)
+    sd = _rescaled_state(CKPT_PI05)
+    kw = dict(num_views=2, prefix_precision="nvfp4", decoder_precision="nvfp4")
+
+    rt = Pi05TorchFrontendRtx(CKPT_PI05, **kw)
+    rt.set_prompt(PROMPT); rt.calibrate(obs)
+    rt.reload_weights(sd)
+    after = [rt.infer(o, noise=noise)["actions"] for o in obs]
+    stream = rt._graph_torch_stream
+    with torch.cuda.stream(stream):
+        rt._record_infer_graph_if_enabled(stream.cuda_stream)
+    torch.cuda.synchronize()
+    recaptured = [rt.infer(o, noise=noise)["actions"] for o in obs]
+    assert all(np.array_equal(a, r) for a, r in zip(after, recaptured))
+    del rt; gc.collect(); torch.cuda.empty_cache()
+
+    fresh = Pi05TorchFrontendRtx(CKPT_PI05, **kw)
+    fresh.reload_weights(sd)
+    fresh.set_prompt(PROMPT); fresh.calibrate(obs)
+    ref = [fresh.infer(o, noise=noise)["actions"] for o in obs]
+    cs = [_cos(a, r) for a, r in zip(after, ref)]
+    print(f"\nnvfp4 reload with new scales: cos vs fresh capture {[round(c, 5) for c in cs]}")
+    assert min(cs) > 0.99, cs
+    del fresh, sd; gc.collect(); torch.cuda.empty_cache()
 
 
 @requires

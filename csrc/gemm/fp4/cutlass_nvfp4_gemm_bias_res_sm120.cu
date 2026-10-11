@@ -96,7 +96,7 @@ void* workspace(int M, int N, int K, int s, size_t need) {
 
 template <class Gemm>
 int run(const void* A, const void* B, const void* SFA, const void* SFB, const void* bias, const void* C, void* D,
-        int M, int N, int K, float alpha, float beta, int s, cudaStream_t stream) {
+        int M, int N, int K, const float* alpha, float beta, int s, cudaStream_t stream) {
     using GK = typename Gemm::GemmKernel;
     auto strA = cutlass::make_cute_packed_stride(typename GK::StrideA{}, cute::make_shape(M, K, 1));
     auto strB = cutlass::make_cute_packed_stride(typename GK::StrideB{}, cute::make_shape(N, K, 1));
@@ -111,7 +111,8 @@ int run(const void* A, const void* B, const void* SFA, const void* SFB, const vo
         {reinterpret_cast<ArrayA const*>(A), strA, reinterpret_cast<ArrayB const*>(B), strB,
          reinterpret_cast<ElementSF const*>(SFA), Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(problem),
          reinterpret_cast<ElementSF const*>(SFB), Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(problem)},
-        {{alpha, beta}, reinterpret_cast<ElementC const*>(C), strC, reinterpret_cast<ElementD*>(D), strD}};
+        {{1.0f, beta}, reinterpret_cast<ElementC const*>(C), strC, reinterpret_cast<ElementD*>(D), strD}};
+    args.epilogue.thread.alpha_ptr = alpha;
     args.epilogue.thread.bias_ptr = reinterpret_cast<ElementBias const*>(bias);
     Gemm gemm;
     const size_t need = Gemm::get_workspace_size(args);
@@ -129,8 +130,8 @@ int run(const void* A, const void* B, const void* SFA, const void* SFB, const vo
 
 int nvfp4_gemm_bias_res_bf16out_sm120(const void* A, const void* B, const void* SFA, const void* SFB,
                                       const void* bias, const void* C, void* D, int M, int N, int K,
-                                      float alpha, float beta, int schedule, cudaStream_t stream) {
-    if (!A || !B || !SFA || !SFB || !bias || !D || (beta != 0.f && !C) || M < 1 || N % 8 || K % 128)
+                                      const float* alpha, float beta, int schedule, cudaStream_t stream) {
+    if (!A || !B || !SFA || !SFB || !bias || !D || !alpha || (beta != 0.f && !C) || M < 1 || N % 8 || K % 128)
         return static_cast<int>(cutlass::Status::kErrorInvalidProblem);
     if (schedule == 0)
         return run<PingpongGemm>(A, B, SFA, SFB, bias, C, D, M, N, K, alpha, beta, 0, stream);
