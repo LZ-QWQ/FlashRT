@@ -131,14 +131,15 @@ Baseline comparisons and source methodology live in [Benchmark Comparison](docs/
 | Jetson AGX Thor | OpenPI FP8, 2 cameras | **40.71 ms** | **24.6 Hz** | [Verified results](docs/thor/pi05.md#4-check-the-result) |
 | Jetson AGX Thor | OpenPI NVFP4 + FA4, 2 cameras | **20.33 ms** | **49.2 Hz** | [Verified results](docs/thor/pi05.md#4-check-the-result) |
 | RTX 5090 | FP8, 2-view | **17.58 ms** | **57 Hz** | [Blackwell VLA](examples/blackwell/README.md#vla-latency-rtx-5090) |
-| RTX 5090 | NVFP4 tier (`use_fp4=True`), 2-view, state in prompt | **10.37 ms** | **96 Hz** | [Pi0.5 NVFP4](docs/pi05_prefix_nvfp4.md#numbers) (FP8 on the same harness: 15.13 ms) |
+| RTX 5090 | NVFP4 tier (`use_fp4=True`), 2-view, `pi05_libero` | **9.31 ms** | **107 Hz** | [Pi0.5 NVFP4](docs/pi05_prefix_nvfp4.md#numbers) (FP8 skinny on the same harness: 13.89 ms) |
 | AMD Instinct MI350X | FP8, CDNA4 | **16.4 ms** | **61 Hz** | [AMD Pi0.5](docs/deployment_amd_pi05.md) |
 
 The Thor rows use OpenPI `pi05_libero`, two cameras and 10 denoising steps.
 These are steady-state medians from the public Thor image after 200 warmups and
 1,000 measured calls. Action cosine against OpenPI is 0.999905 (FP8) / 0.999707 (NVFP4).
 
-Using OpenPI's `pi05_libero` model, FlashRT achieved **94.29% success on LIBERO-10**.
+Using OpenPI's `pi05_libero` model, FlashRT achieved **94.29% success on LIBERO-10**. On RTX 5090 the NVFP4 tier scores **93.32%** on LIBERO-10
+over 10 seeds (5000 episodes; [protocol](docs/pi05_prefix_nvfp4.md#libero-10-closed-loop)).
 
 **Guide:** [Thor](docs/thor/pi05.md) · [RTX 5090](examples/blackwell/README.md) · [AMD](docs/deployment_amd_pi05.md).
 
@@ -734,10 +735,12 @@ data regardless of cache.
 ### NVFP4 encoder FFN (Pi0.5 only)
 
 Optional NVFP4 (Blackwell block-scaled FP4) quantization on the Pi0.5 encoder
-FFN stack. Implemented for **Pi0.5 torch and JAX on Thor** — passing
-`use_fp4=True` with any other config (pi0 / groot / pi0fast) emits a warning
-and uses the FP8 route. (`config="groot_n17"` on Thor has its own NVFP4
-tier behind the same flag — see [GROOT N1.7 Thor](USAGE.md#groot-n17-thor).)
+FFN stack. This section covers **Pi0.5 torch and JAX on Thor** — passing
+`use_fp4=True` with an unsupported config (pi0 / groot / pi0fast) emits a
+warning and uses the FP8 route. (`config="groot_n17"` on Thor has its own NVFP4
+tier behind the same flag — see [GROOT N1.7 Thor](USAGE.md#groot-n17-thor); on
+RTX SM120 the flag selects the [Pi0.5 NVFP4 tier](docs/pi05_prefix_nvfp4.md)
+and the [GROOT N1.7 NVFP4 tier](docs/groot_n17_rtx_nvfp4.md).)
 
 ```python
 model = flash_rt.load_model(

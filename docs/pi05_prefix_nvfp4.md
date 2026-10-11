@@ -12,7 +12,8 @@ standalone quantize or dequantize pass around the 4-bit GEMMs.
 
 It is a tier, not the default: against the FP8 skinny profile it trades about
 1e-4 of action cosine (vs the FP16 engine) for ~1.46x lower E2E latency.
-Qualify it per task before deploying.
+Qualify it per task before deploying; the LIBERO-10 closed-loop numbers are
+below.
 
 ## Use
 
@@ -59,20 +60,26 @@ the frames below.
 
 ## Numbers
 
-RTX 5090, 2 views, `pi05_libero_pytorch`, synchronized observation-to-final-
-action E2E with `tools/bench_pi05_e2e.py` (state in the prompt every frame,
-200 iterations, 8 LIBERO frames, one container and fixture for all rows):
+RTX 5090, 2 views, openpi `pi05_libero` (converted to PyTorch with openpi's
+`examples/convert_jax_model_to_pytorch.py`). Synchronized observation-to-final-
+action E2E with `tools/bench_pi05_e2e.py` (200 iterations after 30 warmups,
+8 LIBERO frames; every row uses the same build, checkpoint and fixture):
 
-| `--profile` | prefix | decoder | p50 | p95 |
-|---|---|---|---:|---:|
-| `default` | FP8 | FP8 | 20.89 ms | 21.11 ms |
-| `skinny` | FP8 | FP8 skinny | 15.13 ms | 15.41 ms |
-| `nvfp4` | NVFP4 | FP8 skinny | 11.23 ms | 11.53 ms |
-| `nvfp4-full` | NVFP4 | NVFP4 skinny | 10.37 ms | 10.63 ms |
+| `--profile` | prefix | decoder | state in prompt | p50 | p95 |
+|---|---|---|---|---:|---:|
+| `default` | FP8 | FP8 | yes | 20.88 ms | 21.17 ms |
+| `skinny` | FP8 | FP8 skinny | yes | 15.08 ms | 15.28 ms |
+| `nvfp4` | NVFP4 | FP8 skinny | yes | 11.18 ms | 11.41 ms |
+| `nvfp4-full` | NVFP4 | NVFP4 skinny | yes | 10.39 ms | 10.60 ms |
+| `skinny --no-state-prompt` | FP8 | FP8 skinny | no | 13.89 ms | 14.12 ms |
+| `nvfp4-full --no-state-prompt` | NVFP4 | NVFP4 skinny | no | 9.31 ms | 9.46 ms |
 
-The captured graph of the `nvfp4-full` tier replays in 8.24 ms (vision 1.75,
-encoder 3.3, decoder 3.25 ms under CUPTI); the rest of the E2E is the host-side
-tokenization, image upload and action download.
+`pi05_libero` is trained without the state in the prompt
+(`discrete_state_input=False`), so the `--no-state-prompt` rows are its
+deployment latency; the state rows add the per-frame prompt rebuild. The
+captured graph of the `nvfp4-full` tier replays in 8.24 ms (vision 1.75,
+encoder 3.3, decoder 3.25 ms under CUPTI); the rest of the E2E is image
+upload, action download and the Python call.
 
 Agreement on 24 real LIBERO frames, same prompt and pinned noise, against the
 FP16 frontend:
@@ -84,6 +91,23 @@ FP16 frontend:
 
 Replays are bit-identical. `tests/test_pi05_prefix_nvfp4.py` gates the tier
 against FP8, the NVFP4 decoder, the batched pipeline and a weight reload.
+
+### LIBERO-10 closed loop
+
+`use_fp4=True` on LIBERO-10, 10 seeds (7, 17, ..., 97) x 10 tasks x 50
+episodes = 5000 episodes: **4666 / 5000 = 93.32%** (Wilson 95% interval
+92.59-93.98%; per seed 91.8-94.6%, standard deviation 0.85 points).
+
+| task | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| success | 94.6% | 99.4% | 95.0% | 96.8% | 97.8% | 99.2% | 93.6% | 99.8% | 70.4% | 86.6% |
+
+Protocol: openpi's `examples/libero/main.py` unchanged except that the policy
+server call is `model.predict(images=[agentview, wrist], prompt=task)` (images
+rotated 180 degrees, `openpi_client.image_tools.resize_with_pad` to 224 and
+`convert_to_uint8`, 10 settle steps, replanning every 5 actions, 520 steps,
+the suite's initial states, no state input). Each task prompt is calibrated
+with `calibrate()` on 16 LIBERO frames before its first episode.
 
 ## Limits
 
