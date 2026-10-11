@@ -1294,9 +1294,11 @@ class Pi05TorchFrontendRtx:
         kernels stream. With ``inplace=True`` the existing buffers are
         refilled (weight reload)."""
         from flash_rt import flash_rt_kernels as fvk
-        if not hasattr(fvk, "nvfp4_skinny_gemm"):
+        missing = [fn for fn in Pi05Pipeline._DEC_FP4_KERNELS if not hasattr(fvk, fn)]
+        if missing:
             raise RuntimeError("decoder_precision='nvfp4' needs a GPU_ARCH=120 build with "
-                               "FLASHRT_ENABLE_PI05_NVFP4=ON")
+                               "FLASHRT_ENABLE_PI05_SKINNY=ON and FLASHRT_ENABLE_PI05_NVFP4=ON "
+                               f"(missing: {', '.join(missing)})")
         W = self._ckpt_bf16
         store = self._dec_nvfp4_store
         if inplace:

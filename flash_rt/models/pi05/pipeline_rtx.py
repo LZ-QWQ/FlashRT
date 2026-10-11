@@ -1063,6 +1063,10 @@ class Pi05Pipeline:
         (DEC_D, DEC_H): 5,                             # down    128x1024 (4 splits)
     }
 
+    _DEC_FP4_KERNELS = ("nvfp4_skinny_gemm", "nvfp4_skinny_gemm_bf16_act", "nvfp4_skinny_config_k_chunk",
+                        "nvfp4_skinny_config_supports", "pi05_dec_fp4_residual_ada_norm",
+                        "pi05_dec_fp4_gate_gelu", "pi05_dec_fp4_action_in_norm")
+
     def _init_decoder_nvfp4(self, precision: str) -> bool:
         precision = (precision or "fp8").lower()
         if precision == "fp8":
@@ -1074,9 +1078,11 @@ class Pi05Pipeline:
                 "decoder_precision='nvfp4' runs on the skinny decoder family: it needs "
                 "decoder_kernel='skinny', the calibrated FP8 decoder and a "
                 "FLASHRT_ENABLE_PI05_SKINNY=ON build")
-        if not hasattr(self.fvk, "nvfp4_skinny_gemm"):
+        missing = [fn for fn in self._DEC_FP4_KERNELS if not hasattr(self.fvk, fn)]
+        if missing:
             raise RuntimeError("decoder_precision='nvfp4' needs a GPU_ARCH=120 build with "
-                               "FLASHRT_ENABLE_PI05_NVFP4=ON")
+                               "FLASHRT_ENABLE_PI05_SKINNY=ON and FLASHRT_ENABLE_PI05_NVFP4=ON "
+                               f"(missing: {', '.join(missing)})")
         table = self.weights.get("dec_nvfp4") or {}
         if f"decoder_ffn_down_w_{DEC_L - 1}" not in table:
             raise RuntimeError("decoder_precision='nvfp4' but the frontend provided no NVFP4 decoder weights")

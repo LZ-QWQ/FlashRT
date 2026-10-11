@@ -1034,10 +1034,11 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             else:
                 logger.warning(
                     "use_fp4=True is only supported for config='pi05' with "
-                    "framework in ('torch', 'jax') on Thor, or config='hyvla' "
-                    "with framework='torch' on Thor; got config='%s' "
-                    "framework='%s' hardware='%s'. Falling back to FP8.",
-                    config, framework, arch)
+                    "framework in ('torch', 'jax') on Thor, config='hyvla' "
+                    "with framework='torch' on Thor, or config in ('pi05', "
+                    "'groot_n17') with framework='torch' on RTX SM120; got "
+                    "config='%s' framework='%s' hardware='%s'. Falling back "
+                    "to FP8.", config, framework, arch)
             use_fp4 = False
         else:
             try:
@@ -1106,10 +1107,13 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
     if "use_fp8" in sig.parameters:
         kwargs["use_fp8"] = use_fp8
     if _rtx_nvfp4 and config == "pi05":
-        if "decoder_precision" not in sig.parameters:
-            raise ValueError(f"{pipe_cls.__name__} has no NVFP4 tier (use_fp4=True on rtx_sm120)")
-        kwargs["prefix_precision"] = "nvfp4"
-        kwargs["decoder_precision"] = "nvfp4"
+        if "decoder_precision" in sig.parameters and "prefix_precision" in sig.parameters:
+            kwargs["prefix_precision"] = "nvfp4"
+            kwargs["decoder_precision"] = "nvfp4"
+        else:
+            logger.warning(
+                "use_fp4=True: %s has no NVFP4 tier; falling back to FP8.",
+                pipe_cls.__name__)
     # A named tier reaches here only for the Ascend backend, and only as
     # "bf16" or "int8"; everything else was refused before the frontend was
     # chosen. A frontend that cannot take the tier is an error rather than a
