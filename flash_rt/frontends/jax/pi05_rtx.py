@@ -460,6 +460,7 @@ class Pi05JaxFrontendRtx(Pi05TorchFrontendRtx):
         decoder_kernel: Optional[str] = None,
         prefix_precision: Optional[str] = None,
         sde: bool = False,
+        decoder_precision: Optional[str] = None,
     ):
         # Don't chain to Pi05TorchFrontendRtx.__init__ — it expects a safetensors
         # file. We replicate the body and swap the loader.
@@ -478,6 +479,20 @@ class Pi05JaxFrontendRtx(Pi05TorchFrontendRtx):
             decoder_kernel
             or os.environ.get("FLASHRT_PI05_DECODER_KERNEL", "cublaslt")
         )
+        # Decoder GEMM precision: "fp8" (per-tensor, calibrated) or "nvfp4"
+        # (block-scaled 4-bit weights and activations on the skinny decoder
+        # family, sm_120a only; activation global scales reuse the FP8
+        # calibration). FLASHRT_PI05_DECODER_PRECISION overrides the default.
+        self._decoder_precision = (decoder_precision
+                                   or os.environ.get("FLASHRT_PI05_DECODER_PRECISION", "fp8")).lower()
+        if self._decoder_precision not in ("fp8", "nvfp4"):
+            raise ValueError(f"decoder_precision must be fp8 or nvfp4, got {self._decoder_precision!r}")
+        if self._decoder_precision == "nvfp4":
+            if decoder_kernel is None and "FLASHRT_PI05_DECODER_KERNEL" not in os.environ:
+                self._decoder_kernel = "skinny"
+            elif self._decoder_kernel != "skinny":
+                raise ValueError("decoder_precision='nvfp4' runs on the skinny decoder family "
+                                 f"(decoder_kernel='skinny'), got decoder_kernel={self._decoder_kernel!r}")
         self._batch_size = PI05_BATCH_SIZE
         self._prefix_features = bool(prefix_features)
         self._last_prompt_len = 0
@@ -573,17 +588,17 @@ class Pi05JaxFrontendRtx(Pi05TorchFrontendRtx):
         self._int8_weight_scales: dict[str, torch.Tensor] = {}
         if self.use_fp8 and not self._force_bf16 and not self._force_int8_decoder:
             self._quantize_all_fp8()
-        self._nvfp4_weights: dict = {}
-        self._nvfp4_store: list = []
+        self._ffn_nvfp4_weights: dict = {}
         if self._prefix_precision == "nvfp4":
-            if not (
-                self.use_fp8
-                and not self._force_bf16
-                and not self._force_int8_decoder
-            ):
-                raise ValueError(
-                    "prefix_precision='nvfp4' needs the FP8 frontend (use_fp8=True)")
-            self._quantize_prefix_nvfp4()
+            if not (self.use_fp8 and not self._force_bf16 and not self._force_int8_decoder):
+                raise ValueError("prefix_precision='nvfp4' needs the FP8 frontend (use_fp8=True)")
+            self._quantize_ffn_nvfp4()
+        self._dec_nvfp4_weights: dict = {}
+        self._dec_nvfp4_store: list = []
+        if self._decoder_precision == "nvfp4":
+            if not (self.use_fp8 and not self._force_bf16 and not self._force_int8_decoder):
+                raise ValueError("decoder_precision='nvfp4' needs the FP8 frontend (use_fp8=True)")
+            self._quantize_decoder_nvfp4()
 
         # ── Pre-compute decoder styles (shared helper) ──
         from flash_rt.frontends.torch.pi05_rtx import _precompute_decoder_styles
@@ -601,6 +616,7 @@ class Pi05JaxFrontendRtx(Pi05TorchFrontendRtx):
             encoder_seq_max=enc_seq_max,
             chunk_size=self.chunk_size,
             num_encoder_layers=ENC_L,
+            encoder_splitkv=self._encoder_splitkv(),
         )
         self.fvk = fvk
         self.gemm = fvk.GemmRunner()

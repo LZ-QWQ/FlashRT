@@ -2167,3 +2167,24 @@ def test_groot_n17_dit_fp8_nk_layout_dispatches_nt_dev():
     assert gemm.fp8_nt_dev.call_count == 3
     gemm.fp8_nn_dev.assert_not_called()
     gemm.fp8_run_dev.assert_not_called()
+
+
+@pytest.mark.parametrize("framework", ["torch", "jax"])
+@pytest.mark.parametrize("options,message", [
+    ({"decoder_precision": "invalid"}, "decoder_precision must be fp8 or nvfp4"),
+    ({"decoder_precision": "nvfp4", "decoder_kernel": "cublaslt"},
+     "runs on the skinny decoder family"),
+    ({"prefix_precision": "invalid"}, "prefix_precision must be fp8 or nvfp4"),
+])
+def test_pi05_rtx_precision_options_reject_invalid_combinations_before_loading(
+        framework, options, message, monkeypatch):
+    import importlib
+
+    for name in ("FLASHRT_PI05_PREFIX_PRECISION", "FLASHRT_PI05_DECODER_PRECISION",
+                 "FLASHRT_PI05_DECODER_KERNEL"):
+        monkeypatch.delenv(name, raising=False)
+    module = importlib.import_module(f"flash_rt.frontends.{framework}.pi05_rtx")
+    cls = getattr(module, "Pi05JaxFrontendRtx" if framework == "jax"
+                  else "Pi05TorchFrontendRtx")
+    with pytest.raises(ValueError, match=message):
+        cls("/unused-checkpoint", **options)

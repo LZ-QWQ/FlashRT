@@ -116,3 +116,87 @@ with `calibrate()` on 16 LIBERO frames before its first episode.
   is now the largest prefix cost after the GEMMs.
 - The numbers above are the engineering gate; closed-loop success rates decide
   per task whether a deployment uses the tier.
+
+
+## JAX / Orbax frontend compatibility
+
+The Orbax frontend accepts the same `decoder_precision` and `prefix_precision`
+options as the Torch frontend. Both default to `"fp8"`. To select the complete
+NVFP4 tier directly from an Orbax checkpoint:
+
+```python
+from flash_rt.frontends.jax.pi05_rtx import Pi05JaxFrontendRtx
+
+model = Pi05JaxFrontendRtx(
+    "/path/to/pi05_libero", num_views=2, hardware="rtx_sm120",
+    prefix_precision="nvfp4", decoder_precision="nvfp4",
+)
+```
+
+The frontend initializes the separate FFN and decoder NVFP4 weight stores and
+calls their current shared quantizers. `decoder_precision="nvfp4"` selects the
+skinny decoder unless the caller explicitly supplies an incompatible kernel,
+which is rejected before checkpoint loading. SM120 encoder split-KV selection
+also follows the shared Torch helper. Orbax checkpoint conversion is unchanged.
+
+### Runtime library version
+
+The verified NGC `nvcr.io/nvidia/pytorch:25.10-py3` environment supplies
+cuBLASLt **13.1**. In the audit follow-up on RTX 5090, system cuBLASLt 13.0
+returned `CUBLAS_STATUS_NOT_SUPPORTED` from the default `kn` FP8 GEMM heuristic
+on both main and this branch. The same minimal GEMM and full inference passed
+with the NGC cuBLASLt 13.1 library. Check the actual library used by the process;
+the CUDA compiler version alone does not identify its cuBLASLt version.
+
+For example, in the intended runtime environment:
+
+```python
+import ctypes
+
+library = ctypes.CDLL("libcublasLt.so.13")
+library.cublasLtGetVersion.restype = ctypes.c_size_t
+print(library.cublasLtGetVersion())  # 130100 in the verified environment
+```
+
+Use a runtime with the verified library support. The frontend does not silently
+change FP8 layout in response to a failed cuBLAS heuristic.
+
+
+### Compatibility follow-up (2026-10-16)
+
+Checked on RTX 5090 with the actual Orbax `pi05_libero` checkpoint and its
+converted PyTorch checkpoint, 8 real LIBERO observations, 2 cameras. Runtime:
+PyTorch 2.11.0+cu128, JAX 0.11.2 / Orbax 0.12.7 / Flax 0.12.10 for CPU weight
+loading, and cuBLASLt 13.1 from NGC 25.10. Both revisions used the same runtime
+and observations. Baseline: main `b171b5a6` (including #227 and #220).
+
+Synchronized CPU-observation-to-final-action timing, fixed text prompt without
+state tokens, 30 warmups and 200 timed observations per process. FP8 values are
+the median of 3 fresh processes per revision, with alternating revision order;
+NVFP4 is one 200-iteration process. Loading, calibration and graph capture are
+excluded.
+
+| frontend / tier | main p50 | branch p50 | branch p95 |
+| --- | ---: | ---: | ---: |
+| TORCH FP8 | 18.873 ms | 18.736 ms | 18.772 ms |
+| JAX FP8 | 18.900 ms | 18.769 ms | 18.802 ms |
+| JAX NVFP4 prefix + decoder | — | 8.778 ms | 8.872 ms |
+
+FP8 showed no slowdown in this comparison. With fixed noise over the 8 frames,
+JAX FP8 vs main had action cosine min **0.999935**, and JAX NVFP4 vs FP8 had
+min **0.996538** (the existing tier gate is 0.99). Repeating an observation after
+other observations produced identical actions with fixed noise. Consecutive
+public `predict()` calls returned finite `(10, 7)` arrays.
+
+Regression checks:
+
+- Constructor/API checks: **71 passed**, with the existing Thor routing test
+  excluded after confirming its same failure on main.
+- Existing prefix/decoder NVFP4, batched and weight-reload tests: **5 passed**.
+- New `tests/test_pi05_jax_precision.py`: checks both FP8 and NVFP4 against real
+  Orbax weights and real observations, including graph replay and public calls.
+  Run it with `PI05_LIBERO_ORBAX_CHECKPOINT` and
+  `PI05_REAL_OBSERVATIONS_NPZ` set to local input paths.
+
+This follow-up did not rerun LIBERO closed-loop task success or GR00T model
+benchmarks. The follow-up code changes are confined to Pi0.5 JAX initialization.
