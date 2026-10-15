@@ -58,22 +58,28 @@ python examples/blackwell/eval_libero.py \
 
 ## VLA latency (RTX 5090)
 
-All RTX 5090 numbers here are pure CUDA Graph replay p50
-(`cuda.Event` around `graph.replay()`), not the end-to-end
-`quickstart.py` wall clock. Replay excludes graph-external work such
-as image normalization, H2D upload, D2H action download, post-process
+Pi0.5 below reports observation-to-final-action wall-clock p50 for the
+fastest verified tiers. The GROOT tables report pure CUDA Graph replay p50
+(`cuda.Event` around `graph.replay()`). Replay excludes graph-external work
+such as image normalization, H2D upload, D2H action download, post-process
 un-normalization, and Python wrapper overhead.
 
 ### Pi0.5
 
-| Views | Latency | Frequency |
-|-------|---------|-----------|
-| 1 view | **14.48 ms** | 69 Hz |
-| 2 views | **17.58 ms** | 57 Hz |
-| 3 views | **20.00 ms** | 50 Hz |
+| Tier (2 views, `pi05_libero`) | Observation-to-action p50 | Frequency |
+|---|---:|---:|
+| **JAX/Orbax NVFP4 prefix + decoder** | **8.78 ms** | **114 Hz** |
+| Torch NVFP4 prefix + decoder (`use_fp4=True`) | **9.31 ms** | **107 Hz** |
 
-Wall p50 reference: 15.92 ms / 19.58 ms / 23.24 ms for 1/2/3 views.
-Cosine vs FP16 PyTorch reference: **0.998**.
+These timings use a fixed text prompt without state tokens, and exclude
+loading, calibration and graph capture. They were measured in separate runs.
+The JAX result is the fastest verified tier: RTX 5090, cuBLASLt 13.1, 8 real
+LIBERO observations, 30 warmups and 200 synchronized measured calls. Numerical
+checks and the exact boundary are in the
+[JAX compatibility follow-up](../../docs/pi05_prefix_nvfp4.md#compatibility-follow-up-2026-10-16).
+Select it with the [Orbax frontend precision options](../../docs/pi05_prefix_nvfp4.md#jax--orbax-frontend-compatibility).
+The Torch tier's method and quality gates are in
+[Pi0.5 NVFP4 numbers](../../docs/pi05_prefix_nvfp4.md#numbers).
 
 ### GROOT N1.6
 
