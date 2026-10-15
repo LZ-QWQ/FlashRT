@@ -130,16 +130,9 @@ Baseline comparisons and source methodology live in [Benchmark Comparison](docs/
 |---|---|---:|---:|---|
 | Jetson AGX Thor | OpenPI FP8, 2 cameras | **40.71 ms** | **24.6 Hz** | [Verified results](docs/thor/pi05.md#4-check-the-result) |
 | Jetson AGX Thor | OpenPI NVFP4 + FA4, 2 cameras | **20.33 ms** | **49.2 Hz** | [Verified results](docs/thor/pi05.md#4-check-the-result) |
-| RTX 5090 | NVFP4 prefix + decoder (JAX/Orbax), 2-view, `pi05_libero` | **8.78 ms** | **114 Hz** | [JAX verification](docs/pi05_prefix_nvfp4.md#compatibility-follow-up-2026-10-16) |
-| RTX 5090 | NVFP4 tier (Torch, `use_fp4=True`), 2-view, `pi05_libero` | **9.31 ms** | **107 Hz** | [Pi0.5 NVFP4](docs/pi05_prefix_nvfp4.md#numbers) (FP8 skinny on the same harness: 13.89 ms) |
+| RTX 5090 | FP8, 2-view | **13.10 ms** | **76 Hz** | [Blackwell VLA](examples/blackwell/README.md#vla-latency-rtx-5090) |
+| RTX 5090 | FP4, 2-view | **8.75 ms** | **114 Hz** | [Pi0.5 NVFP4](docs/pi05_prefix_nvfp4.md#latest-verified-modes-2026-10-16) |
 | AMD Instinct MI350X | FP8, CDNA4 | **16.4 ms** | **61 Hz** | [AMD Pi0.5](docs/deployment_amd_pi05.md) |
-
-The RTX rows report observation-to-final-action p50 with a fixed text prompt,
-without state tokens; loading, calibration and graph capture are excluded.
-The fastest verified JAX tier uses cuBLASLt 13.1 and is selected through the
-[Orbax frontend precision options](docs/pi05_prefix_nvfp4.md#jax--orbax-frontend-compatibility).
-The Torch tier uses `load_model(..., use_fp4=True)`. The two RTX rows come from
-separate verification runs; see their linked methods and numerical gates.
 
 The Thor rows use OpenPI `pi05_libero`, two cameras and 10 denoising steps.
 These are steady-state medians from the public Thor image after 200 warmups and

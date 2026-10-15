@@ -66,20 +66,16 @@ un-normalization, and Python wrapper overhead.
 
 ### Pi0.5
 
-| Tier (2 views, `pi05_libero`) | Observation-to-action p50 | Frequency |
-|---|---:|---:|
-| **JAX/Orbax NVFP4 prefix + decoder** | **8.78 ms** | **114 Hz** |
-| Torch NVFP4 prefix + decoder (`use_fp4=True`) | **9.31 ms** | **107 Hz** |
+| Mode | Latency | Frequency |
+|-------|---------|-----------|
+| FP8, 2 views (skinny decoder) | **13.10 ms** | **76 Hz** |
+| NVFP4, 2 views (prefix + decoder) | **8.75 ms** | **114 Hz** |
 
-These timings use a fixed text prompt without state tokens, and exclude
-loading, calibration and graph capture. They were measured in separate runs.
-The JAX result is the fastest verified tier: RTX 5090, cuBLASLt 13.1, 8 real
-LIBERO observations, 30 warmups and 200 synchronized measured calls. Numerical
-checks and the exact boundary are in the
-[JAX compatibility follow-up](../../docs/pi05_prefix_nvfp4.md#compatibility-follow-up-2026-10-16).
-Select it with the [Orbax frontend precision options](../../docs/pi05_prefix_nvfp4.md#jax--orbax-frontend-compatibility).
-The Torch tier's method and quality gates are in
-[Pi0.5 NVFP4 numbers](../../docs/pi05_prefix_nvfp4.md#numbers).
+These are synchronized observation-to-action medians with a fixed text prompt
+without state tokens; loading, calibration and capture are excluded. Both modes
+use the same model, observations, build and runtime. Torch and Orbax loaders use
+the same inference pipeline. See [verification](../../docs/pi05_prefix_nvfp4.md#latest-verified-modes-2026-10-16)
+for measurements and the cuBLASLt 13.1 runtime requirement.
 
 ### GROOT N1.6
 

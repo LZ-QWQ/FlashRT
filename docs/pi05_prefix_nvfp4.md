@@ -200,3 +200,24 @@ Regression checks:
 
 This follow-up did not rerun LIBERO closed-loop task success or GR00T model
 benchmarks. The follow-up code changes are confined to Pi0.5 JAX initialization.
+
+
+### Latest verified modes (2026-10-16)
+
+RTX 5090, `pi05_libero`, two views, eight real observations, fixed text prompt
+without state tokens. The latest confirmation measured each mode with
+30 warmups and 200 synchronized observation-to-action calls.
+The table reports that run's p50/p95 and reciprocal p50 frequency;
+loading, calibration and capture are excluded. Runtime is cuBLASLt 13.1.
+
+| Mode | p50 | p95 | Frequency |
+|---|---:|---:|---:|
+| FP8 skinny decoder | 13.10 ms | 13.18 ms | 76 Hz |
+| NVFP4 prefix + decoder | 8.75 ms | 8.78 ms | 114 Hz |
+
+The two checkpoint loaders use the same inference pipeline and precision tiers.
+These latest timing samples used the safetensors loader.
+The confirmation agrees with three earlier fresh-process measurements
+(FP8 median p50 13.10 ms; NVFP4 median p50 8.74 ms). Earlier Orbax samples
+above used the same pipeline, model family, real observations and timing boundary.
+No closed-loop task evaluation was repeated for this documentation update.
