@@ -140,17 +140,19 @@ int flashdrive_w4a8_quant(int rows, int K, int n_sets, const void* const* xr, co
 
 // LayerNorm of BF16 rows with FP32 statistics and arithmetic, one BF16 rounding (F.layer_norm on BF16 input with
 // BF16 weight/bias under autocast): out[r] = (x[r] - mean) * rsqrt(var + eps) * w + b. dim % 8 == 0 (8-byte vectors).
-int flashdrive_layernorm_bf16(const void* x, const void* w, const void* b, void* out, int rows, int dim, float eps,
+int alpamayo15_layernorm_bf16(const void* x, const void* w, const void* b, void* out, int rows, int dim, float eps,
                               cudaStream_t stream);
 
-// out[r, f] = bf16(silu(bf16 gu[r, f])) * bf16 gu[r, F + f] (the rounding of silu_mul_qwen36_bf16) for a fused
-// gate | up GEMM output gu [rows, 2F] bf16; out [rows, F] bf16. F % 4 == 0.
-int flashdrive_silu_mul_split_bf16(const void* gu, void* out, int rows, int F, cudaStream_t stream);
+// out[r, f] = bf16(silu(bf16 gate[r, f])) * bf16 up[r, f] (the rounding of silu_mul_qwen36_bf16); gate and up are
+// bf16 rows of leading dimension ld: the halves of a fused gate | up GEMM output gu [rows, 2F] (gate = gu, up = gu + F,
+// ld = 2F) or two separate [rows, F] outputs (ld = F). out [rows, F] bf16. F % 4 == 0, ld % 4 == 0.
+int alpamayo15_silu_mul_split_bf16(const void* gate, const void* up, int ld, void* out, int rows, int F,
+                                   cudaStream_t stream);
 
 // Per-row FP8 E4M3 quantization of BF16 activations (the W8A8 expert tier): scale[r] = absmax(row) / 448 (1 for an
 // all-zero row), q = round-to-nearest-even(x / scale) saturated to +-448. x [rows, K] bf16 with leading dim ld_x,
 // q [rows, K] e4m3 bytes, scale [rows] fp32. K % 8 == 0.
-int flashdrive_quantize_fp8_rows_bf16(const void* x, int ld_x, void* q, float* scale, int rows, int K, cudaStream_t stream);
+int alpamayo15_quantize_fp8_rows_bf16(const void* x, int ld_x, void* q, float* scale, int rows, int K, cudaStream_t stream);
 
 // Process-wide programmatic-dependent-launch switch for every FlashDrive-backend kernel (off by default).
 void flashdrive_set_pdl(bool on);

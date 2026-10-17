@@ -34,13 +34,23 @@ Numerics follow the official module graph under ``torch.autocast(bfloat16)``:
 the VLM runs in BF16; the expert keeps an FP32 residual stream, applies RoPE in
 FP32 and feeds BF16 operands to attention (autocast casts SDPA inputs).
 
-``decode_weights="fp8"`` is an opt-in precision tier, not part of that
-contract: the reasoning-decode projections (q/k/v, o, gate/up, down and the LM
-head) read per-row FP8 E4M3 copies of their weights (BF16 activations, FP32
-accumulation). Decode is weight-streaming bound, so this halves its bytes;
-vision, prefill, the expert and the sampler keep BF16 arithmetic. The expert
-still attends over the reasoning-token K/V written by the FP8 projections, so
-trajectories can move even when the sampled tokens are identical.
+The vision tower and the expert run on FlashRT's tcgen05 GEMMs (bias, GELU and residual fused into the epilogues) by default;
+``vision_gemm`` / ``expert_gemm`` = ``"torch"`` keep cuBLAS and torch
+elementwise for comparison; the prefill projections stay on cuBLAS, which is
+faster than the tcgen05 BF16 GEMM at those shapes on Thor. Each frame grid's
+vision tower is one CUDA graph.
+
+Precision tiers (opt-in, numerics changes outside that contract):
+``decode_weights="fp8"`` / ``"int8"`` read per-row FP8 E4M3 or symmetric INT8
+copies of the reasoning-decode projections (q/k/v, o, gate/up, down and the LM
+head) with BF16 activations and FP32 accumulation. Decode is weight-streaming
+bound, so this halves its bytes; INT8 carries about 4x less weight error than
+E4M3 for the same bytes. The expert still attends over the reasoning-token K/V
+written by those projections, so trajectories can move even when the sampled
+tokens are identical. ``expert_weights="fp8"`` runs the diffusion expert's
+projections as W8A8 (per-row FP8 activations and weights, scales applied in
+the GEMM epilogue), halving its weight stream; ``prefill_weights="fp8"`` does
+the same for the 36 prefill layers on 2-SM tcgen05 tiles.
 """
 from __future__ import annotations
 
@@ -67,7 +77,10 @@ ALPAMAYO15_KERNEL_SYMBOLS = (
     "alpamayo15_vision_rope_qk_bf16",
     "alpamayo15_vlm_qk_prep_bf16",
     "alpamayo15_w8a16_gemm_bf16",
-    # tcgen05 GEMMs of the FlashDrive backend (csrc/gemm/alpamayo15_bf16_gemm_sm100.cu), same build gate
+    "alpamayo15_layernorm_bf16",
+    "alpamayo15_silu_mul_split_bf16",
+    "alpamayo15_quantize_fp8_rows_bf16",
+    # tcgen05 GEMMs (csrc/gemm/alpamayo15_bf16_gemm_sm100.cu), same build gate
     "alpamayo15_bf16_gemm_sm100",
     "alpamayo15_bf16_gemm_sm100_workspace",
     "alpamayo15_fp8_gemm_sm100",
@@ -75,6 +88,13 @@ ALPAMAYO15_KERNEL_SYMBOLS = (
     "alpamayo15_int8_gemm_sm100",
     "alpamayo15_int8_gemm_sm100_workspace",
 )
+GEMM_BACKENDS = ("cutlass", "torch")         # BF16 GEMMs of the vision tower and the action expert
+VISION_TILE = 2                              # tcgen05 tile of the vision GEMMs: 256 x 128 on a 2-SM UMMA
+DECODE_WEIGHTS = ("bf16", "fp8", "int8")
+EXPERT_WEIGHTS = ("bf16", "fp8")
+PREFILL_WEIGHTS = ("bf16", "fp8")
+PREFILL_FP8_TILE = 2        # FP8 prefill GEMMs: 256 x 128 x 128 tiles on a 2-SM UMMA
+PREFILL_DOWN_SPLIT = 4      # the K=12288 down projection as 4 column blocks (weight blocks that fit the L2: 1.47 vs 3.9 ms)
 
 
 def require_alpamayo15_kernels(fvk: object) -> None:
@@ -223,6 +243,61 @@ def _autocast():
     return torch.autocast("cuda", dtype=BF16)
 
 
+def _capture(fn, warmups: int = 2) -> torch.cuda.CUDAGraph:
+    """Warm ``fn`` up on a side stream, then capture it (BF16 autocast, no autograd). The autocast cast cache is
+    disabled: a cached cast would be freed when the caller's autocast region ends while the graph keeps its address."""
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream), torch.no_grad(), torch.autocast("cuda", dtype=BF16, cache_enabled=False):
+        for _ in range(warmups):
+            fn()
+    torch.cuda.current_stream().wait_stream(stream)
+    g = torch.cuda.CUDAGraph()
+    with torch.no_grad(), torch.autocast("cuda", dtype=BF16, cache_enabled=False), torch.cuda.graph(g):
+        fn()
+    torch.cuda.synchronize()
+    return g
+
+
+class _Gemm:
+    """BF16 tcgen05 GEMM (``alpamayo15_bf16_gemm_sm100``): ``D = act(A @ W.T + bias) (+ C)`` with a workspace per shape."""
+
+    def __init__(self, fvk) -> None:
+        self._fvk = fvk
+        self._ws: dict = {}
+
+    def __call__(self, A: torch.Tensor, W: torch.Tensor, D: torch.Tensor, bias: torch.Tensor | None = None,
+                 C: torch.Tensor | None = None, act: int = 0, tile: int = 0) -> torch.Tensor:
+        M, K = A.shape
+        N = W.shape[0]
+        key = (M, N, K, act, tile, C is not None)
+        ws = self._ws.get(key)
+        if ws is None:
+            nbytes = self._fvk.alpamayo15_bf16_gemm_sm100_workspace(M, N, K, act, tile, int(C is not None))
+            ws = torch.empty(max(int(nbytes), 16), dtype=torch.uint8, device=DEV)
+            self._ws[key] = ws
+        self._fvk.alpamayo15_bf16_gemm_sm100(A.data_ptr(), W.data_ptr(), bias.data_ptr() if bias is not None else 0,
+                                             C.data_ptr() if C is not None else 0, D.data_ptr(), M, N, K, act, tile,
+                                             ws.data_ptr(), ws.numel(), torch.cuda.current_stream().cuda_stream)
+        return D
+
+    def fp8(self, A8: torch.Tensor, a_s: torch.Tensor, W8: torch.Tensor, w_s: torch.Tensor, D: torch.Tensor,
+            tile: int = 1) -> torch.Tensor:
+        """``D = bf16((A8 @ W8.T) * a_s[m] * w_s[n])`` on the FP8 tcgen05 GEMM (A8 [M, K], W8 [N, K] e4m3 bytes; D a
+        row-major [M, N] block of a wider row-major tensor; tile 1 = 64-row, 0 = 128-row, 2 = 256-row 2-SM)."""
+        M, K = A8.shape
+        N = W8.shape[0]
+        key = ("fp8", M, N, K, tile)
+        ws = self._ws.get(key)
+        if ws is None:
+            nbytes = self._fvk.alpamayo15_fp8_gemm_sm100_workspace(M, N, K, tile)
+            ws = torch.empty(max(int(nbytes), 16), dtype=torch.uint8, device=DEV)
+            self._ws[key] = ws
+        self._fvk.alpamayo15_fp8_gemm_sm100(A8.data_ptr(), W8.data_ptr(), a_s.data_ptr(), w_s.data_ptr(), D.data_ptr(), M, N, K,
+                                            ws.data_ptr(), ws.numel(), torch.cuda.current_stream().cuda_stream, tile, D.stride(0))
+        return D
+
+
 class Alpamayo15Thor:
     """Static-buffer CUDA-graph engine for one official Alpamayo 1.5 model.
 
@@ -236,9 +311,21 @@ class Alpamayo15Thor:
         vision_attention: ``"fa4"`` (strided views, no copies), ``"cudnn"`` or ``"sdpa"``.
         prefill: ``"native"`` (fused FlashRT kernels writing the static cache)
             or ``"official"`` (official Qwen3-VL forward; reference path).
-        decode_weights: ``"bf16"`` (official weights) or ``"fp8"`` (opt-in
-            per-row FP8 E4M3 copies for the reasoning-decode projections and the
+        vision_gemm, expert_gemm: ``"cutlass"`` (default; FlashRT's tcgen05 BF16
+            GEMMs, bias / GELU / residual fused into the epilogues, the vision
+            tower as one CUDA graph per frame grid) or ``"torch"`` (cuBLAS and
+            torch elementwise). The CUTLASS vision tower needs
+            ``vision_attention="fa4"`` and equal frame grids (otherwise the
+            torch tower runs). The prefill projections stay on cuBLAS, which is
+            faster than the tcgen05 BF16 GEMM at those shapes on Thor.
+        decode_weights: ``"bf16"`` (official weights), ``"fp8"`` or ``"int8"``
+            (opt-in per-row copies for the reasoning-decode projections and the
             LM head; about +7.6 GB, changes decode numerics - see module notes).
+        expert_weights: ``"bf16"`` (official weights) or ``"fp8"`` (opt-in W8A8
+            expert projections; about +4.6 GB, changes expert numerics).
+        prefill_weights: ``"bf16"`` (official weights on cuBLAS) or ``"fp8"``
+            (opt-in W8A8 prefill projections on the FP8 tcgen05 GEMM; about
+            +7.6 GB, changes the prompt K/V and therefore every later token).
     """
 
     def __init__(
@@ -255,13 +342,26 @@ class Alpamayo15Thor:
         vision_attention: str = "fa4",
         prefill: str = "native",
         decode_weights: str = "bf16",
+        vision_gemm: str = "cutlass",
+        expert_gemm: str = "cutlass",
+        expert_weights: str = "bf16",
+        prefill_weights: str = "bf16",
     ) -> None:
         if prefill not in ("native", "official"):
             raise ValueError(f"unknown prefill {prefill!r}")
-        if decode_weights not in ("bf16", "fp8"):
-            raise ValueError(f"unknown decode_weights {decode_weights!r}")
-        if decode_weights == "fp8" and max_samples > 16:
-            raise ValueError("decode_weights='fp8' supports max_samples <= 16 (the W8A16 kernel serves up to 16 rows)")
+        if decode_weights not in DECODE_WEIGHTS:
+            raise ValueError(f"unknown decode_weights {decode_weights!r}; choose from {DECODE_WEIGHTS}")
+        if decode_weights != "bf16" and max_samples > 16:
+            raise ValueError(f"decode_weights={decode_weights!r} supports max_samples <= 16 (the W8A16 kernel serves up to 16 rows)")
+        if expert_weights not in EXPERT_WEIGHTS:
+            raise ValueError(f"unknown expert_weights {expert_weights!r}; choose from {EXPERT_WEIGHTS}")
+        if prefill_weights not in PREFILL_WEIGHTS:
+            raise ValueError(f"unknown prefill_weights {prefill_weights!r}; choose from {PREFILL_WEIGHTS}")
+        for name, choice in (("vision_gemm", vision_gemm), ("expert_gemm", expert_gemm)):
+            if choice not in GEMM_BACKENDS:
+                raise ValueError(f"unknown {name} {choice!r}; choose from {GEMM_BACKENDS}")
+        if expert_weights == "fp8" and expert_gemm != "cutlass":
+            raise ValueError("expert_weights='fp8' runs on the FlashRT GEMMs (expert_gemm='cutlass')")
         if vision_attention not in ("fa4", "cudnn", "sdpa"):
             raise ValueError(f"unknown vision_attention {vision_attention!r}")
         if max_samples < 1:
@@ -308,6 +408,9 @@ class Alpamayo15Thor:
         self.vision_attention = vision_attention
         self.prefill_impl = prefill
         self.decode_weights = decode_weights
+        self.vision_gemm, self.expert_gemm = vision_gemm, expert_gemm
+        self.expert_weights, self.prefill_weights = expert_weights, prefill_weights
+        self._gemm = _Gemm(fvk)
         self.max_seq = self.max_prompt + self.max_new + self.n_act
         self.scale = self.head_dim ** -0.5
 
@@ -357,11 +460,16 @@ class Alpamayo15Thor:
         self._expert_graphs: dict[int, torch.cuda.CUDAGraph] = {}
 
         self._fuse_weights()
-        self._q8 = self._quantize_decode_weights() if decode_weights == "fp8" else None
+        self._q8 = self._quantize_decode_weights(decode_weights) if decode_weights != "bf16" else None
+        self._e8 = self._quantize_expert_weights() if expert_weights == "fp8" else None
+        self._p8 = self._quantize_prefill_weights() if prefill_weights == "fp8" else None
         self._pf = None
         self._db = None
         self._eb = None
         self._vis_tables: dict = {}
+        self._vis_graphs: dict = {}
+        if vision_gemm == "cutlass":
+            self._check_vision_modules()
         self._mark = None
 
     def _fuse_weights(self) -> None:
@@ -383,41 +491,74 @@ class Alpamayo15Thor:
                 a.v_proj.weight.data = fused[nq + nk:]
                 out.append(fused)
             return out
+        def fuse_gu(layers):
+            out = []
+            for layer in layers:
+                mlp = layer.mlp
+                fused = torch.cat([mlp.gate_proj.weight.data, mlp.up_proj.weight.data], 0).contiguous()
+                ng = mlp.gate_proj.weight.shape[0]
+                mlp.gate_proj.weight.data = fused[:ng]
+                mlp.up_proj.weight.data = fused[ng:]
+                out.append(fused)
+            return out
         self.w_qkv = fuse(self.lm.layers)
         self.e_w_qkv = fuse(self.expert.layers)
-        self.w_gu = []
-        for layer in self.lm.layers:
-            mlp = layer.mlp
-            fused = torch.cat([mlp.gate_proj.weight.data, mlp.up_proj.weight.data], 0).contiguous()
-            ng = mlp.gate_proj.weight.shape[0]
-            mlp.gate_proj.weight.data = fused[:ng]
-            mlp.up_proj.weight.data = fused[ng:]
-            self.w_gu.append(fused)
+        self.w_gu = fuse_gu(self.lm.layers)
+        self.e_w_gu = fuse_gu(self.expert.layers)
         torch.cuda.empty_cache()
 
     @torch.no_grad()
-    def _quantize_decode_weights(self) -> dict:
-        """FP8 fragment copies of the decode projections (the BF16 originals stay for prefill)."""
-        q8 = {"qkv": [], "o": [], "gu": [], "down": []}
+    def _quantize_decode_weights(self, fmt: str) -> dict:
+        """Per-row FP8 or INT8 fragment copies of the decode projections (the BF16 originals stay for prefill)."""
+        quant = quantize_int8_rows if fmt == "int8" else quantize_fp8_rows
+        q8 = {"qkv": [], "o": [], "gu": [], "down": [], "fmt": 1 if fmt == "int8" else 0}
         for li, layer in enumerate(self.lm.layers):
-            q8["qkv"].append(fp8_fragment_layout(*quantize_fp8_rows(self.w_qkv[li])))
-            q8["o"].append(fp8_fragment_layout(*quantize_fp8_rows(layer.self_attn.o_proj.weight)))
-            q8["gu"].append(fp8_fragment_layout(*quantize_fp8_rows(self.w_gu[li])))
-            q8["down"].append(fp8_fragment_layout(*quantize_fp8_rows(layer.mlp.down_proj.weight)))
-        q8["lm_head"] = fp8_fragment_layout(*quantize_fp8_rows(self.vlm.lm_head.weight))
+            q8["qkv"].append(fp8_fragment_layout(*quant(self.w_qkv[li])))
+            q8["o"].append(fp8_fragment_layout(*quant(layer.self_attn.o_proj.weight)))
+            q8["gu"].append(fp8_fragment_layout(*quant(self.w_gu[li])))
+            q8["down"].append(fp8_fragment_layout(*quant(layer.mlp.down_proj.weight)))
+        q8["lm_head"] = fp8_fragment_layout(*quant(self.vlm.lm_head.weight))
         torch.cuda.empty_cache()
         return q8
 
+    @torch.no_grad()
+    def _quantize_expert_weights(self) -> list:
+        """Per-row FP8 E4M3 copies (row-major codes + fp32 scales) of the expert projections for the W8A8 GEMM."""
+        e8 = []
+        for li, layer in enumerate(self.expert.layers):
+            q = {}
+            for name, w in (("qkv", self.e_w_qkv[li]), ("o", layer.self_attn.o_proj.weight), ("gu", self.e_w_gu[li]),
+                            ("down", layer.mlp.down_proj.weight)):
+                codes, scale = quantize_fp8_rows(w)
+                q[name] = (codes.contiguous(), scale.contiguous())
+            e8.append(q)
+        torch.cuda.empty_cache()
+        return e8
+
+    @torch.no_grad()
+    def _quantize_prefill_weights(self) -> list:
+        """Per-row FP8 E4M3 copies (row-major codes + fp32 scales) of the prefill projections for the W8A8 GEMM."""
+        p8 = []
+        for li, layer in enumerate(self.lm.layers):
+            q = {}
+            for name, w in (("qkv", self.w_qkv[li]), ("o", layer.self_attn.o_proj.weight), ("gu", self.w_gu[li]),
+                            ("down", layer.mlp.down_proj.weight)):
+                codes, scale = quantize_fp8_rows(w)
+                q[name] = (codes.contiguous(), scale.contiguous())
+            p8.append(q)
+        torch.cuda.empty_cache()
+        return p8
+
     def _proj(self, x: torch.Tensor, w: torch.Tensor, key: str, li: int, out: torch.Tensor, stream: int) -> None:
-        """``out = x @ w.T`` from the BF16 weight or, in the FP8 tier, its fragment copy."""
+        """``out = x @ w.T`` from the BF16 weight or, in the FP8 / INT8 tier, its fragment copy."""
         if self._q8 is None:
             torch.mm(x, w.t(), out=out)
             return
         frag, scale = self._q8[key][li] if li >= 0 else self._q8[key]
         if not (x.is_contiguous() and out.is_contiguous() and x.shape[0] == out.shape[0]):
-            raise ValueError("FP8 projection needs contiguous row-major x [n, K] and out [n, N]")
+            raise ValueError("quantized projection needs contiguous row-major x [n, K] and out [n, N]")
         self._fvk.alpamayo15_w8a16_gemm_bf16(frag.data_ptr(), scale.data_ptr(), x.data_ptr(), out.data_ptr(),
-                                             x.shape[0], out.shape[1], x.shape[1], stream)
+                                             x.shape[0], out.shape[1], x.shape[1], stream, self._q8["fmt"])
 
     # ------------------------------------------------------------------
     # vision
@@ -500,6 +641,114 @@ class Alpamayo15Thor:
             img = V.merger(x).to(BF16)
         return img, deep
 
+    def _check_vision_modules(self) -> None:
+        """The CUTLASS vision path assumes the Qwen3-VL tower layout of Alpamayo 1.5 (bias linears, LayerNorms,
+        GELU-tanh block MLP, erf-GELU mergers, equal frame grids)."""
+        V = self.vlm.model.visual
+        blk = V.blocks[0]
+        if any(getattr(lin, "bias", None) is None for lin in (V.patch_embed.proj, blk.attn.qkv, blk.attn.proj,
+                                                               blk.mlp.linear_fc1, blk.mlp.linear_fc2, V.merger.linear_fc1,
+                                                               V.merger.linear_fc2)):
+            raise ValueError("the CUTLASS vision path expects bias linears in the Qwen3-VL vision tower")
+        if type(blk.mlp.act_fn).__name__ not in ("PytorchGELUTanh", "GELUTanh") and getattr(blk.mlp.act_fn, "approximate", "") != "tanh":
+            raise ValueError(f"unexpected vision MLP activation {type(blk.mlp.act_fn).__name__}")
+        if getattr(V.merger.act_fn, "approximate", "none") != "none":
+            raise ValueError("the vision merger is expected to use the erf GELU")
+        if V.merger.use_postshuffle_norm or not all(m.use_postshuffle_norm for m in V.deepstack_merger_list):
+            raise ValueError("unexpected merger normalization placement")
+
+    def _merger(self, mod, x: torch.Tensor, rows: int, D_in: int) -> torch.Tensor:
+        """Qwen3VLVisionPatchMerger on FlashRT kernels: LayerNorm (pre- or post-shuffle), fc1 + erf GELU, fc2."""
+        fvk, g = self._fvk, self._gemm
+        s = torch.cuda.current_stream().cuda_stream
+        Hm = mod.hidden_size                                   # 4 * D_in
+        n = rows // 4
+        if mod.use_postshuffle_norm:
+            h = torch.empty(n, Hm, device=DEV, dtype=BF16)
+            fvk.alpamayo15_layernorm_bf16(x.data_ptr(), mod.norm.weight.data_ptr(), mod.norm.bias.data_ptr(), h.data_ptr(),
+                                          n, Hm, mod.norm.eps, s)
+        else:
+            h = torch.empty(rows, D_in, device=DEV, dtype=BF16)
+            fvk.alpamayo15_layernorm_bf16(x.data_ptr(), mod.norm.weight.data_ptr(), mod.norm.bias.data_ptr(), h.data_ptr(),
+                                          rows, D_in, mod.norm.eps, s)
+            h = h.view(n, Hm)
+        f1 = g(h, mod.linear_fc1.weight, torch.empty(n, Hm, device=DEV, dtype=BF16), bias=mod.linear_fc1.bias, act=2,
+               tile=VISION_TILE)
+        return g(f1, mod.linear_fc2.weight, torch.empty(n, mod.linear_fc2.weight.shape[0], device=DEV, dtype=BF16),
+                 bias=mod.linear_fc2.bias, tile=VISION_TILE)
+
+    def _vision_cutlass(self, pixel_values: torch.Tensor, grid: torch.Tensor):
+        """The Qwen3-VL vision tower on FlashRT kernels: patch embedding (+ position embedding) and every block's
+        LayerNorm, qkv / proj / fc1 / fc2 (bias, GELU and residual fused into the GEMM epilogues), FP32 RoPE and
+        batched FA4 attention; mergers as ``_merger``. Same operation order as ``_vision``; GEMM reduction order and
+        the fused epilogues (one rounding of bias + activation) differ from the cuBLAS + torch path."""
+        V = self.vlm.model.visual
+        fvk, g = self._fvk, self._gemm
+        (pos, cos, sin), key = self._vision_tables(grid)
+        n_img = len(key) // 3
+        t, gh, gw = key[0:3]
+        if not all(key[3 * i:3 * i + 3] == (t, gh, gw) for i in range(n_img)):
+            raise ValueError("the CUTLASS vision path needs equal frame grids (batched attention)")
+        pe = V.patch_embed.proj
+        S, Din = pixel_values.shape[0], pe.weight.shape[0]
+        s = torch.cuda.current_stream().cuda_stream
+        px = pixel_values.to(BF16)
+        T = VISION_TILE
+        x = g(px, pe.weight.view(Din, -1), torch.empty(S, Din, device=DEV, dtype=BF16), bias=pe.bias, C=pos, tile=T)
+        nh = V.blocks[0].attn.num_heads
+        hd = Din // nh
+        L = t * gh * gw
+        h = torch.empty(S, Din, device=DEV, dtype=BF16)
+        qkv = torch.empty(S, 3 * Din, device=DEV, dtype=BF16)
+        f1 = torch.empty(S, V.blocks[0].mlp.linear_fc1.weight.shape[0], device=DEV, dtype=BF16)
+        x2 = torch.empty_like(x)
+        deep = []
+        for li, blk in enumerate(V.blocks):
+            a, m = blk.attn, blk.mlp
+            fvk.alpamayo15_layernorm_bf16(x.data_ptr(), blk.norm1.weight.data_ptr(), blk.norm1.bias.data_ptr(), h.data_ptr(),
+                                          S, Din, blk.norm1.eps, s)
+            g(h, a.qkv.weight, qkv, bias=a.qkv.bias, tile=T)
+            fvk.alpamayo15_vision_rope_qk_bf16(qkv.data_ptr(), cos.data_ptr(), sin.data_ptr(), S, nh, hd, s)
+            q, k, v = qkv.view(S, 3, nh, hd).unbind(1)
+            o, _ = self._fa4(*(z.view(n_img, L, nh, hd) for z in (q, k, v)), softmax_scale=a.scaling, causal=False)
+            g(o.reshape(S, Din), a.proj.weight, x2, bias=a.proj.bias, C=x, tile=T)     # x2 = x + proj(o)
+            fvk.alpamayo15_layernorm_bf16(x2.data_ptr(), blk.norm2.weight.data_ptr(), blk.norm2.bias.data_ptr(), h.data_ptr(),
+                                          S, Din, blk.norm2.eps, s)
+            g(h, m.linear_fc1.weight, f1, bias=m.linear_fc1.bias, act=1, tile=T)
+            g(f1, m.linear_fc2.weight, x, bias=m.linear_fc2.bias, C=x2, tile=T)         # x = x2 + fc2(gelu(fc1(h)))
+            if li in V.deepstack_visual_indexes:
+                deep.append(self._merger(V.deepstack_merger_list[V.deepstack_visual_indexes.index(li)], x, S, Din))
+        return self._merger(V.merger, x, S, Din), deep
+
+    def _encode(self, pixel_values: torch.Tensor, grid: torch.Tensor):
+        """(image embeddings, DeepStack features) of the request's frames: the CUTLASS tower as one CUDA graph per
+        (pixel shape, frame grid) when its conditions hold, otherwise the torch tower."""
+        key_grid = tuple(grid.flatten().tolist())
+        n_img = len(key_grid) // 3
+        equal = all(key_grid[3 * i:3 * i + 3] == key_grid[0:3] for i in range(n_img))
+        if self.vision_gemm != "cutlass" or self.vision_attention != "fa4" or not equal:
+            return self._vision(pixel_values, grid)
+        key = (tuple(pixel_values.shape), key_grid)
+        ent = self._vis_graphs.get(key)
+        if ent is None:
+            if len(self._vis_graphs) >= 2:
+                self._vis_graphs.pop(next(iter(self._vis_graphs)))
+            px = torch.empty_like(pixel_values)
+            px.copy_(pixel_values)
+            with _autocast():
+                self._vision_cutlass(px, grid)             # builds the per-grid tables outside capture
+            grid_host = grid.cpu()                         # table lookup key only: no device sync while capturing
+            tables = self._vis_tables[key_grid]            # captured by address: keep alive with the graph
+            out = {}
+
+            def run():
+                out["img"], out["deep"] = self._vision_cutlass(px, grid_host)
+            ent = {"px": px, "out": out, "tables": tables, "graph": _capture(run)}
+            self._vis_graphs[key] = ent
+        ent["px"].copy_(pixel_values)
+        ent["graph"].replay()
+        return ent["out"]["img"], ent["out"]["deep"]
+
     # ------------------------------------------------------------------
     # prefill (writes sample 0 of the cache)
     # ------------------------------------------------------------------
@@ -510,6 +759,10 @@ class Alpamayo15Thor:
             mk = lambda *shape: torch.empty(*shape, device=DEV, dtype=BF16)
             self._pf = {"P": n, "x": mk(n, H), "h": mk(n, H), "qkv": mk(n, Hq + 2 * Hkv), "q": mk(n, Hq),
                         "attn": mk(n, Hq), "o": mk(n, H), "g": mk(n, F_), "u": mk(n, F_), "d": mk(n, H)}
+            if self._p8 is not None:       # W8A8 tier: FP8 rows + per-row scales of the three GEMM inputs
+                for name, width in (("h", H), ("attn", Hq), ("g", F_)):
+                    self._pf[name + "8"] = torch.empty(n, width, device=DEV, dtype=torch.uint8)
+                    self._pf[name + "_s"] = torch.empty(n, device=DEV, dtype=torch.float32)
         return self._pf
 
     def _prefill_official(self, input_ids, tokenized):
@@ -535,7 +788,7 @@ class Alpamayo15Thor:
         b = self._prefill_buffers(P)
         x, h, qkv, q, attn, o, g, u, d = (b[k][:P] for k in ("x", "h", "qkv", "q", "attn", "o", "g", "u", "d"))
         grid = tokenized["image_grid_thw"]
-        img, deepstack = self._vision(tokenized["pixel_values"], grid)
+        img, deepstack = self._encode(tokenized["pixel_values"], grid)
         if self._mark is not None:
             self._mark("vision_end")
         vis_idx = (input_ids[0] == self.vlm.config.image_token_id).nonzero().squeeze(1)
@@ -548,10 +801,31 @@ class Alpamayo15Thor:
         cos, sin = lm.rotary_emb(x[:1].unsqueeze(0), position_ids)       # [1, P, D] bf16
         cos_f, sin_f = cos[0].contiguous(), sin[0].contiguous()
         layers = lm.layers
+        p8 = self._p8
+
+        def lin(src, akey, w, wname, li, out, col0=0):
+            """``out = src @ w.T``: cuBLAS on the BF16 weight ``w``, or (W8A8 tier) per-row FP8 rows of ``src``
+            (buffers ``akey``) times rows ``col0:`` of the FP8 copy ``wname`` of layer ``li``."""
+            if p8 is None:
+                torch.mm(src, w.t(), out=out)
+                return
+            q8, q_s = b[akey + "8"][:P], b[akey + "_s"][:P]
+            if col0 == 0:
+                fvk.alpamayo15_quantize_fp8_rows_bf16(src.data_ptr(), src.stride(0), q8.data_ptr(), q_s.data_ptr(), P,
+                                                      src.shape[1], s)
+            w8, w_s = p8[li][wname]
+            N = out.shape[1]
+            if wname == "down" and PREFILL_DOWN_SPLIT > 1:          # column blocks: each weight block fits the L2
+                Nb = N // PREFILL_DOWN_SPLIT
+                for j in range(PREFILL_DOWN_SPLIT):
+                    self._gemm.fp8(q8, q_s, w8[j * Nb:(j + 1) * Nb], w_s[j * Nb:(j + 1) * Nb], out[:, j * Nb:(j + 1) * Nb],
+                                   tile=PREFILL_FP8_TILE)
+            else:
+                self._gemm.fp8(q8, q_s, w8[col0:col0 + N], w_s[col0:col0 + N], out, tile=PREFILL_FP8_TILE)
         fvk.alpamayo15_rms_bf16(x.data_ptr(), 0, layers[0].input_layernorm.weight.data_ptr(), h.data_ptr(), P, H, self.eps, s)
         for li, layer in enumerate(layers):
             a = layer.self_attn
-            torch.mm(h, self.w_qkv[li].t(), out=qkv)
+            lin(h, "h", self.w_qkv[li], "qkv", li, qkv)
             kc, vc = self.k_cache[li, 0, :P], self.v_cache[li, 0, :P]
             fvk.alpamayo15_vlm_qk_prep_bf16(
                 qkv.data_ptr(), a.q_norm.weight.data_ptr(), a.k_norm.weight.data_ptr(),
@@ -559,14 +833,13 @@ class Alpamayo15Thor:
                 P, NH, NKV, NKV * D, P, 0, self.eps, s)
             self._fa4(q.view(1, P, NH, D), kc.unsqueeze(0), vc.unsqueeze(0), softmax_scale=self.scale,
                       causal=True, pack_gqa=True, out=attn.view(1, P, NH, D))
-            torch.mm(attn, a.o_proj.weight.t(), out=o)
+            lin(attn, "attn", a.o_proj.weight, "o", li, o)
             fvk.alpamayo15_rms_bf16(x.data_ptr(), o.data_ptr(), layer.post_attention_layernorm.weight.data_ptr(),
                                     h.data_ptr(), P, H, self.eps, s)
-            mlp = layer.mlp
-            torch.mm(h, mlp.gate_proj.weight.t(), out=g)
-            torch.mm(h, mlp.up_proj.weight.t(), out=u)
-            fvk.silu_mul_qwen36_bf16(g.data_ptr(), u.data_ptr(), g.data_ptr(), P * F_, s)
-            torch.mm(g, mlp.down_proj.weight.t(), out=d)
+            lin(h, "h", self.w_gu[li][:F_], "gu", li, g)             # cuBLAS is slower on the fused gate | up shape: two GEMMs
+            lin(h, "h", self.w_gu[li][F_:], "gu", li, u, col0=F_)
+            fvk.alpamayo15_silu_mul_split_bf16(g.data_ptr(), u.data_ptr(), F_, g.data_ptr(), P, F_, s)   # in place
+            lin(g, "g", layer.mlp.down_proj.weight, "down", li, d)
             if li < len(deepstack):
                 fvk.residual_add(x.data_ptr(), d.data_ptr(), P * H, s)
                 x[vis_idx] = x[vis_idx] + deepstack[li].to(BF16)
@@ -652,10 +925,7 @@ class Alpamayo15Thor:
             fvk.alpamayo15_rms_bf16(x.data_ptr(), o.data_ptr(), layer.post_attention_layernorm.weight.data_ptr(),
                                     h.data_ptr(), n, H, self.eps, s)
             self._proj(h, self.w_gu[li], "gu", li, gu, s)
-            if n == 1:
-                fvk.silu_mul_qwen36_bf16(gu.data_ptr(), gu[:, F_:].data_ptr(), act.data_ptr(), F_, s)
-            else:
-                act.copy_(F.silu(gu[:, :F_]) * gu[:, F_:])
+            fvk.alpamayo15_silu_mul_split_bf16(gu.data_ptr(), gu[:, F_:].data_ptr(), 2 * F_, act.data_ptr(), n, F_, s)
             self._proj(act, layer.mlp.down_proj.weight, "down", li, d, s)
             nxt = layers[li + 1].input_layernorm.weight if li + 1 < len(layers) else lm.norm.weight
             fvk.alpamayo15_rms_bf16(x.data_ptr(), d.data_ptr(), nxt.data_ptr(), h.data_ptr(), n, H, self.eps, s)
@@ -732,8 +1002,11 @@ class Alpamayo15Thor:
             ff = self.expert.config.intermediate_size
             self._eb = {"res": mk(rows, E, dt=torch.float32), "hn": mk(rows, E),
                         "qkv": mk(rows, (self.e_heads + 2 * self.n_kv) * D), "q": mk(rows, self.e_heads * D),
-                        "attn": mk(rows, self.e_heads * D), "o": mk(rows, E), "g": mk(rows, ff), "u": mk(rows, ff),
-                        "d": mk(rows, E)}
+                        "o": mk(rows, E), "gu": mk(rows, 2 * ff), "a": mk(rows, ff), "d": mk(rows, E)}
+            if self._e8 is not None:       # W8A8 tier: FP8 rows + per-row scales of the three GEMM inputs
+                for name, width in (("hn", E), ("attn", self.e_heads * D), ("a", ff)):
+                    self._eb[name + "8"] = mk(rows, width, dt=torch.uint8)
+                    self._eb[name + "_s"] = mk(rows, dt=torch.float32)
         return self._eb
 
     def _expert_velocity(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
@@ -744,31 +1017,45 @@ class Alpamayo15Thor:
         A, E, D, HQ, KV, S = self.n_act, self.e_hidden, self.head_dim, self.e_heads, self.n_kv, self.max_seq
         rows = n * A
         b = self._expert_buffers()
-        res, hn, qkv, q, attn, o, g, u, d = (b[k][:rows] for k in ("res", "hn", "qkv", "q", "attn", "o", "g", "u", "d"))
-        ff = g.shape[1]
+        res, hn, qkv, q, o, gu, act, d = (b[k][:rows] for k in ("res", "hn", "qkv", "q", "o", "gu", "a", "d"))
+        ff = act.shape[1]
         eps = self.e_eps
         layers = self.expert.layers
+        e8 = self._e8
+        cut = self.expert_gemm == "cutlass"
+
+        def lin(src, akey, w, wname, li, out):
+            """``out = src @ w.T``: tcgen05 / cuBLAS on the BF16 weight, or (W8A8 tier) per-row FP8 rows of ``src``
+            (buffers ``akey``) times the FP8 copy ``wname`` of layer ``li``, scales applied in the epilogue."""
+            if e8 is not None:
+                q8, q_s = b[akey + "8"][:rows], b[akey + "_s"][:rows]
+                fvk.alpamayo15_quantize_fp8_rows_bf16(src.data_ptr(), src.stride(0), q8.data_ptr(), q_s.data_ptr(), rows,
+                                                      src.shape[1], s)
+                w8, w_s = e8[li][wname]
+                self._gemm.fp8(q8, q_s, w8, w_s, out)
+            elif cut:
+                self._gemm(src, w, out, tile=1)
+            else:
+                torch.mm(src, w.t(), out=out)
         res.copy_(m.action_in_proj(x, t).view(rows, E))                 # fp32 residual stream
         fvk.alpamayo15_res_rms_f32_bf16(res.data_ptr(), 0, layers[0].input_layernorm.weight.data_ptr(),
                                         hn.data_ptr(), rows, E, eps, s)
         for li, layer in enumerate(layers):
             a = layer.self_attn
-            torch.mm(hn, self.e_w_qkv[li].t(), out=qkv)
+            lin(hn, "hn", self.e_w_qkv[li], "qkv", li, qkv)
             fvk.alpamayo15_expert_qk_prep_bf16(
                 qkv.data_ptr(), a.q_norm.weight.data_ptr(), a.k_norm.weight.data_ptr(),
                 self.e_cos.data_ptr(), self.e_sin.data_ptr(), q.data_ptr(),
                 self.k_cache[li].data_ptr(), self.v_cache[li].data_ptr(), self.d_aslot.data_ptr(),
                 rows, HQ, KV, KV * D, A, S, eps, s)
             attn = self._attend(li, q.view(rows, HQ, D), n, A, self.d_eseq, self.d_esuf, self.expert_splits)
-            torch.mm(attn, a.o_proj.weight.t(), out=o)
+            lin(attn, "attn", a.o_proj.weight, "o", li, o)
             fvk.alpamayo15_res_rms_f32_bf16(res.data_ptr(), o.data_ptr(),
                                             layer.post_attention_layernorm.weight.data_ptr(),
                                             hn.data_ptr(), rows, E, eps, s)
-            mlp = layer.mlp
-            torch.mm(hn, mlp.gate_proj.weight.t(), out=g)
-            torch.mm(hn, mlp.up_proj.weight.t(), out=u)
-            fvk.silu_mul_qwen36_bf16(g.data_ptr(), u.data_ptr(), g.data_ptr(), rows * ff, s)
-            torch.mm(g, mlp.down_proj.weight.t(), out=d)
+            lin(hn, "hn", self.e_w_gu[li], "gu", li, gu)
+            fvk.alpamayo15_silu_mul_split_bf16(gu.data_ptr(), gu[:, ff:].data_ptr(), 2 * ff, act.data_ptr(), rows, ff, s)
+            lin(act, "a", layer.mlp.down_proj.weight, "down", li, d)
             nxt = layers[li + 1].input_layernorm.weight if li + 1 < len(layers) else self.expert.norm.weight
             fvk.alpamayo15_res_rms_f32_bf16(res.data_ptr(), d.data_ptr(), nxt.data_ptr(), hn.data_ptr(), rows, E, eps, s)
         return F.linear(hn, m.action_out_proj.weight, m.action_out_proj.bias).view(-1, A, self.act_dim)

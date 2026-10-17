@@ -13,6 +13,8 @@ pytest.importorskip("transformers")
 
 from flash_rt.models.alpamayo15.pipeline_thor import (  # noqa: E402
     ALPAMAYO15_KERNEL_SYMBOLS,
+    Alpamayo15Thor,
+    _Gemm,
     _TrajTokenMask,
     FP8_E4M3_MAX,
     check_generation_config,
@@ -379,3 +381,173 @@ def test_w8a16_gemm_rejects_unsupported_shapes():
         with pytest.raises(Exception, match="alpamayo15_w8a16_gemm_bf16"):
             fvk.alpamayo15_w8a16_gemm_bf16(frag.data_ptr() + off, scale.data_ptr(), x.data_ptr(), y.data_ptr(),
                                            M, 16, K, _stream())
+
+
+@pytest.mark.parametrize("M,N,K,act,tile,res", [(3072, 3456, 1152, 0, 0, False), (3072, 1152, 1152, 0, 0, True),
+                                                  (3072, 4304, 1152, 1, 0, False), (768, 4608, 4608, 2, 0, False),
+                                                  (3072, 1152, 1536, 0, 0, True), (64, 16512, 2048, 0, 1, False),
+                                                  (64, 2048, 8256, 0, 1, False), (37, 1032, 72, 1, 0, False),
+                                                  (3086, 6144, 4096, 0, 2, False), (300, 4096, 12288, 0, 2, False),
+                                                  (2880, 4304, 1152, 1, 2, False), (2880, 1152, 4304, 0, 2, True),
+                                                  (720, 4608, 4608, 2, 2, False)])
+def test_bf16_cutlass_gemm_matches_torch(M, N, K, act, tile, res):
+    """D = act(A @ W.T + bias) (+ C) on tcgen05 against the torch reference (FP32 math, one BF16 rounding)."""
+    fvk = _kernels()
+    torch.manual_seed(23)
+    A = (torch.randn(M, K, device="cuda") * 0.5).to(BF16)
+    W = (torch.randn(N, K, device="cuda") * 0.05).to(BF16)
+    bias = (torch.randn(N, device="cuda") * 0.1).to(BF16) if tile == 0 else None
+    C = torch.randn(M, N, device="cuda").to(BF16) if res else None
+    D = torch.empty(M, N, device="cuda", dtype=BF16)
+    _Gemm(fvk)(A, W, D, bias=bias, C=C, act=act, tile=tile)
+    torch.cuda.synchronize()
+    ref = A.float() @ W.float().t()
+    if bias is not None:
+        ref = ref + bias.float()
+    if act == 1:
+        ref = torch.nn.functional.gelu(ref, approximate="tanh")
+    elif act == 2:
+        ref = torch.nn.functional.gelu(ref)
+    if C is not None:
+        ref = ref + C.float()
+    err = (D.float() - ref).abs()
+    tol = ref.abs() * 2 ** -7 + 2 ** -7 * (K ** 0.5) * 0.05 * 0.5 * 0.1 + 2 ** -6
+    assert bool((err <= tol).all()), float((err / tol).max())
+    assert float((D.float() - ref).abs().mean()) < 2e-3 * max(1.0, float(ref.abs().mean()))
+    if tile == 2:                         # the 2-SM form reduces K in the same order as the 128-row tile
+        D0 = _Gemm(fvk)(A, W, torch.empty_like(D), bias=bias, C=C, act=act, tile=0)
+        torch.cuda.synchronize()
+        assert torch.equal(D0, D)
+
+
+@pytest.mark.parametrize("M,N,K,tile", [(64, 3072, 2048, 1), (64, 2048, 8256, 1), (64, 16512, 2048, 1), (9, 256, 64, 1),
+                                         (3086, 6144, 4096, 2), (300, 4096, 12288, 2), (300, 4096, 4096, 0)])
+def test_fp8_gemm_and_row_quantization_match_reference(M, N, K, tile):
+    """Per-row FP8 activation quantization equals the engine's quantize_fp8_rows; the W8A8 GEMM reproduces
+    bf16((q_a @ q_w.T) * a_s * w_s) (FP32 accumulation)."""
+    fvk = _kernels()
+    torch.manual_seed(26)
+    x = (torch.randn(M, K + 8, device="cuda") * 2).to(BF16)[:, :K]
+    w = (torch.randn(N, K, device="cuda") * 0.05).to(BF16)
+    q8 = torch.empty(M, K, device="cuda", dtype=torch.uint8)
+    a_s = torch.empty(M, device="cuda", dtype=torch.float32)
+    fvk.alpamayo15_quantize_fp8_rows_bf16(x.data_ptr(), x.stride(0), q8.data_ptr(), a_s.data_ptr(), M, K,
+                                          torch.cuda.current_stream().cuda_stream)
+    torch.cuda.synchronize()
+    q_ref, s_ref = quantize_fp8_rows(x.contiguous())
+    assert torch.equal(a_s, s_ref)
+    assert torch.equal(q8, q_ref)
+    w8, w_s = quantize_fp8_rows(w)
+    D = torch.empty(M, N, device="cuda", dtype=BF16)
+    _Gemm(fvk).fp8(q8, a_s, w8, w_s, D, tile=tile)
+    torch.cuda.synchronize()
+    ref = (q8.view(torch.float8_e4m3fn).float() @ w8.view(torch.float8_e4m3fn).float().t()) * a_s[:, None] * w_s[None, :]
+    err = (D.float() - ref).abs()
+    assert bool((err <= ref.abs() * 2 ** -7 + 2 ** -6 * float(ref.abs().mean())).all()), float(err.max())
+    if tile != 1:                     # column blocks of a wider output (leading dimension N): same values, same order
+        D2 = torch.full((M, N), float("nan"), device="cuda", dtype=BF16)
+        half = N // 2
+        _Gemm(fvk).fp8(q8, a_s, w8[:half], w_s[:half], D2[:, :half], tile=tile)
+        _Gemm(fvk).fp8(q8, a_s, w8[half:], w_s[half:], D2[:, half:], tile=tile)
+        torch.cuda.synchronize()
+        assert torch.equal(D2, D)
+    deq = x.float() @ w.float().t()
+    assert float((D.float() - deq).abs().mean()) < 0.06 * float(deq.abs().mean())   # e4m3 on both operands
+
+
+@pytest.mark.parametrize("rows,dim", [(3072, 1152), (768, 4608), (5, 8)])
+def test_layernorm_matches_torch(rows, dim):
+    fvk = _kernels()
+    torch.manual_seed(24)
+    x = (torch.randn(rows, dim, device="cuda") * 2 + 0.3).to(BF16)
+    w = (torch.rand(dim, device="cuda") + 0.5).to(BF16)
+    b = (torch.randn(dim, device="cuda") * 0.1).to(BF16)
+    out = torch.empty_like(x)
+    fvk.alpamayo15_layernorm_bf16(x.data_ptr(), w.data_ptr(), b.data_ptr(), out.data_ptr(), rows, dim, 1e-6,
+                                  torch.cuda.current_stream().cuda_stream)
+    torch.cuda.synchronize()
+    ref = torch.nn.functional.layer_norm(x.float(), (dim,), w.float(), b.float(), 1e-6)
+    assert bool(((out.float() - ref).abs() <= ref.abs() * 2 ** -7 + 2 ** -6).all())
+    ref_bf = torch.nn.functional.layer_norm(x, (dim,), w, b, 1e-6)         # the autocast BF16 module path
+    assert float((out != ref_bf).float().mean()) < 0.05
+
+
+def test_silu_mul_split_matches_torch():
+    fvk = _kernels()
+    torch.manual_seed(25)
+    rows, F = 64, 8256
+    gu = (torch.randn(rows, 2 * F, device="cuda") * 2).to(BF16)
+    out = torch.empty(rows, F, device="cuda", dtype=BF16)
+    s = torch.cuda.current_stream().cuda_stream
+    fvk.alpamayo15_silu_mul_split_bf16(gu.data_ptr(), gu[:, F:].data_ptr(), 2 * F, out.data_ptr(), rows, F, s)
+    torch.cuda.synchronize()
+    with torch.autocast("cuda", dtype=BF16):
+        ref = torch.nn.functional.silu(gu[:, :F]) * gu[:, F:]
+    assert torch.equal(out, ref)
+    g, u = gu[:, :F].contiguous(), gu[:, F:].contiguous()         # separate gate / up buffers (leading dimension F)
+    out2 = torch.empty_like(out)
+    fvk.alpamayo15_silu_mul_split_bf16(g.data_ptr(), u.data_ptr(), F, out2.data_ptr(), rows, F, s)
+    torch.cuda.synchronize()
+    assert torch.equal(out2, ref)
+
+
+@pytest.mark.parametrize("kw,msg", [({"decode_weights": "int4"}, "decode_weights"),
+                                    ({"expert_weights": "int8"}, "expert_weights"),
+                                    ({"prefill_weights": "int8"}, "prefill_weights"),
+                                    ({"vision_gemm": "cublas"}, "vision_gemm"),
+                                    ({"expert_weights": "fp8", "expert_gemm": "torch"}, "expert_gemm='cutlass'"),
+                                    ({"decode_weights": "int8", "max_samples": 17}, "max_samples <= 16")])
+def test_engine_option_validation(kw, msg):
+    with pytest.raises(ValueError, match=msg):
+        Alpamayo15Thor(SimpleNamespace(), **kw)
+
+
+def test_vision_tower_cutlass_and_graph_match_torch_tower():
+    """A small Qwen3-VL tower (two blocks, one DeepStack merger): the CUTLASS path, eager and as the captured
+    graph, against the torch path of the same weights."""
+    fvk = _kernels()
+    from flash_rt.hardware.thor import fa4_backend
+    fa4 = fa4_backend.fa4_fwd()
+    if fa4 is None:
+        pytest.skip(f"FA4 unavailable: {fa4_backend.status()}")
+    from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLVisionConfig
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
+    torch.manual_seed(5)
+    cfg = Qwen3VLVisionConfig(depth=2, hidden_size=64, intermediate_size=128, num_heads=1, patch_size=4,
+                              spatial_merge_size=2, temporal_patch_size=2, out_hidden_size=48,
+                              num_position_embeddings=16, deepstack_visual_indexes=[0])
+    V = Qwen3VLVisionModel(cfg).eval()
+    with torch.no_grad():
+        for p in V.parameters():
+            p.normal_(0.0, 0.2)
+    V = V.to("cuda", BF16)
+    grid = torch.tensor([[1, 4, 4], [1, 4, 4]], device="cuda")
+    S = int((grid[:, 0] * grid[:, 1] * grid[:, 2]).sum())
+    px = torch.randn(S, 3 * 2 * 4 * 4, device="cuda")
+    eng = SimpleNamespace(vlm=SimpleNamespace(model=SimpleNamespace(visual=V)), _fvk=fvk, _fa4=fa4, _gemm=_Gemm(fvk),
+                          vision_attention="fa4", vision_gemm="cutlass", _vis_tables={}, _vis_graphs={})
+    for name in ("_vision_tables", "_vision", "_vision_cutlass", "_merger", "_check_vision_modules", "_encode"):
+        setattr(eng, name, getattr(Alpamayo15Thor, name).__get__(eng))
+    eng._check_vision_modules()
+    with torch.no_grad(), torch.autocast("cuda", dtype=BF16):
+        ref_img, ref_deep = Alpamayo15Thor._vision(eng, px, grid)
+        img, deep = Alpamayo15Thor._vision_cutlass(eng, px, grid)
+        g_img, g_deep = Alpamayo15Thor._encode(eng, px, grid)
+        g_img, g_deep = g_img.clone(), g_deep[0].clone()
+        px2 = torch.randn_like(px)
+        g2_img, g2_deep = Alpamayo15Thor._encode(eng, px2, grid)
+        g2_img, g2_deep = g2_img.clone(), g2_deep[0].clone()
+        ref2_img, ref2_deep = Alpamayo15Thor._vision_cutlass(eng, px2, grid)
+    torch.cuda.synchronize()
+
+    def close(a, e):
+        a, e = a.float(), e.float()
+        cos = torch.nn.functional.cosine_similarity(a.flatten(), e.flatten(), dim=0)
+        assert float(cos) > 0.999, float(cos)
+        assert float((a - e).abs().mean()) < 2e-2 * float(e.abs().mean())
+    assert img.shape == ref_img.shape == (S // 4, 48) and len(deep) == len(ref_deep) == 1
+    close(img, ref_img)
+    close(deep[0], ref_deep[0])
+    assert torch.equal(g_img, img) and torch.equal(g_deep, deep[0])              # the graph replays the eager path
+    assert torch.equal(g2_img, ref2_img) and torch.equal(g2_deep, ref2_deep[0])  # new pixels through the same graph
+    assert len(eng._vis_graphs) == 1

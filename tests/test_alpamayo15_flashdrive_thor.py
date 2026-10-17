@@ -751,66 +751,6 @@ def test_pack_w4a8_small_layout():
             assert nib == int(w[k, n])
 
 
-@pytest.mark.parametrize("M,N,K,act,tile,res", [(3072, 3456, 1152, 0, 0, False), (3072, 1152, 1152, 0, 0, True),
-                                                  (3072, 4304, 1152, 1, 0, False), (768, 4608, 4608, 2, 0, False),
-                                                  (3072, 1152, 1536, 0, 0, True), (64, 16512, 2048, 0, 1, False),
-                                                  (64, 2048, 8256, 0, 1, False), (37, 1032, 72, 1, 0, False)])
-def test_bf16_cutlass_gemm_matches_torch(M, N, K, act, tile, res):
-    """D = act(A @ W.T + bias) (+ C) on tcgen05 against the torch reference (FP32 math, one BF16 rounding)."""
-    fvk = _kernels()
-    from flash_rt.models.alpamayo15_flashdrive.pipeline_thor import _Gemm
-    torch.manual_seed(23)
-    A = (torch.randn(M, K, device="cuda") * 0.5).to(BF16)
-    W = (torch.randn(N, K, device="cuda") * 0.05).to(BF16)
-    bias = (torch.randn(N, device="cuda") * 0.1).to(BF16) if tile == 0 else None
-    C = torch.randn(M, N, device="cuda").to(BF16) if res else None
-    D = torch.empty(M, N, device="cuda", dtype=BF16)
-    _Gemm(fvk)(A, W, D, bias=bias, C=C, act=act, tile=tile)
-    torch.cuda.synchronize()
-    ref = A.float() @ W.float().t()
-    if bias is not None:
-        ref = ref + bias.float()
-    if act == 1:
-        ref = torch.nn.functional.gelu(ref, approximate="tanh")
-    elif act == 2:
-        ref = torch.nn.functional.gelu(ref)
-    if C is not None:
-        ref = ref + C.float()
-    err = (D.float() - ref).abs()
-    tol = ref.abs() * 2 ** -7 + 2 ** -7 * (K ** 0.5) * 0.05 * 0.5 * 0.1 + 2 ** -6
-    assert bool((err <= tol).all()), float((err / tol).max())
-    assert float((D.float() - ref).abs().mean()) < 2e-3 * max(1.0, float(ref.abs().mean()))
-
-
-@pytest.mark.parametrize("M,N,K", [(64, 3072, 2048), (64, 2048, 8256), (64, 16512, 2048), (9, 256, 64)])
-def test_fp8_gemm_and_row_quantization_match_reference(M, N, K):
-    """Per-row FP8 activation quantization equals the engine's quantize_fp8_rows; the W8A8 GEMM reproduces
-    bf16((q_a @ q_w.T) * a_s * w_s) (FP32 accumulation)."""
-    fvk = _kernels()
-    from flash_rt.models.alpamayo15.pipeline_thor import quantize_fp8_rows
-    from flash_rt.models.alpamayo15_flashdrive.pipeline_thor import _Gemm
-    torch.manual_seed(26)
-    x = (torch.randn(M, K + 8, device="cuda") * 2).to(BF16)[:, :K]
-    w = (torch.randn(N, K, device="cuda") * 0.05).to(BF16)
-    q8 = torch.empty(M, K, device="cuda", dtype=torch.uint8)
-    a_s = torch.empty(M, device="cuda", dtype=torch.float32)
-    fvk.flashdrive_quantize_fp8_rows_bf16(x.data_ptr(), x.stride(0), q8.data_ptr(), a_s.data_ptr(), M, K,
-                                          torch.cuda.current_stream().cuda_stream)
-    torch.cuda.synchronize()
-    q_ref, s_ref = quantize_fp8_rows(x.contiguous())
-    assert torch.equal(a_s, s_ref)
-    assert torch.equal(q8, q_ref)
-    w8, w_s = quantize_fp8_rows(w)
-    D = torch.empty(M, N, device="cuda", dtype=BF16)
-    _Gemm(fvk).fp8(q8, a_s, w8, w_s, D)
-    torch.cuda.synchronize()
-    ref = (q8.view(torch.float8_e4m3fn).float() @ w8.view(torch.float8_e4m3fn).float().t()) * a_s[:, None] * w_s[None, :]
-    err = (D.float() - ref).abs()
-    assert bool((err <= ref.abs() * 2 ** -7 + 2 ** -6 * float(ref.abs().mean())).all()), float(err.max())
-    deq = x.float() @ w.float().t()
-    assert float((D.float() - deq).abs().mean()) < 0.06 * float(deq.abs().mean())   # e4m3 on both operands
-
-
 @pytest.mark.parametrize("M,N,K,tile", [(802, 3584, 3584, 0), (802, 512, 3584, 0), (300, 18944, 3584, 1), (802, 3584, 18944, 0)])
 def test_int8_channel_gemm_and_requantization_match_reference(M, N, K, tile):
     """The per-channel INT8 prefill GEMM reproduces half(float(xq @ codes.T) * a_s[m] * c[n]) (int32 accumulation);
@@ -912,41 +852,11 @@ def test_new_kernels_are_bitwise_repeatable():
     outs = []
     for _ in range(2):
         o = torch.empty_like(A)
-        fvk.flashdrive_layernorm_bf16(A.data_ptr(), bias.data_ptr(), bias.data_ptr(), o.data_ptr(), 3072, 1152, 1e-6, s_)
+        fvk.alpamayo15_layernorm_bf16(A.data_ptr(), bias.data_ptr(), bias.data_ptr(), o.data_ptr(), 3072, 1152, 1e-6, s_)
         torch.cuda.synchronize(); outs.append(o)
     runs.append(("layernorm", 3072, 1152, torch.equal(outs[0], outs[1])))
     bad = [r for r in runs if not r[3]]
     assert not bad, bad
-
-
-@pytest.mark.parametrize("rows,dim", [(3072, 1152), (768, 4608), (5, 8)])
-def test_layernorm_matches_torch(rows, dim):
-    fvk = _kernels()
-    torch.manual_seed(24)
-    x = (torch.randn(rows, dim, device="cuda") * 2 + 0.3).to(BF16)
-    w = (torch.rand(dim, device="cuda") + 0.5).to(BF16)
-    b = (torch.randn(dim, device="cuda") * 0.1).to(BF16)
-    out = torch.empty_like(x)
-    fvk.flashdrive_layernorm_bf16(x.data_ptr(), w.data_ptr(), b.data_ptr(), out.data_ptr(), rows, dim, 1e-6,
-                                  torch.cuda.current_stream().cuda_stream)
-    torch.cuda.synchronize()
-    ref = torch.nn.functional.layer_norm(x.float(), (dim,), w.float(), b.float(), 1e-6)
-    assert bool(((out.float() - ref).abs() <= ref.abs() * 2 ** -7 + 2 ** -6).all())
-    ref_bf = torch.nn.functional.layer_norm(x, (dim,), w, b, 1e-6)         # the autocast BF16 module path
-    assert float((out != ref_bf).float().mean()) < 0.05
-
-
-def test_silu_mul_split_matches_torch():
-    fvk = _kernels()
-    torch.manual_seed(25)
-    rows, F = 64, 8256
-    gu = (torch.randn(rows, 2 * F, device="cuda") * 2).to(BF16)
-    out = torch.empty(rows, F, device="cuda", dtype=BF16)
-    fvk.flashdrive_silu_mul_split_bf16(gu.data_ptr(), out.data_ptr(), rows, F, torch.cuda.current_stream().cuda_stream)
-    torch.cuda.synchronize()
-    with torch.autocast("cuda", dtype=BF16):
-        ref = torch.nn.functional.silu(gu[:, :F]) * gu[:, F:]
-    assert torch.equal(out, ref)
 
 
 @pytest.mark.parametrize("rows,K", [(802, 4096), (8, 4096), (1, 12288), (130, 12288)])

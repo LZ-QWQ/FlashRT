@@ -5,8 +5,9 @@
 // bias [N] (optional), C [M, N] row-major residual (optional, added after the activation; identity only),
 // D [M, N] row-major.
 //   act: 0 identity, 1 GELU (tanh approximation, gelu_pytorch_tanh), 2 GELU (erf)
-//   tile: 0 = 128 x 128 x 64 (vision tower), 1 = 64 x 128 x 64 (few-row operands such as the action expert;
-//         identity, no residual)
+//   tile: 0 = 128 x 128 x 64 per SM, 2 = 256 x 128 x 64 on a 2-SM UMMA (2 x 1 cluster; the vision tower: every
+//         activation / residual form), 1 = 64 x 128 x 64 (few-row operands such as the action expert; identity, no
+//         residual)
 // The residual is added to the activated value, so proj / fc2 (x + linear(..)) and the patch embedding (+ position
 // embedding) are one launch each. 16-byte alignment on every operand; K % 8 == 0, N % 8 == 0.
 
@@ -50,19 +51,23 @@ using NoResTree = fe::Sm90EVT<fe::Sm90Compute<Act, ElementD, ElementCompute, kRN
 template <class Tile>
 using ResTree = fe::Sm90EVT<fe::Sm90Compute<cutlass::plus, ElementD, ElementCompute, kRN>, AccBias<Tile>, fe::Sm90SrcFetch<ElementAB>>;
 
-template <class Tile, class Fusion>
+template <class Tile, class Fusion, bool k2Sm = false>
 struct GemmDef {
-  using Cluster = Shape<_1, _1, _1>;
+  using Cluster = cute::conditional_t<k2Sm, Shape<_2, _1, _1>, Shape<_1, _1, _1>>;
+  using MainSched = cute::conditional_t<k2Sm, cutlass::gemm::KernelTmaWarpSpecialized2SmSm100,
+                                        cutlass::gemm::collective::KernelScheduleAuto>;
+  using EpiSched = cute::conditional_t<k2Sm, cutlass::epilogue::TmaWarpSpecialized2Sm,
+                                       cutlass::epilogue::collective::EpilogueScheduleAuto>;
   using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp, Tile, Cluster,
       cutlass::epilogue::collective::EpilogueTileAuto, ElementAcc, ElementCompute, ElementAB,
       cutlass::layout::RowMajor, kAlign, ElementD, cutlass::layout::RowMajor, kAlign,
-      cutlass::epilogue::collective::EpilogueScheduleAuto, Fusion>::CollectiveOp;
+      EpiSched, Fusion>::CollectiveOp;
   using Mainloop = typename cutlass::gemm::collective::CollectiveBuilder<
       cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp, ElementAB, cutlass::layout::RowMajor, kAlign, ElementAB,
       cutlass::layout::ColumnMajor, kAlign, ElementAcc, Tile, Cluster,
       cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename Epilogue::SharedStorage))>,
-      cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+      MainSched>::CollectiveOp;
   using Kernel = cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, Mainloop, Epilogue, void>;
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
 };
@@ -79,25 +84,30 @@ using Fp8ScaleTree = fe::Sm90EVT<fe::Sm90Compute<cutlass::multiplies, ElementD, 
     fe::Sm90EVT<fe::Sm90Compute<cutlass::multiplies, ElementCompute, ElementCompute, kRN>, fe::Sm90AccFetch, RowScaleNode<Tile>>,
     ColScaleNode<Tile>>;
 
-template <class Tile>
+template <class Tile, bool k2Sm = false>
 struct Fp8GemmDef {
-  using Cluster = Shape<_1, _1, _1>;
+  using Cluster = cute::conditional_t<k2Sm, Shape<_2, _1, _1>, Shape<_1, _1, _1>>;
+  using MainSched = cute::conditional_t<k2Sm, cutlass::gemm::KernelTmaWarpSpecialized2SmSm100,
+                                        cutlass::gemm::collective::KernelScheduleAuto>;
+  using EpiSched = cute::conditional_t<k2Sm, cutlass::epilogue::TmaWarpSpecialized2Sm,
+                                       cutlass::epilogue::collective::EpilogueScheduleAuto>;
   using Fusion = Fp8ScaleTree<Tile>;
   using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp, Tile, Cluster,
       cutlass::epilogue::collective::EpilogueTileAuto, ElementAcc, ElementCompute, void,
       cutlass::layout::RowMajor, kAlign, ElementD, cutlass::layout::RowMajor, kAlign,
-      cutlass::epilogue::collective::EpilogueScheduleAuto, Fusion>::CollectiveOp;
+      EpiSched, Fusion>::CollectiveOp;
   using Mainloop = typename cutlass::gemm::collective::CollectiveBuilder<
       cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp, ElementF8, cutlass::layout::RowMajor, 16, ElementF8,
       cutlass::layout::ColumnMajor, 16, ElementAcc, Tile, Cluster,
       cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename Epilogue::SharedStorage))>,
-      cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+      MainSched>::CollectiveOp;
   using Kernel = cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, Mainloop, Epilogue, void>;
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
 };
-using Tile64F8 = Shape<_64, _128, _128>;
-using F8G64 = Fp8GemmDef<Tile64F8>;
+using F8G64 = Fp8GemmDef<Shape<_64, _128, _128>>;            // tile 1: few-row operands (action expert)
+using F8G128 = Fp8GemmDef<Shape<_128, _128, _128>>;          // tile 0
+using F8G256P = Fp8GemmDef<Shape<_256, _128, _128>, true>;   // tile 2: 2-SM UMMA, 2 x 1 cluster (prefill)
 
 // INT8 x INT8 -> FP16 with per-row activation scales and per-column weight scales (per-channel INT8 prefill tier):
 // D[m, n] = half(float(acc[m, n]) * a_s[m] * w_s[n]), int32 accumulation.
@@ -168,12 +178,13 @@ int run_int8(const void* A, const void* B, const float* a_s, const float* w_s, v
   return cudaPeekAtLastError() == cudaSuccess ? 0 : 4;
 }
 
-typename F8G64::Gemm::Arguments make_fp8_args(const void* A, const void* B, const float* a_s, const float* w_s, void* D,
-                                              int M, int N, int K) {
-  using Gemm = F8G64::Gemm;
+template <class G>
+typename G::Gemm::Arguments make_fp8_args(const void* A, const void* B, const float* a_s, const float* w_s, void* D,
+                                          int M, int N, int K, int ldd) {
+  using Gemm = typename G::Gemm;
   auto sA = cutlass::make_cute_packed_stride(typename Gemm::GemmKernel::StrideA{}, make_shape(M, K, 1));
   auto sB = cutlass::make_cute_packed_stride(typename Gemm::GemmKernel::StrideB{}, make_shape(N, K, 1));
-  auto sD = cutlass::make_cute_packed_stride(typename Gemm::GemmKernel::StrideD{}, make_shape(M, N, 1));
+  typename Gemm::GemmKernel::StrideD sD{int64_t(ldd), _1{}, int64_t(0)};    // D rows ldd elements apart
   typename Gemm::Arguments args{cutlass::gemm::GemmUniversalMode::kGemm,
                                 {M, N, K, 1},
                                 {static_cast<const ElementF8*>(A), sA, static_cast<const ElementF8*>(B), sB},
@@ -194,12 +205,17 @@ template <class T> using GeluErfAct = cutlass::epilogue::thread::GELU<T>;
 
 using Tile128 = Shape<_128, _128, _64>;
 using Tile64 = Shape<_64, _128, _64>;
+using Tile256 = Shape<_256, _128, _64>;
 
 using G128Id = GemmDef<Tile128, NoResTree<Tile128, IdentityAct>>;
 using G128Tanh = GemmDef<Tile128, NoResTree<Tile128, GeluTanhAct>>;
 using G128Erf = GemmDef<Tile128, NoResTree<Tile128, GeluErfAct>>;
 using G128Res = GemmDef<Tile128, ResTree<Tile128>>;
 using G64Id = GemmDef<Tile64, NoResTree<Tile64, IdentityAct>>;
+using G256Id = GemmDef<Tile256, NoResTree<Tile256, IdentityAct>, true>;      // 2-SM UMMA, 2 x 1 cluster
+using G256Tanh = GemmDef<Tile256, NoResTree<Tile256, GeluTanhAct>, true>;
+using G256Erf = GemmDef<Tile256, NoResTree<Tile256, GeluErfAct>, true>;
+using G256Res = GemmDef<Tile256, ResTree<Tile256>, true>;
 
 template <class Def, bool kRes>
 typename Def::Gemm::Arguments make_args(const void* A, const void* B, const void* bias, const void* C, void* D, int M,
@@ -239,12 +255,25 @@ unsigned long long ws_size(int M, int N, int K) {
   return Def::Gemm::get_workspace_size(make_args<Def, kRes>(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K));
 }
 
+template <class G>
+int run_fp8(const void* A, const void* B, const float* a_s, const float* w_s, void* D, int M, int N, int K, int ldd,
+            void* workspace, unsigned long long workspace_bytes, int pdl, cudaStream_t stream) {
+  using Gemm = typename G::Gemm;
+  auto args = make_fp8_args<G>(A, B, a_s, w_s, D, M, N, K, ldd);
+  Gemm gemm;
+  if (Gemm::get_workspace_size(args) > workspace_bytes) return 3;
+  if (gemm.can_implement(args) != cutlass::Status::kSuccess) return 5;
+  if (gemm.initialize(args, workspace, stream) != cutlass::Status::kSuccess) return 6;
+  if (gemm.run(stream, nullptr, pdl != 0) != cutlass::Status::kSuccess) return 7;
+  return cudaPeekAtLastError() == cudaSuccess ? 0 : 4;
+}
+
 bool aligned16(const void* p) { return (reinterpret_cast<uintptr_t>(p) & 15u) == 0; }
 
 int check(int M, int N, int K, int act, int tile, bool res) {
-  if (M <= 0 || N <= 0 || K <= 0 || (N % kAlign) || (K % kAlign) || act < 0 || act > 2 || tile < 0 || tile > 1) return 2;
-  if (res && (act != 0 || tile != 0)) return 2;
-  if (tile == 1 && act != 0) return 2;
+  if (M <= 0 || N <= 0 || K <= 0 || (N % kAlign) || (K % kAlign) || act < 0 || act > 2 || tile < 0 || tile > 2) return 2;
+  if (res && act != 0) return 2;
+  if (tile == 1 && (act != 0 || res)) return 2;
   return 0;
 }
 
@@ -255,6 +284,13 @@ extern "C" {
 int flashrt_a15_bf16_gemm_sm100_workspace(int M, int N, int K, int act, int tile, int residual,
                                           unsigned long long* workspace_bytes) {
   if (int rc = check(M, N, K, act, tile, residual != 0)) return rc;
+  if (tile == 2) {
+    if (residual) *workspace_bytes = ws_size<G256Res, true>(M, N, K);
+    else if (act == 0) *workspace_bytes = ws_size<G256Id, false>(M, N, K);
+    else if (act == 1) *workspace_bytes = ws_size<G256Tanh, false>(M, N, K);
+    else *workspace_bytes = ws_size<G256Erf, false>(M, N, K);
+    return 0;
+  }
   if (residual) *workspace_bytes = ws_size<G128Res, true>(M, N, K);
   else if (tile == 1) *workspace_bytes = ws_size<G64Id, false>(M, N, K);
   else if (act == 0) *workspace_bytes = ws_size<G128Id, false>(M, N, K);
@@ -265,25 +301,24 @@ int flashrt_a15_bf16_gemm_sm100_workspace(int M, int N, int K, int act, int tile
 
 // FP8 W8A8 GEMM (action expert tier): A [M, K] e4m3 row-major, B [N, K] e4m3 row-major, a_s [M] fp32, w_s [N] fp32,
 // D [M, N] bf16. K % 16 == 0, N % 8 == 0, 16-byte aligned operands.
-int flashrt_a15_fp8_gemm_sm100_workspace(int M, int N, int K, unsigned long long* workspace_bytes) {
-  if (M <= 0 || N <= 0 || K <= 0 || (N % kAlign) || (K % 16)) return 2;
-  *workspace_bytes = F8G64::Gemm::get_workspace_size(make_fp8_args(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K));
+// tile 0 = 128 x 128 x 128, 1 = 64 x 128 x 128, 2 = 256 x 128 x 128 on a 2-SM UMMA; ldd = leading dimension of D
+// (>= N: a column block of a wider output).
+int flashrt_a15_fp8_gemm_sm100_workspace(int M, int N, int K, int tile, unsigned long long* workspace_bytes) {
+  if (M <= 0 || N <= 0 || K <= 0 || (N % kAlign) || (K % 16) || tile < 0 || tile > 2) return 2;
+  *workspace_bytes = tile == 2 ? F8G256P::Gemm::get_workspace_size(make_fp8_args<F8G256P>(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K, N))
+                   : tile == 1 ? F8G64::Gemm::get_workspace_size(make_fp8_args<F8G64>(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K, N))
+                   : F8G128::Gemm::get_workspace_size(make_fp8_args<F8G128>(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K, N));
   return 0;
 }
-
 int flashrt_a15_fp8_gemm_sm100(const void* A, const void* B, const float* a_s, const float* w_s, void* D, int M, int N,
-                               int K, void* workspace, unsigned long long workspace_bytes, int pdl, cudaStream_t stream) {
+                               int K, int tile, int ldd, void* workspace, unsigned long long workspace_bytes, int pdl,
+                               cudaStream_t stream) {
   if (!A || !B || !a_s || !w_s || !D || (workspace_bytes && !workspace)) return 1;
-  if (M <= 0 || N <= 0 || K <= 0 || (N % kAlign) || (K % 16)) return 2;
+  if (M <= 0 || N <= 0 || K <= 0 || (N % kAlign) || (K % 16) || tile < 0 || tile > 2 || ldd < N || (ldd % kAlign)) return 2;
   if (!aligned16(A) || !aligned16(B) || !aligned16(D) || !aligned16(a_s) || !aligned16(w_s)) return 5;
-  using Gemm = F8G64::Gemm;
-  auto args = make_fp8_args(A, B, a_s, w_s, D, M, N, K);
-  Gemm gemm;
-  if (Gemm::get_workspace_size(args) > workspace_bytes) return 3;
-  if (gemm.can_implement(args) != cutlass::Status::kSuccess) return 5;
-  if (gemm.initialize(args, workspace, stream) != cutlass::Status::kSuccess) return 6;
-  if (gemm.run(stream, nullptr, pdl != 0) != cutlass::Status::kSuccess) return 7;
-  return cudaPeekAtLastError() == cudaSuccess ? 0 : 4;
+  if (tile == 2) return run_fp8<F8G256P>(A, B, a_s, w_s, D, M, N, K, ldd, workspace, workspace_bytes, pdl, stream);
+  if (tile == 1) return run_fp8<F8G64>(A, B, a_s, w_s, D, M, N, K, ldd, workspace, workspace_bytes, pdl, stream);
+  return run_fp8<F8G128>(A, B, a_s, w_s, D, M, N, K, ldd, workspace, workspace_bytes, pdl, stream);
 }
 
 // Per-channel INT8 GEMM (prefill tier): A [M, K] int8 row-major, B [N, K] int8 row-major, a_s [M] fp32, w_s [N] fp32,
@@ -314,6 +349,12 @@ int flashrt_a15_bf16_gemm_sm100(const void* A, const void* B, const void* bias, 
   if (!A || !B || !D || (workspace_bytes && !workspace)) return 1;
   if (int rc = check(M, N, K, act, tile, C != nullptr)) return rc;
   if (!aligned16(A) || !aligned16(B) || !aligned16(D) || (bias && !aligned16(bias)) || (C && !aligned16(C))) return 5;
+  if (tile == 2) {
+    if (C) return run<G256Res, true>(A, B, bias, C, D, M, N, K, workspace, workspace_bytes, pdl, stream);
+    if (act == 0) return run<G256Id, false>(A, B, bias, nullptr, D, M, N, K, workspace, workspace_bytes, pdl, stream);
+    if (act == 1) return run<G256Tanh, false>(A, B, bias, nullptr, D, M, N, K, workspace, workspace_bytes, pdl, stream);
+    return run<G256Erf, false>(A, B, bias, nullptr, D, M, N, K, workspace, workspace_bytes, pdl, stream);
+  }
   if (C) return run<G128Res, true>(A, B, bias, C, D, M, N, K, workspace, workspace_bytes, pdl, stream);
   if (tile == 1) return run<G64Id, false>(A, B, bias, nullptr, D, M, N, K, workspace, workspace_bytes, pdl, stream);
   if (act == 0) return run<G128Id, false>(A, B, bias, nullptr, D, M, N, K, workspace, workspace_bytes, pdl, stream);

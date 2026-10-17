@@ -922,15 +922,16 @@ __global__ void __launch_bounds__(256) fd_layernorm_kernel(const __nv_bfloat16* 
 }
 
 
-// gate | up halves of one GEMM output row -> bf16(silu(g)) * u, rounded as silu_mul_qwen36_bf16.
-__global__ void fd_silu_mul_split_kernel(const __nv_bfloat16* __restrict__ gu, __nv_bfloat16* __restrict__ out,
-                                         int rows, int F) {
+// out[r, f] = bf16(silu(gate[r, f])) * up[r, f] over rows of leading dimension ld (the gate | up halves of one GEMM
+// output row with up = gate + F, ld = 2F, or two separate outputs with ld = F), rounded as silu_mul_qwen36_bf16.
+__global__ void fd_silu_mul_split_kernel(const __nv_bfloat16* __restrict__ gate, const __nv_bfloat16* __restrict__ up,
+                                         int ld, __nv_bfloat16* __restrict__ out, int rows, int F) {
   fd_pdl();
   const long long n4 = (long long)rows * (F >> 2);
   for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (long long)gridDim.x * blockDim.x) {
     const int r = (int)(i / (F >> 2)), c = (int)(i - (long long)r * (F >> 2)) * 4;
-    const Bf4 g = *reinterpret_cast<const Bf4*>(gu + (size_t)r * 2 * F + c);
-    const Bf4 u = *reinterpret_cast<const Bf4*>(gu + (size_t)r * 2 * F + F + c);
+    const Bf4 g = *reinterpret_cast<const Bf4*>(gate + (size_t)r * ld + c);
+    const Bf4 u = *reinterpret_cast<const Bf4*>(up + (size_t)r * ld + c);
     Bf4 o;
 #pragma unroll
     for (int e = 0; e < 4; ++e) {
@@ -970,14 +971,13 @@ __global__ void __launch_bounds__(256) fd_quantize_fp8_rows_kernel(const __nv_bf
   __syncthreads();
   const float amax = smem[0];
   const float s = amax > 0.0f ? amax / 448.0f : 1.0f;
-  const float inv = 1.0f / s;
   if (threadIdx.x == 0) scale[row] = s;
   uint32_t* qr = reinterpret_cast<uint32_t*>(q + (size_t)row * K);
   for (int i = threadIdx.x; i < n4; i += 256) {
     const Bf4 t = xr[i];
     float f[4];
 #pragma unroll
-    for (int e = 0; e < 4; ++e) f[e] = fminf(fmaxf(bf(t.v[e]) * inv, -448.0f), 448.0f);
+    for (int e = 0; e < 4; ++e) f[e] = fminf(fmaxf(__fdiv_rn(bf(t.v[e]), s), -448.0f), 448.0f);   // x / s as torch
     const __nv_fp8x2_storage_t lo = __nv_cvt_float2_to_fp8x2(make_float2(f[0], f[1]), __NV_SATFINITE, __NV_E4M3);
     const __nv_fp8x2_storage_t hi = __nv_cvt_float2_to_fp8x2(make_float2(f[2], f[3]), __NV_SATFINITE, __NV_E4M3);
     qr[i] = (uint32_t)lo | ((uint32_t)hi << 16);
@@ -1800,7 +1800,7 @@ int flashdrive_w4a8_quant(int rows, int K, int n_sets, const void* const* xr, co
   return cudaPeekAtLastError() == cudaSuccess ? 0 : 4;
 }
 
-int flashdrive_layernorm_bf16(const void* x, const void* w, const void* b, void* out, int rows, int dim, float eps,
+int alpamayo15_layernorm_bf16(const void* x, const void* w, const void* b, void* out, int rows, int dim, float eps,
                               cudaStream_t stream) {
   if (!x || !w || !b || !out) return 1;
   if (rows <= 0 || dim <= 0 || (dim % 8) != 0 || dim > 16384) return 2;
@@ -1811,18 +1811,20 @@ int flashdrive_layernorm_bf16(const void* x, const void* w, const void* b, void*
   return cudaPeekAtLastError() == cudaSuccess ? 0 : 4;
 }
 
-int flashdrive_silu_mul_split_bf16(const void* gu, void* out, int rows, int F, cudaStream_t stream) {
-  if (!gu || !out) return 1;
-  if (rows <= 0 || F <= 0 || (F % 4) != 0) return 2;
-  if (!aligned8(gu) || !aligned8(out)) return 5;
+int alpamayo15_silu_mul_split_bf16(const void* gate, const void* up, int ld, void* out, int rows, int F,
+                                   cudaStream_t stream) {
+  if (!gate || !up || !out) return 1;
+  if (rows <= 0 || F <= 0 || (F % 4) != 0 || ld < F || (ld % 4) != 0) return 2;
+  if (!aligned8(gate) || !aligned8(up) || !aligned8(out)) return 5;
   const long long n4 = (long long)rows * (F / 4);
   const long long blocks = (n4 + 255) / 256;
-  fd_launch(fd_silu_mul_split_kernel, dim3((unsigned)(blocks > 4096 ? 4096 : blocks)), dim3(256), (size_t)(0), stream, 
-      static_cast<const __nv_bfloat16*>(gu), static_cast<__nv_bfloat16*>(out), rows, F);
+  fd_launch(fd_silu_mul_split_kernel, dim3((unsigned)(blocks > 4096 ? 4096 : blocks)), dim3(256), (size_t)(0), stream,
+      static_cast<const __nv_bfloat16*>(gate), static_cast<const __nv_bfloat16*>(up), ld,
+      static_cast<__nv_bfloat16*>(out), rows, F);
   return cudaPeekAtLastError() == cudaSuccess ? 0 : 4;
 }
 
-int flashdrive_quantize_fp8_rows_bf16(const void* x, int ld_x, void* q, float* scale, int rows, int K, cudaStream_t stream) {
+int alpamayo15_quantize_fp8_rows_bf16(const void* x, int ld_x, void* q, float* scale, int rows, int K, cudaStream_t stream) {
   if (!x || !q || !scale) return 1;
   if (rows <= 0 || K <= 0 || (K % 8) != 0 || ld_x < K || (ld_x % 4) != 0) return 2;
   if (!aligned8(x) || (reinterpret_cast<uintptr_t>(q) & 3u) != 0) return 5;

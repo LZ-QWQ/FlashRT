@@ -57,6 +57,8 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from flash_rt.models.alpamayo15.pipeline_thor import _Gemm, _capture  # noqa: F401  (shared tcgen05 GEMM / graph capture)
+
 BF16 = torch.bfloat16
 DEV = "cuda"
 logger = logging.getLogger(__name__)
@@ -65,14 +67,14 @@ BACKEND_CHOICES = ("flashrt", "flashdrive")
 
 # Kernels of the FlashDrive backend (csrc/kernels/alpamayo15_flashdrive_kernels.cuh and the W4A8 GEMM in
 # csrc/gemm/alpamayo15_flashdrive_w4a8_sm100.cu), built with
-# -DFLASHRT_ENABLE_ALPAMAYO15=ON next to the Alpamayo 1.5 engine kernels.
+# -DFLASHRT_ENABLE_ALPAMAYO15=ON next to the Alpamayo 1.5 engine kernels (whose LayerNorm, split SiLU-mul and
+# per-row FP8 quantization kernels and tcgen05 GEMMs the backend shares).
 FLASHDRIVE_KERNEL_SYMBOLS = ("flashdrive_qk_prep_bf16", "flashdrive_rope_rows", "flashdrive_w4a8_act_prep",
                              "flashdrive_shift_cache",
                              "flashdrive_rms_f16delta_bf16", "flashdrive_silu_mul_f16in_bf16",
                              "flashdrive_w4a8_gemm_sm100", "flashdrive_w4a8_gemm_sm100_sizes", "flashdrive_w4a8_gemm_small",
                              "flashdrive_bf16_gemm_small", "flashdrive_draft_qkv_prep_bf16", "flashdrive_w4a8_rotate_dense",
-                             "flashdrive_w4a8_quant", "flashdrive_layernorm_bf16", "flashdrive_silu_mul_split_bf16",
-                             "flashdrive_quantize_fp8_rows_bf16", "flashdrive_set_pdl", "flashdrive_w4a8_gemm_tile",
+                             "flashdrive_w4a8_quant", "flashdrive_set_pdl", "flashdrive_w4a8_gemm_tile",
                              "flashdrive_bf16_gemm_frag", "flashdrive_w4a8_act_prep_tile")
 TILE_MIN_N = 2048           # few-row W4A8 GEMMs with at least this many output channels stream one warp per 16-row tile
 ENGINE_GEMMS = ("cutlass", "torch")    # BF16 GEMMs of the vision tower and the action expert
@@ -496,43 +498,6 @@ class _W4A8Group:
         return worst
 
 
-class _Gemm:
-    """BF16 tcgen05 GEMM (``alpamayo15_bf16_gemm_sm100``): ``D = act(A @ W.T + bias) (+ C)`` with a workspace per shape."""
-
-    def __init__(self, fvk) -> None:
-        self._fvk = fvk
-        self._ws: dict = {}
-
-    def __call__(self, A: torch.Tensor, W: torch.Tensor, D: torch.Tensor, bias: torch.Tensor | None = None,
-                 C: torch.Tensor | None = None, act: int = 0, tile: int = 0) -> torch.Tensor:
-        M, K = A.shape
-        N = W.shape[0]
-        key = (M, N, K, act, tile, C is not None)
-        ws = self._ws.get(key)
-        if ws is None:
-            nbytes = self._fvk.alpamayo15_bf16_gemm_sm100_workspace(M, N, K, act, tile, int(C is not None))
-            ws = torch.empty(max(int(nbytes), 16), dtype=torch.uint8, device=DEV)
-            self._ws[key] = ws
-        self._fvk.alpamayo15_bf16_gemm_sm100(A.data_ptr(), W.data_ptr(), bias.data_ptr() if bias is not None else 0,
-                                             C.data_ptr() if C is not None else 0, D.data_ptr(), M, N, K, act, tile,
-                                             ws.data_ptr(), ws.numel(), torch.cuda.current_stream().cuda_stream)
-        return D
-
-    def fp8(self, A8: torch.Tensor, a_s: torch.Tensor, W8: torch.Tensor, w_s: torch.Tensor, D: torch.Tensor) -> torch.Tensor:
-        """``D = bf16((A8 @ W8.T) * a_s[m] * w_s[n])`` on the FP8 tcgen05 GEMM (A8 [M, K], W8 [N, K] e4m3 bytes)."""
-        M, K = A8.shape
-        N = W8.shape[0]
-        key = ("fp8", M, N, K)
-        ws = self._ws.get(key)
-        if ws is None:
-            nbytes = self._fvk.alpamayo15_fp8_gemm_sm100_workspace(M, N, K)
-            ws = torch.empty(max(int(nbytes), 16), dtype=torch.uint8, device=DEV)
-            self._ws[key] = ws
-        self._fvk.alpamayo15_fp8_gemm_sm100(A8.data_ptr(), W8.data_ptr(), a_s.data_ptr(), w_s.data_ptr(), D.data_ptr(), M, N, K,
-                                            ws.data_ptr(), ws.numel(), torch.cuda.current_stream().cuda_stream)
-        return D
-
-
 def bf16_fragment_layout(w: torch.Tensor) -> torch.Tensor:
     """Reorder a [N, K] bf16 weight into the ``flashdrive_bf16_gemm_frag`` operand: ``[ceil(N/16)][K/16][32 lanes][16 B]``,
     lane ``4g + c`` holding the four ``mma.m16n8k16`` A registers of one 16-wide k step (rows g, g+8; k 2c and 8+2c).
@@ -592,22 +557,6 @@ def _gemm_small(fvk, x: torch.Tensor, w, y: torch.Tensor) -> torch.Tensor:
     return y
 
 
-def _capture(fn, warmups: int = 2) -> torch.cuda.CUDAGraph:
-    """Warm ``fn`` up on a side stream, then capture it (BF16 autocast, no autograd). The autocast cast cache is
-    disabled: a cached cast would be freed when the caller's autocast region ends while the graph keeps its address."""
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream), torch.no_grad(), torch.autocast("cuda", dtype=BF16, cache_enabled=False):
-        for _ in range(warmups):
-            fn()
-    torch.cuda.current_stream().wait_stream(stream)
-    g = torch.cuda.CUDAGraph()
-    with torch.no_grad(), torch.autocast("cuda", dtype=BF16, cache_enabled=False), torch.cuda.graph(g):
-        fn()
-    torch.cuda.synchronize()
-    return g
-
-
 class FlashDriveThor:
     """FlashRT execution backend installed on a FlashDrive Alpamayo 1.5 model.
 
@@ -660,6 +609,9 @@ class FlashDriveThor:
     from flash_rt.models.alpamayo15.pipeline_thor import Alpamayo15Thor as _Engine
     _vision_tables = _Engine._vision_tables
     _vision = _Engine._vision
+    _vision_cutlass = _Engine._vision_cutlass
+    _merger = _Engine._merger
+    _check_vision_modules = _Engine._check_vision_modules
     del _Engine
 
     def __init__(self, model, *, expert: str = "flashrt", vision: str = "flashrt", prefill: str = "flashrt",
@@ -928,7 +880,7 @@ class FlashDriveThor:
         def lin8(x, name, li, y):          # W8A8: per-row FP8 activations x per-row FP8 weights, scales in the epilogue
             q8, q_s = {"hn": (b["hn8"], b["hn_s"]), "att": (b["att8"], b["att_s"]), "act": (b["act8"], b["act_s"])}[x]
             src = {"hn": hn, "att": b["q"], "act": b["act"]}[x]
-            fvk.flashdrive_quantize_fp8_rows_bf16(src.data_ptr(), src.stride(0), q8.data_ptr(), q_s.data_ptr(), A, src.shape[1], s)
+            fvk.alpamayo15_quantize_fp8_rows_bf16(src.data_ptr(), src.stride(0), q8.data_ptr(), q_s.data_ptr(), A, src.shape[1], s)
             w8, w_s = e8[li][name]
             return self._gemm.fp8(q8, q_s, w8, w_s, y)
 
@@ -966,7 +918,7 @@ class FlashDriveThor:
                 else:
                     self._gemm(hn, layer.mlp.gate_up_proj.weight, gu, tile=1)
                 # gate | up are the halves of one row-major [A, 2F] GEMM output: split them for the SiLU-mul kernel
-                fvk.flashdrive_silu_mul_split_bf16(gu.data_ptr(), act.data_ptr(), A, F_, s)
+                fvk.alpamayo15_silu_mul_split_bf16(gu.data_ptr(), gu[:, F_:].data_ptr(), 2 * F_, act.data_ptr(), A, F_, s)
                 if e8 is not None:
                     lin8("act", "down", li, d)
                 else:
@@ -1062,83 +1014,6 @@ class FlashDriveThor:
     # ------------------------------------------------------------------
     # vision
     # ------------------------------------------------------------------
-    def _check_vision_modules(self) -> None:
-        """The CUTLASS vision path assumes the Qwen3-VL tower layout of Alpamayo 1.5 (bias linears, LayerNorms,
-        GELU-tanh block MLP, erf-GELU mergers, equal frame grids)."""
-        V = self.vlm.model.visual
-        blk = V.blocks[0]
-        if any(getattr(lin, "bias", None) is None for lin in (V.patch_embed.proj, blk.attn.qkv, blk.attn.proj,
-                                                               blk.mlp.linear_fc1, blk.mlp.linear_fc2, V.merger.linear_fc1,
-                                                               V.merger.linear_fc2)):
-            raise ValueError("the CUTLASS vision path expects bias linears in the Qwen3-VL vision tower")
-        if type(blk.mlp.act_fn).__name__ not in ("PytorchGELUTanh", "GELUTanh") and getattr(blk.mlp.act_fn, "approximate", "") != "tanh":
-            raise ValueError(f"unexpected vision MLP activation {type(blk.mlp.act_fn).__name__}")
-        if getattr(V.merger.act_fn, "approximate", "none") != "none":
-            raise ValueError("the vision merger is expected to use the erf GELU")
-        if V.merger.use_postshuffle_norm or not all(m.use_postshuffle_norm for m in V.deepstack_merger_list):
-            raise ValueError("unexpected merger normalization placement")
-
-    def _merger(self, mod, x: torch.Tensor, rows: int, D_in: int) -> torch.Tensor:
-        """Qwen3VLVisionPatchMerger on FlashRT kernels: LayerNorm (pre- or post-shuffle), fc1 + erf GELU, fc2."""
-        fvk, g = self._fvk, self._gemm
-        s = torch.cuda.current_stream().cuda_stream
-        Hm = mod.hidden_size                                   # 4 * D_in
-        n = rows // 4
-        if mod.use_postshuffle_norm:
-            h = torch.empty(n, Hm, device=DEV, dtype=BF16)
-            fvk.flashdrive_layernorm_bf16(x.data_ptr(), mod.norm.weight.data_ptr(), mod.norm.bias.data_ptr(), h.data_ptr(),
-                                          n, Hm, mod.norm.eps, s)
-        else:
-            h = torch.empty(rows, D_in, device=DEV, dtype=BF16)
-            fvk.flashdrive_layernorm_bf16(x.data_ptr(), mod.norm.weight.data_ptr(), mod.norm.bias.data_ptr(), h.data_ptr(),
-                                          rows, D_in, mod.norm.eps, s)
-            h = h.view(n, Hm)
-        f1 = g(h, mod.linear_fc1.weight, torch.empty(n, Hm, device=DEV, dtype=BF16), bias=mod.linear_fc1.bias, act=2)
-        return g(f1, mod.linear_fc2.weight, torch.empty(n, mod.linear_fc2.weight.shape[0], device=DEV, dtype=BF16),
-                 bias=mod.linear_fc2.bias)
-
-    def _vision_cutlass(self, pixel_values: torch.Tensor, grid: torch.Tensor):
-        """The Qwen3-VL vision tower on FlashRT kernels: patch embedding (+ position embedding) and every block's
-        LayerNorm, qkv / proj / fc1 / fc2 (bias, GELU and residual fused into the GEMM epilogues), FP32 RoPE and
-        batched FA4 attention; mergers as ``_merger``. Same operation order as ``_vision``; GEMM reduction order and
-        the fused epilogues (one rounding of bias + activation) differ from the cuBLAS + torch path."""
-        V = self.vlm.model.visual
-        fvk, g = self._fvk, self._gemm
-        (pos, cos, sin), key = self._vision_tables(grid)
-        n_img = len(key) // 3
-        t, gh, gw = key[0:3]
-        if not all(key[3 * i:3 * i + 3] == (t, gh, gw) for i in range(n_img)):
-            raise ValueError("the CUTLASS vision path needs equal frame grids (batched attention)")
-        pe = V.patch_embed.proj
-        S, Din = pixel_values.shape[0], pe.weight.shape[0]
-        s = torch.cuda.current_stream().cuda_stream
-        px = pixel_values.to(BF16)
-        x = g(px, pe.weight.view(Din, -1), torch.empty(S, Din, device=DEV, dtype=BF16), bias=pe.bias, C=pos)
-        nh = V.blocks[0].attn.num_heads
-        hd = Din // nh
-        L = t * gh * gw
-        h = torch.empty(S, Din, device=DEV, dtype=BF16)
-        qkv = torch.empty(S, 3 * Din, device=DEV, dtype=BF16)
-        f1 = torch.empty(S, V.blocks[0].mlp.linear_fc1.weight.shape[0], device=DEV, dtype=BF16)
-        x2 = torch.empty_like(x)
-        deep = []
-        for li, blk in enumerate(V.blocks):
-            a, m = blk.attn, blk.mlp
-            fvk.flashdrive_layernorm_bf16(x.data_ptr(), blk.norm1.weight.data_ptr(), blk.norm1.bias.data_ptr(), h.data_ptr(),
-                                          S, Din, blk.norm1.eps, s)
-            g(h, a.qkv.weight, qkv, bias=a.qkv.bias)
-            fvk.alpamayo15_vision_rope_qk_bf16(qkv.data_ptr(), cos.data_ptr(), sin.data_ptr(), S, nh, hd, s)
-            q, k, v = qkv.view(S, 3, nh, hd).unbind(1)
-            o, _ = self._fa4(*(z.view(n_img, L, nh, hd) for z in (q, k, v)), softmax_scale=a.scaling, causal=False)
-            g(o.reshape(S, Din), a.proj.weight, x2, bias=a.proj.bias, C=x)             # x2 = x + proj(o)
-            fvk.flashdrive_layernorm_bf16(x2.data_ptr(), blk.norm2.weight.data_ptr(), blk.norm2.bias.data_ptr(), h.data_ptr(),
-                                          S, Din, blk.norm2.eps, s)
-            g(h, m.linear_fc1.weight, f1, bias=m.linear_fc1.bias, act=1)
-            g(f1, m.linear_fc2.weight, x, bias=m.linear_fc2.bias, C=x2)                 # x = x2 + fc2(gelu(fc1(h)))
-            if li in V.deepstack_visual_indexes:
-                deep.append(self._merger(V.deepstack_merger_list[V.deepstack_visual_indexes.index(li)], x, S, Din))
-        return self._merger(V.merger, x, S, Din), deep
-
     @torch.no_grad()
     def _encode(self, pixel_values: torch.Tensor, image_grid_thw: torch.Tensor):
         """Drop-in for FlashDrive's ``_encode``: (image embeddings, DeepStack features) of the window's frames."""
