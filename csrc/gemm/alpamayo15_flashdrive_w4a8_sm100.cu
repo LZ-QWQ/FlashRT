@@ -24,7 +24,8 @@
 //   sf_ones  int32 ones (the token-side scale operand of the mainloop), see sizes()
 //   a_scale  [M] fp32
 //   out      [M, N] fp16, row-major
-// flags: bit 0 = programmatic dependent launch, bit 1 = 256-deep K tile (two groups per mainloop step).
+// flags: bit 0 = programmatic dependent launch, bit 1 = 256-deep K tile (two groups per mainloop step),
+//        bit 2 = 2-SM UMMA over 256-channel tiles (2 x 1 cluster).
 
 #include <cuda_runtime.h>
 
@@ -61,10 +62,17 @@ using ScaleConfig = cutlass::detail::Sm100BlockwiseScaleConfig<1, 32, kGroup>;
 using LayoutSFW = decltype(ScaleConfig::deduce_layoutSFA());
 using LayoutSFX = decltype(ScaleConfig::deduce_layoutSFB());
 
-// One GEMM definition per K tile (128 = one group per mainloop step, 256 = two: fewer per-step overheads).
-template <int kTileK>
+// One GEMM definition per K tile (128 = one group per mainloop step, 256 = two: fewer per-step overheads) and MMA
+// form (one SM per 128-channel tile, or a 2-SM UMMA over a 256-channel tile with a 2 x 1 cluster: the token operand
+// is multicast to the pair, halving its loads per channel).
+template <int kTileK, bool k2Sm = false>
 struct W4A8Def {
-  using MmaTile = Shape<_128, _128, Int<kTileK>>;
+  using MmaTile = Shape<Int<k2Sm ? 256 : 128>, _128, Int<kTileK>>;
+  using ClusterT = cute::conditional_t<k2Sm, Shape<_2, _1, _1>, Cluster>;
+  using MainSched = cute::conditional_t<k2Sm, cutlass::gemm::KernelTmaWarpSpecializedBlockwise2SmSm100,
+                                        cutlass::gemm::KernelScheduleSm100Blockwise>;
+  using EpiSched = cute::conditional_t<k2Sm, cutlass::epilogue::TmaWarpSpecialized2Sm,
+                                       cutlass::epilogue::collective::EpilogueScheduleAuto>;
   // D^T[n, m] = half(a_scale[m] * float(acc[n, m])): a per-column broadcast of the transposed problem.
   using TokenScale = cutlass::epilogue::fusion::Sm90RowBroadcast<0, MmaTile, float, ElementCompute,
                                                                  Stride<_0, _1, int64_t>, 4>;
@@ -73,20 +81,22 @@ struct W4A8Def {
                                              cutlass::FloatRoundStyle::round_to_nearest>,
       TokenScale, cutlass::epilogue::fusion::Sm90AccFetch>;
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-      cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp, MmaTile, Cluster,
+      cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp, MmaTile, ClusterT,
       cutlass::epilogue::collective::EpilogueTileAuto, ElementAcc, ElementCompute, void,
       cutlass::layout::ColumnMajor, kAlignD, ElementD, cutlass::layout::ColumnMajor, kAlignD,
-      cutlass::epilogue::collective::EpilogueScheduleAuto, Epilogue>::CollectiveOp;
+      EpiSched, Epilogue>::CollectiveOp;
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
       cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp, ElementW, cute::tuple<cutlass::layout::RowMajor, LayoutSFW>,
-      kAlign8, ElementX, cute::tuple<cutlass::layout::ColumnMajor, LayoutSFX>, kAlign8, ElementAcc, MmaTile, Cluster,
+      kAlign8, ElementX, cute::tuple<cutlass::layout::ColumnMajor, LayoutSFX>, kAlign8, ElementAcc, MmaTile, ClusterT,
       cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-      cutlass::gemm::KernelScheduleSm100Blockwise>::CollectiveOp;
+      MainSched>::CollectiveOp;
   using Kernel = cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue, void>;
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
 };
 using Gemm = W4A8Def<128>::Gemm;
 using Gemm256 = W4A8Def<256>::Gemm;
+using GemmPair = W4A8Def<128, true>::Gemm;
+using GemmPair256 = W4A8Def<256, true>::Gemm;
 
 template <class G>
 typename G::Arguments make_args(const void* xq, const void* w8, const int* sf_group, const int* sf_ones,
@@ -126,9 +136,12 @@ extern "C" {
 int flashrt_fd_w4a8_gemm_sm100_sizes(int M, int N, int K, unsigned long long* workspace_bytes,
                                      long long* ones_elems) {
   if (M <= 0 || N <= 0 || K <= 0 || K % kGroup || N % kAlignD) return 2;
-  auto args = make_args<Gemm>(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K);
-  auto args256 = make_args<Gemm256>(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K);
-  *workspace_bytes = std::max(Gemm::get_workspace_size(args), Gemm256::get_workspace_size(args256));
+  const unsigned long long ws[4] = {
+      Gemm::get_workspace_size(make_args<Gemm>(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K)),
+      Gemm256::get_workspace_size(make_args<Gemm256>(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K)),
+      GemmPair::get_workspace_size(make_args<GemmPair>(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K)),
+      GemmPair256::get_workspace_size(make_args<GemmPair256>(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K))};
+  *workspace_bytes = *std::max_element(ws, ws + 4);
   *ones_elems = size(filter_zeros(ScaleConfig::tile_atom_to_shape_SFB(make_shape(N, M, K, 1))));
   return 0;
 }
@@ -141,6 +154,10 @@ int flashrt_fd_w4a8_gemm_sm100(const void* xq, const void* w8, const int* sf_gro
   if (!aligned16(xq) || !aligned16(w8) || !aligned16(sf_group) || !aligned16(sf_ones) || !aligned16(a_scale) ||
       !aligned16(out))
     return 5;                                      // TMA and vectorized scale loads need 16-byte alignment
+  if (flags & 4) {
+    if (flags & 2) return run_w4a8<GemmPair256>(xq, w8, sf_group, sf_ones, a_scale, out, M, N, K, workspace, workspace_bytes, flags & 1, stream);
+    return run_w4a8<GemmPair>(xq, w8, sf_group, sf_ones, a_scale, out, M, N, K, workspace, workspace_bytes, flags & 1, stream);
+  }
   if (flags & 2) return run_w4a8<Gemm256>(xq, w8, sf_group, sf_ones, a_scale, out, M, N, K, workspace, workspace_bytes, flags & 1, stream);
   return run_w4a8<Gemm>(xq, w8, sf_group, sf_ones, a_scale, out, M, N, K, workspace, workspace_bytes, flags & 1, stream);
 }

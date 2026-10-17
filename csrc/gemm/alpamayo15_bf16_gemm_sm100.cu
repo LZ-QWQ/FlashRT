@@ -109,25 +109,30 @@ using Int8ScaleTree = fe::Sm90EVT<fe::Sm90Compute<cutlass::multiplies, ElementH,
     fe::Sm90EVT<fe::Sm90Compute<cutlass::multiplies, ElementCompute, ElementCompute, kRN>, fe::Sm90AccFetch, RowScaleNode<Tile>>,
     ColScaleNode<Tile>>;
 
-template <class Tile>
+template <class Tile, bool k2Sm = false>
 struct Int8GemmDef {
-  using Cluster = Shape<_1, _1, _1>;
+  using Cluster = cute::conditional_t<k2Sm, Shape<_2, _1, _1>, Shape<_1, _1, _1>>;
+  using MainSched = cute::conditional_t<k2Sm, cutlass::gemm::KernelTmaWarpSpecialized2SmSm100,
+                                        cutlass::gemm::collective::KernelScheduleAuto>;
+  using EpiSched = cute::conditional_t<k2Sm, cutlass::epilogue::TmaWarpSpecialized2Sm,
+                                       cutlass::epilogue::collective::EpilogueScheduleAuto>;
   using Fusion = Int8ScaleTree<Tile>;
   using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp, Tile, Cluster,
       cutlass::epilogue::collective::EpilogueTileAuto, ElementI32, ElementCompute, void,
       cutlass::layout::RowMajor, kAlign, ElementH, cutlass::layout::RowMajor, kAlign,
-      cutlass::epilogue::collective::EpilogueScheduleAuto, Fusion>::CollectiveOp;
+      EpiSched, Fusion>::CollectiveOp;
   using Mainloop = typename cutlass::gemm::collective::CollectiveBuilder<
       cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp, ElementI8, cutlass::layout::RowMajor, 16, ElementI8,
       cutlass::layout::ColumnMajor, 16, ElementI32, Tile, Cluster,
       cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename Epilogue::SharedStorage))>,
-      cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+      MainSched>::CollectiveOp;
   using Kernel = cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, Mainloop, Epilogue, void>;
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
 };
 using I8G128 = Int8GemmDef<Shape<_128, _128, _128>>;
 using I8G64 = Int8GemmDef<Shape<_64, _128, _128>>;
+using I8G256P = Int8GemmDef<Shape<_256, _128, _128>, true>;   // 2-SM UMMA, 2 x 1 cluster
 
 template <class G>
 typename G::Gemm::Arguments make_int8_args(const void* A, const void* B, const float* a_s, const float* w_s, void* D,
@@ -282,11 +287,13 @@ int flashrt_a15_fp8_gemm_sm100(const void* A, const void* B, const float* a_s, c
 }
 
 // Per-channel INT8 GEMM (prefill tier): A [M, K] int8 row-major, B [N, K] int8 row-major, a_s [M] fp32, w_s [N] fp32,
-// D [M, N] fp16; tile 0 = 128 x 128 x 128, 1 = 64 x 128 x 128. K % 16 == 0, N % 8 == 0, 16-byte aligned operands.
+// D [M, N] fp16; tile 0 = 128 x 128 x 128, 1 = 64 x 128 x 128, 2 = 256 x 128 x 128 on a 2-SM UMMA (2 x 1 cluster).
+// K % 16 == 0, N % 8 == 0, 16-byte aligned operands.
 int flashrt_a15_int8_gemm_sm100_workspace(int M, int N, int K, int tile, unsigned long long* workspace_bytes) {
-  if (M <= 0 || N <= 0 || K <= 0 || (N % kAlign) || (K % 16) || tile < 0 || tile > 1) return 2;
-  *workspace_bytes = tile ? I8G64::Gemm::get_workspace_size(make_int8_args<I8G64>(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K))
-                          : I8G128::Gemm::get_workspace_size(make_int8_args<I8G128>(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K));
+  if (M <= 0 || N <= 0 || K <= 0 || (N % kAlign) || (K % 16) || tile < 0 || tile > 2) return 2;
+  *workspace_bytes = tile == 2 ? I8G256P::Gemm::get_workspace_size(make_int8_args<I8G256P>(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K))
+                   : tile == 1 ? I8G64::Gemm::get_workspace_size(make_int8_args<I8G64>(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K))
+                               : I8G128::Gemm::get_workspace_size(make_int8_args<I8G128>(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K));
   return 0;
 }
 
@@ -294,8 +301,9 @@ int flashrt_a15_int8_gemm_sm100(const void* A, const void* B, const float* a_s, 
                                 int K, int tile, void* workspace, unsigned long long workspace_bytes, int pdl,
                                 cudaStream_t stream) {
   if (!A || !B || !a_s || !w_s || !D || (workspace_bytes && !workspace)) return 1;
-  if (M <= 0 || N <= 0 || K <= 0 || (N % kAlign) || (K % 16) || tile < 0 || tile > 1) return 2;
+  if (M <= 0 || N <= 0 || K <= 0 || (N % kAlign) || (K % 16) || tile < 0 || tile > 2) return 2;
   if (!aligned16(A) || !aligned16(B) || !aligned16(D) || !aligned16(a_s) || !aligned16(w_s)) return 5;
+  if (tile == 2) return run_int8<I8G256P>(A, B, a_s, w_s, D, M, N, K, workspace, workspace_bytes, pdl, stream);
   return tile ? run_int8<I8G64>(A, B, a_s, w_s, D, M, N, K, workspace, workspace_bytes, pdl, stream)
               : run_int8<I8G128>(A, B, a_s, w_s, D, M, N, K, workspace, workspace_bytes, pdl, stream);
 }

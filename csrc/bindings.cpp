@@ -5494,7 +5494,8 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
 
     m.def("flashdrive_w4a8_gemm_sm100",
         [](uintptr_t xq, uintptr_t w8, uintptr_t sf_group, uintptr_t sf_ones, uintptr_t a_scale, uintptr_t out,
-           int M, int N, int K, uintptr_t workspace, unsigned long long workspace_bytes, uintptr_t stream, int ktile) {
+           int M, int N, int K, uintptr_t workspace, unsigned long long workspace_bytes, uintptr_t stream, int ktile,
+           int sm_pair) {
             const auto shape = kernel_shape({{"M", M}, {"N", N}, {"K", K}});
             require_kernel_ptrs("flashdrive_w4a8_gemm_sm100",
                 {{"xq", xq}, {"w8", w8}, {"sf_group", sf_group}, {"sf_ones", sf_ones}, {"a_scale", a_scale},
@@ -5503,13 +5504,13 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
                 reinterpret_cast<const void*>(xq), reinterpret_cast<const void*>(w8),
                 reinterpret_cast<const int*>(sf_group), reinterpret_cast<const int*>(sf_ones),
                 reinterpret_cast<const float*>(a_scale), reinterpret_cast<void*>(out), M, N, K,
-                reinterpret_cast<void*>(workspace), workspace_bytes, (flash_rt::kernels::flashdrive_pdl() ? 1 : 0) | (ktile == 256 ? 2 : 0), to_stream(stream));
+                reinterpret_cast<void*>(workspace), workspace_bytes, (flash_rt::kernels::flashdrive_pdl() ? 1 : 0) | (ktile == 256 ? 2 : 0) | (sm_pair ? 4 : 0), to_stream(stream));
             require_kernel(rc == 0, "flashdrive_w4a8_gemm_sm100",
                            "invalid shape/alignment/workspace or launch failure (rc=" + std::to_string(rc) + ")", shape);
         },
         py::arg("xq"), py::arg("w8"), py::arg("sf_group"), py::arg("sf_ones"), py::arg("a_scale"), py::arg("out"),
         py::arg("M"), py::arg("N"), py::arg("K"), py::arg("workspace"), py::arg("workspace_bytes"),
-        py::arg("stream") = 0, py::arg("ktile") = 128);
+        py::arg("stream") = 0, py::arg("ktile") = 128, py::arg("sm_pair") = 0);
 
     m.def("flashdrive_rms_f16delta_bf16",
         [](uintptr_t residual, uintptr_t delta, uintptr_t weight, uintptr_t out, int rows, int dim, float eps,

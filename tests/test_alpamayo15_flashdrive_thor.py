@@ -839,6 +839,32 @@ def test_int8_channel_gemm_and_requantization_match_reference(M, N, K, tile):
     assert bool((err <= ref.float().abs() * 2 ** -9 + 1e-6).all()), float(err.max())   # two FP32 products, one FP16 rounding
 
 
+def test_w4a8_prefill_gemm_forms_are_identical():
+    """K tile 128 / 256 and the 1-SM / 2-SM forms of the blockwise W4A8 GEMM produce identical FP16 outputs (integer
+    mainloop, one FP32 scale and FP16 rounding per output)."""
+    fvk = _kernels()
+    torch.manual_seed(41)
+    M, N, K = 300, 512, 3584
+    xq = torch.randint(-127, 128, ((M + 31) // 32 * 32, K), device="cuda", dtype=torch.int8)
+    w8 = torch.randint(-15, 16, (N, K), device="cuda", dtype=torch.int8)
+    sg = torch.randint(1, 4097, (K // 128, N), device="cuda", dtype=torch.int32)
+    a_s = (torch.rand(M, device="cuda") * 1e-6).float()
+    nbytes, n_ones = fvk.flashdrive_w4a8_gemm_sm100_sizes(M, N, K)
+    ws = torch.empty(max(int(nbytes), 1), dtype=torch.uint8, device="cuda")
+    ones = torch.ones(int(n_ones) + 1024, dtype=torch.int32, device="cuda")
+    outs = []
+    for ktile, pair in ((128, 0), (256, 0), (128, 1), (256, 1)):
+        out = torch.full((M, N), float("nan"), device="cuda", dtype=torch.float16)
+        fvk.flashdrive_w4a8_gemm_sm100(xq.data_ptr(), w8.data_ptr(), sg.data_ptr(), ones.data_ptr(), a_s.data_ptr(), out.data_ptr(),
+                                       M, N, K, ws.data_ptr(), ws.numel(), torch.cuda.current_stream().cuda_stream, ktile, pair)
+        torch.cuda.synchronize()
+        outs.append(out)
+    ref = ((xq[:M].double() @ (w8.int() * sg.t().repeat_interleave(128, 1)).double().t()) * a_s.double()[:, None]).to(torch.float16)
+    assert torch.equal(outs[0], ref) or bool(((outs[0].float() - ref.float()).abs() <= ref.float().abs() * 2 ** -10).all())
+    for o in outs[1:]:
+        assert torch.equal(o, outs[0])
+
+
 def test_new_kernels_are_bitwise_repeatable():
     """Every new kernel of the backend returns identical bits on a second call with identical inputs (fixed
     reduction orders, no races)."""

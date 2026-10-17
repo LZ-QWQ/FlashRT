@@ -511,8 +511,8 @@ is the validated fast tier: on 9 clips x 3 seeds its ADE is +0.008 vs the BF16 d
 the FlashDrive author stack),
 `expert_weights="fp8"` (W8A8: per-row FP8 activations and weights on the FP8 tcgen05 GEMM, scales applied in the
 epilogue), `prefill_weights="int8"` (the streaming-window GEMMs on per-channel INT8 requantizations of Marlin's
-group-scaled integers, plain INT8 tcgen05 GEMM with the token and channel scales in the epilogue instead of the
-blockwise mainloop). The blockwise prefill GEMM runs two 128-channel groups per mainloop step by default (`w4a8_ktile=256`; 128 is
+group-scaled integers, plain INT8 tcgen05 GEMM on 2-SM UMMA tiles with the token and channel scales in the epilogue
+instead of the blockwise mainloop: 201-211 TOPS vs 124-140 for the blockwise GEMM on Thor). The blockwise prefill GEMM runs two 128-channel groups per mainloop step by default (`w4a8_ktile=256`; 128 is
 the single-group form, identical integers).
 
 ### Cache contract
@@ -625,14 +625,21 @@ intervals over clips.
 
 Streaming (FlashDrive's procedure):
 
-| Path | mean ms | median ms | p90 ms | p99 ms | peak GB |
-|---|---|---|---|---|---|
-| FlashDrive (unmodified, `torch.compile` max-autotune) | 956 [856, 1106] | 856 | 1057 | 2888 | 13.3 |
-| FlashDrive + FlashRT backend (defaults) | 514 [454, 610] | 461 | 571 | 1625 | 20.8 |
+| Path | mean ms | median ms | p90 ms | peak GB |
+|---|---|---|---|---|
+| FlashDrive (unmodified, `torch.compile` max-autotune) | 958 [856, 1106] | 856 | 1057 | 13.3 |
+| FlashDrive + FlashRT backend, FlashDrive's W4A8 Marlin GEMMs and torch vision / expert (earlier form) | 514 [454, 610] | 461 | 571 | 20.8 |
+| FlashDrive + FlashRT backend (defaults: every streaming primitive on FlashRT kernels) | 476 [417, 549] | 417 | 533 | 26.0 |
+| + `decode_weights="int8"` | 452 | 399 | 520 | 25.0 |
+| + `prefill_weights="int8"` | 453 | 392 | 507 | 26.0 |
+| + both tiers | 426 | 369 | 495 | 25.0 |
+| + `expert_weights="fp8"` alone | 440 | 383 | 499 | 28.1 |
+| + all three tiers | 392 | 335 | 433 | 27.1 |
 
-Per window the backend is 442 ms faster on average (paired by clip, seed and
-window, [399, 504] ms). FlashDrive averages 4.64 DFlash rounds and 3.56
-reasoning tokens per round; the backend 4.62 and 3.61. Cold costs (medians):
+Per window the default backend is 481 ms faster than FlashDrive on average
+(paired by clip, seed and window, [440, 535] ms), the two INT8 tiers together
+533 ms [486, 607] and all three tiers 566 ms [521, 634]. FlashDrive averages 4.64 DFlash rounds and 3.56 reasoning tokens
+per round; the backend 4.6 and 3.6. Cold costs (medians):
 FlashDrive's first window of a stream takes 4.4 s and its second 148 s
 (`torch.compile` with a warm compile cache; FlashDrive's `scripts/infer.py`
 runs one clip per process). The backend ran each seed's nine clips in one
@@ -643,17 +650,28 @@ FA4 kernels). The backend's peak includes the INT8 weight copy of
 
 Trajectory error against the logged future (meters, xy, one sample):
 
-| Path | ADE mean | ADE median | ADE p95 | ADE max | FDE mean |
+| Path | ADE mean | ADE p95 | ADE max | FDE mean | paired ADE vs FlashDrive |
 |---|---|---|---|---|---|
-| FlashDrive (unmodified) | 2.710 [1.74, 3.91] | 1.741 | 9.51 | 21.1 | 8.087 [5.38, 11.68] |
-| FlashDrive + FlashRT backend | 2.714 [1.75, 4.05] | 1.778 | 9.83 | 19.9 | 8.114 [5.27, 11.70] |
+| FlashDrive (unmodified) | 2.763 [1.72, 3.97] | 9.98 | 21.1 | 8.216 | - |
+| FlashDrive + FlashRT backend (defaults) | 2.682 [1.69, 4.04] | 9.47 | 21.6 | 8.045 | -0.041 [-0.104, +0.011] |
+| + `decode_weights="int8"` | 2.692 [1.75, 3.97] | 9.33 | 21.6 | 8.069 | -0.023 [-0.102, +0.041] |
+| + `prefill_weights="int8"` | 2.659 [1.76, 3.93] | 9.32 | 20.2 | 7.971 | -0.054 [-0.162, +0.023] |
+| + both tiers | 2.656 [1.72, 3.90] | 9.40 | 20.2 | 7.938 | -0.052 [-0.162, +0.023] |
+| + `expert_weights="fp8"` alone | 2.689 [1.70, 4.04] | 9.48 | 21.6 | 8.066 | -0.034 [-0.098, +0.017] |
+| + all three tiers | 2.657 [1.73, 3.90] | 9.44 | 20.2 | 7.926 | -0.052 [-0.161, +0.024] |
 
-Paired difference (backend - FlashDrive): ADE +0.004 m [-0.043, +0.059], FDE
-+0.027 m [-0.125, +0.193]. Reasoning is sampled (temperature 0.6), so these
-are distribution-level comparisons; FlashDrive's own compiled stack does not
-reproduce its tokens across processes with the same seed. The backend itself
-is reproducible: three processes with the same seed produced identical
-reasoning tokens and trajectories on all 117 windows of the default clip.
+Paired differences of the tiers against the default backend: INT8 decode
+weights ADE +0.010 m [-0.030, +0.066], INT8 prefill weights -0.023 m [-0.121,
++0.074], both -0.026 m [-0.121, +0.071], FP8 expert weights +0.007 m [-0.005,
++0.028] (the expert tier leaves the reasoning tokens unchanged, so its interval
+is narrow), all three -0.025 m [-0.124, +0.075] (FDE within [-0.47, +0.22] for
+all).
+Reasoning is sampled (temperature 0.6), so these are distribution-level
+comparisons; FlashDrive's own compiled stack does not reproduce its tokens
+across processes with the same seed. The default backend is reproducible: three
+processes with the same seed produced identical reasoning tokens and
+trajectories on all 117 windows of the default clip, and the exact-path
+changes after the first full-FlashRT form kept those tokens identical.
 
 Full requests (official request semantics, seed 0, the same clips and
 windows):
@@ -676,12 +694,19 @@ group to the previous):
 | + streaming prefill / shift (FlashDrive W4A8 modules) | 849 | 713 | 339 | 64.3 | 95 | 47 |
 | + DFlash verify / trajectory start | 690 | 667 | 339 | 37.8 | 95 | 46 |
 | + fused W4A8 activations (Marlin GEMM) | 619 | 597 | 278 | 36.1 | 95 | 46 |
-| + tcgen05 W4A8 prefill GEMM (default) | 491 | 497 | 179 | 36.1 | 95 | 46 |
+| + tcgen05 W4A8 prefill GEMM | 491 | 497 | 179 | 36.1 | 95 | 46 |
+| + every streaming primitive on FlashRT kernels (few-row W4A8 / BF16 GEMMs, CUTLASS vision and expert GEMMs, single-kernel shift) | 482 | 449 | 178 | 36.2 | 87 | 40 |
+| + tile activation preparation, bank-ordered rotation tables, 256-deep K tile (default) | 454 | 420 | 144 | 37.1 | 88 | 40 |
+| `decode_weights="int8"` (tier) | 447 | 437 | 153 | 30.6 | 88 | 40 |
+| `prefill_weights="int8"` (tier) | 445 | 396 | 120 | 37.3 | 88 | 40 |
 
 Stage columns are CUDA-event means per window (ms; the DFlash column per
 round). Groups left on FlashDrive run compiled. Window latency depends on the
-number of DFlash rounds, which varies with the sampled reasoning, so compare
-the stage columns between rows.
+number of DFlash rounds, which varies with the sampled reasoning (3.8-4.3 per
+window across these rows), so compare the stage columns between rows. The
+rows from "every streaming primitive" on are reproducible: the same seed gives
+identical reasoning tokens across processes, and the two exact rows give
+identical tokens to each other.
 
 On identical cache and random state (12 windows, each FlashRT primitive
 against FlashDrive eager; FlashDrive's compiled primitives against eager for

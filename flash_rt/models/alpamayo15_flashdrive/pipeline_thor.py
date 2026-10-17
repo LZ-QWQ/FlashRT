@@ -83,7 +83,7 @@ W4A8_BACKENDS = ("flashdrive", "fused")
 W4A8_GEMMS = ("tcgen05", "marlin")
 ACT_ROTS = ("paro", "dense")
 TCGEN05_MIN_ROWS = 256      # W4A8 GEMMs with at least this many rows (streaming-window prefill) run on tcgen05
-INT8_PREFILL_TILE = 0       # per-channel INT8 prefill GEMM tile: 0 = 128 x 128 x 128, 1 = 64 x 128 x 128
+INT8_PREFILL_TILE = 2       # per-channel INT8 prefill GEMM: 256 x 128 x 128 on a 2-SM UMMA (0: 128 x 128, 1: 64 x 128; identical integers)
 SMALL_MAX_ROWS = 16         # ... and with at most this many (verification, trajectory start) on the few-row mma kernel
 
 
