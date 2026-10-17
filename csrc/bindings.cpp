@@ -5397,6 +5397,35 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("Hq"), py::arg("Hk"), py::arg("k_row_stride"), py::arg("rows_per_batch"), py::arg("batch_stride"),
         py::arg("eps"), py::arg("stream") = 0);
 
+    m.def("alpamayo15_rms_fp8_rows_bf16",
+        [](uintptr_t residual, uintptr_t delta, uintptr_t weight, uintptr_t q, uintptr_t scale,
+           int rows, int dim, float eps, uintptr_t stream) {
+            const auto shape = kernel_shape({{"rows", rows}, {"dim", dim}});
+            require_kernel_ptrs("alpamayo15_rms_fp8_rows_bf16",
+                {{"residual", residual}, {"weight", weight}, {"q", q}, {"scale", scale}}, shape);
+            const int rc = flash_rt::kernels::alpamayo15_rms_fp8_rows_bf16(
+                reinterpret_cast<void*>(residual), reinterpret_cast<const void*>(delta),
+                reinterpret_cast<const void*>(weight), reinterpret_cast<void*>(q), reinterpret_cast<float*>(scale),
+                rows, dim, eps, to_stream(stream));
+            require_kernel(rc == 0, "alpamayo15_rms_fp8_rows_bf16",
+                           "invalid shape/alignment or launch failure (rc=" + std::to_string(rc) + ")", shape);
+        },
+        py::arg("residual"), py::arg("delta"), py::arg("weight"), py::arg("q"), py::arg("scale"), py::arg("rows"),
+        py::arg("dim"), py::arg("eps"), py::arg("stream") = 0);
+
+    m.def("alpamayo15_silu_mul_fp8_rows_bf16",
+        [](uintptr_t gate, uintptr_t up, int ld, uintptr_t q, uintptr_t scale, int rows, int F, uintptr_t stream) {
+            const auto shape = kernel_shape({{"rows", rows}, {"F", F}, {"ld", ld}});
+            require_kernel_ptrs("alpamayo15_silu_mul_fp8_rows_bf16", {{"gate", gate}, {"up", up}, {"q", q}, {"scale", scale}}, shape);
+            const int rc = flash_rt::kernels::alpamayo15_silu_mul_fp8_rows_bf16(
+                reinterpret_cast<const void*>(gate), reinterpret_cast<const void*>(up), ld, reinterpret_cast<void*>(q),
+                reinterpret_cast<float*>(scale), rows, F, to_stream(stream));
+            require_kernel(rc == 0, "alpamayo15_silu_mul_fp8_rows_bf16",
+                           "invalid shape/alignment or launch failure (rc=" + std::to_string(rc) + ")", shape);
+        },
+        py::arg("gate"), py::arg("up"), py::arg("ld"), py::arg("q"), py::arg("scale"), py::arg("rows"), py::arg("F"),
+        py::arg("stream") = 0);
+
     m.def("alpamayo15_rms_bf16",
         [](uintptr_t residual, uintptr_t delta, uintptr_t weight, uintptr_t out,
            int rows, int dim, float eps, uintptr_t stream) {

@@ -131,6 +131,97 @@ __global__ void rms_bf16_kernel(__nv_bfloat16* __restrict__ res,
   }
 }
 
+// Per-row FP8 E4M3 quantization of a BF16 row held in shared memory (the W8A8 prefill tier): scale = absmax / 448
+// (1 for an all-zero row), codes = round-to-nearest-even(x / scale) saturated to +-448, as alpamayo15_quantize_fp8_rows_bf16.
+__device__ __forceinline__ void quantize_row_fp8(const __nv_bfloat16* srow, uint8_t* __restrict__ q, float* __restrict__ scale,
+                                                 int row, int dim, float* smem) {
+  float mx = 0.0f;
+  for (int i = threadIdx.x; i < dim; i += blockDim.x) mx = fmaxf(mx, fabsf(bf(srow[i])));
+  for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  if (lane == 0) smem[warp] = mx;
+  __syncthreads();
+  if (warp == 0) {
+    float t = threadIdx.x < ((blockDim.x + 31) >> 5) ? smem[threadIdx.x] : 0.0f;
+    for (int o = 16; o > 0; o >>= 1) t = fmaxf(t, __shfl_xor_sync(0xffffffffu, t, o));
+    if (lane == 0) smem[0] = t;
+  }
+  __syncthreads();
+  const float amax = smem[0];
+  const float s = amax > 0.0f ? amax / 448.0f : 1.0f;
+  if (threadIdx.x == 0) scale[row] = s;
+  uint32_t* qr = reinterpret_cast<uint32_t*>(q + (size_t)row * dim);
+  const Bf4* s4 = reinterpret_cast<const Bf4*>(srow);
+  for (int i = threadIdx.x; i < (dim >> 2); i += blockDim.x) {
+    const Bf4 t = s4[i];
+    float f[4];
+#pragma unroll
+    for (int e = 0; e < 4; ++e) f[e] = fminf(fmaxf(__fdiv_rn(bf(t.v[e]), s), -448.0f), 448.0f);
+    const __nv_fp8x2_storage_t lo = __nv_cvt_float2_to_fp8x2(make_float2(f[0], f[1]), __NV_SATFINITE, __NV_E4M3);
+    const __nv_fp8x2_storage_t hi = __nv_cvt_float2_to_fp8x2(make_float2(f[2], f[3]), __NV_SATFINITE, __NV_E4M3);
+    qr[i] = (uint32_t)lo | ((uint32_t)hi << 16);
+  }
+}
+
+// rms_bf16_kernel whose normalized row goes to FP8 codes + a row scale instead of a BF16 output (identical codes
+// to rms_bf16 followed by alpamayo15_quantize_fp8_rows_bf16). dim <= kFusedRowMax.
+constexpr int kFusedRowMax = 16384;
+__global__ void __launch_bounds__(256) rms_fp8_rows_kernel(__nv_bfloat16* __restrict__ res,
+                                                           const __nv_bfloat16* __restrict__ delta,
+                                                           const __nv_bfloat16* __restrict__ w,
+                                                           uint8_t* __restrict__ q, float* __restrict__ scale,
+                                                           int dim, float eps) {
+  __shared__ float smem[32];
+  __shared__ __align__(16) __nv_bfloat16 srow[kFusedRowMax];
+  const int row = blockIdx.x;
+  __nv_bfloat16* r = res + (size_t)row * dim;
+  const __nv_bfloat16* dl = delta ? delta + (size_t)row * dim : nullptr;
+  float ss = 0.0f;
+  for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+    __nv_bfloat16 v = r[i];
+    if (dl) {
+      v = to_bf(__fadd_rn(bf(v), bf(dl[i])));
+      r[i] = v;
+    }
+    const float f = bf(v);
+    ss += __fmul_rn(f, f);
+  }
+  const float inv = rsqrtf(__fadd_rn(block_sum(ss, smem) / (float)dim, eps));
+  for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+    const __nv_bfloat16 n1 = to_bf(__fmul_rn(bf(r[i]), inv));
+    srow[i] = to_bf(__fmul_rn(bf(w[i]), bf(n1)));
+  }
+  __syncthreads();
+  quantize_row_fp8(srow, q, scale, row, dim, smem);
+}
+
+// out = bf16(silu(bf16 gate)) * bf16 up (the rounding of the split SiLU-mul kernel) quantized per row to FP8 codes
+// + a row scale; gate / up rows ld elements apart. F <= kFusedRowMax, F % 4 == 0.
+__global__ void __launch_bounds__(256) silu_mul_fp8_rows_kernel(const __nv_bfloat16* __restrict__ gate,
+                                                                const __nv_bfloat16* __restrict__ up, int ld,
+                                                                uint8_t* __restrict__ q, float* __restrict__ scale,
+                                                                int F) {
+  __shared__ float smem[32];
+  __shared__ __align__(16) __nv_bfloat16 srow[kFusedRowMax];
+  const int row = blockIdx.x;
+  const Bf4* g4 = reinterpret_cast<const Bf4*>(gate + (size_t)row * ld);
+  const Bf4* u4 = reinterpret_cast<const Bf4*>(up + (size_t)row * ld);
+  Bf4* s4 = reinterpret_cast<Bf4*>(srow);
+  for (int i = threadIdx.x; i < (F >> 2); i += blockDim.x) {
+    const Bf4 g = g4[i], u = u4[i];
+    Bf4 o;
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+      const float gf = bf(g.v[e]);
+      const float sl = bf(to_bf(gf / (1.0f + expf(-gf))));
+      o.v[e] = to_bf(__fmul_rn(sl, bf(u.v[e])));
+    }
+    s4[i] = o;
+  }
+  __syncthreads();
+  quantize_row_fp8(srow, q, scale, row, F, smem);
+}
+
 // One warp per (row, head) over q | k | v heads of a fused projection row.
 // Head RMSNorm (Qwen3: BF16 rounding of the normalized value and of the weight
 // product), then rotate-half RoPE. kFp32Rope: FP32 tables and FP32 math with one
@@ -343,6 +434,28 @@ int alpamayo15_rms_bf16(void* residual, const void* delta, const void* weight, v
   rms_bf16_kernel<<<rows, 256, 0, stream>>>(
       reinterpret_cast<__nv_bfloat16*>(residual), reinterpret_cast<const __nv_bfloat16*>(delta),
       reinterpret_cast<const __nv_bfloat16*>(weight), reinterpret_cast<__nv_bfloat16*>(out), dim, eps);
+  return cudaPeekAtLastError() == cudaSuccess ? 0 : 4;
+}
+
+int alpamayo15_rms_fp8_rows_bf16(void* residual, const void* delta, const void* weight, void* q, float* scale,
+                                 int rows, int dim, float eps, cudaStream_t stream) {
+  if (!residual || !weight || !q || !scale) return 1;
+  if (rows <= 0 || dim <= 0 || dim > kFusedRowMax || (dim % 4) != 0) return 2;
+  if (!aligned8(residual) || !aligned8(weight) || (reinterpret_cast<uintptr_t>(q) & 3u) != 0) return 5;
+  rms_fp8_rows_kernel<<<rows, 256, 0, stream>>>(
+      reinterpret_cast<__nv_bfloat16*>(residual), reinterpret_cast<const __nv_bfloat16*>(delta),
+      reinterpret_cast<const __nv_bfloat16*>(weight), static_cast<uint8_t*>(q), scale, dim, eps);
+  return cudaPeekAtLastError() == cudaSuccess ? 0 : 4;
+}
+
+int alpamayo15_silu_mul_fp8_rows_bf16(const void* gate, const void* up, int ld, void* q, float* scale, int rows, int F,
+                                      cudaStream_t stream) {
+  if (!gate || !up || !q || !scale) return 1;
+  if (rows <= 0 || F <= 0 || F > kFusedRowMax || (F % 4) != 0 || ld < F || (ld % 4) != 0) return 2;
+  if (!aligned8(gate) || !aligned8(up) || (reinterpret_cast<uintptr_t>(q) & 3u) != 0) return 5;
+  silu_mul_fp8_rows_kernel<<<rows, 256, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(gate), reinterpret_cast<const __nv_bfloat16*>(up), ld,
+      static_cast<uint8_t*>(q), scale, F);
   return cudaPeekAtLastError() == cudaSuccess ? 0 : 4;
 }
 

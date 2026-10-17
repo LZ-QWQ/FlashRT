@@ -551,3 +551,32 @@ def test_vision_tower_cutlass_and_graph_match_torch_tower():
     assert torch.equal(g_img, img) and torch.equal(g_deep, deep[0])              # the graph replays the eager path
     assert torch.equal(g2_img, ref2_img) and torch.equal(g2_deep, ref2_deep[0])  # new pixels through the same graph
     assert len(eng._vis_graphs) == 1
+
+
+@pytest.mark.parametrize("rows,dim,with_delta", [(3086, 4096, True), (37, 4096, False), (300, 12288, True)])
+def test_fused_fp8_row_producers_match_separate_kernels(rows, dim, with_delta):
+    """RMSNorm -> FP8 rows and SiLU-mul -> FP8 rows give the codes, scales and residual of the separate kernels."""
+    fvk = _kernels()
+    torch.manual_seed(31)
+    s = _stream()
+    x = (torch.randn(rows, dim, device="cuda") * 1.5).to(BF16)
+    delta = (torch.randn(rows, dim, device="cuda") * 0.3).to(BF16) if with_delta else None
+    w = (torch.rand(dim, device="cuda") + 0.5).to(BF16)
+    x_ref, x_fused = x.clone(), x.clone()
+    h = torch.empty_like(x)
+    fvk.alpamayo15_rms_bf16(x_ref.data_ptr(), delta.data_ptr() if with_delta else 0, w.data_ptr(), h.data_ptr(), rows, dim, 1e-6, s)
+    q_ref = torch.empty(rows, dim, device="cuda", dtype=torch.uint8); s_ref = torch.empty(rows, device="cuda")
+    fvk.alpamayo15_quantize_fp8_rows_bf16(h.data_ptr(), dim, q_ref.data_ptr(), s_ref.data_ptr(), rows, dim, s)
+    q = torch.full((rows, dim), 7, device="cuda", dtype=torch.uint8); sc = torch.zeros(rows, device="cuda")
+    fvk.alpamayo15_rms_fp8_rows_bf16(x_fused.data_ptr(), delta.data_ptr() if with_delta else 0, w.data_ptr(), q.data_ptr(),
+                                     sc.data_ptr(), rows, dim, 1e-6, s)
+    torch.cuda.synchronize()
+    assert torch.equal(x_fused, x_ref) and torch.equal(sc, s_ref) and torch.equal(q, q_ref)
+    F = dim
+    g = (torch.randn(rows, F, device="cuda") * 2).to(BF16); u = (torch.randn(rows, F, device="cuda") * 2).to(BF16)
+    act = torch.empty_like(g)
+    fvk.alpamayo15_silu_mul_split_bf16(g.data_ptr(), u.data_ptr(), F, act.data_ptr(), rows, F, s)
+    fvk.alpamayo15_quantize_fp8_rows_bf16(act.data_ptr(), F, q_ref.data_ptr(), s_ref.data_ptr(), rows, F, s)
+    fvk.alpamayo15_silu_mul_fp8_rows_bf16(g.data_ptr(), u.data_ptr(), F, q.data_ptr(), sc.data_ptr(), rows, F, s)
+    torch.cuda.synchronize()
+    assert torch.equal(sc, s_ref) and torch.equal(q, q_ref)

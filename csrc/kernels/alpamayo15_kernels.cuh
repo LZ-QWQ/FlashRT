@@ -73,6 +73,16 @@ int alpamayo15_expert_qk_prep_bf16(const void* qkv, const void* q_norm_w, const 
 int alpamayo15_rms_bf16(void* residual, const void* delta, const void* weight, void* out,
                         int rows, int dim, float eps, cudaStream_t stream);
 
+// The W8A8 prefill tier's producers with the per-row FP8 E4M3 quantization fused (same codes and scales as the BF16
+// kernel followed by alpamayo15_quantize_fp8_rows_bf16; the BF16 row is never written):
+//   rms_fp8_rows      residual (+= delta) -> Qwen3 RMSNorm * weight -> q [rows, dim] e4m3 bytes, scale [rows] fp32
+//   silu_mul_fp8_rows bf16(silu(gate)) * up over rows ld elements apart -> q [rows, F], scale [rows]
+// dim / F <= 16384 and a multiple of 4; 8-byte aligned bf16 pointers, 4-byte aligned q.
+int alpamayo15_rms_fp8_rows_bf16(void* residual, const void* delta, const void* weight, void* q, float* scale,
+                                 int rows, int dim, float eps, cudaStream_t stream);
+int alpamayo15_silu_mul_fp8_rows_bf16(const void* gate, const void* up, int ld, void* q, float* scale, int rows, int F,
+                                      cudaStream_t stream);
+
 // qkv : [rows, (Hq + 2*Hk) * 128] bf16; cos/sin : [rows, 128] bf16
 // q_out : [rows, Hq, 128] bf16
 // K/V of row r go to cache row (r / rows_per_batch) * batch_stride + r % rows_per_batch

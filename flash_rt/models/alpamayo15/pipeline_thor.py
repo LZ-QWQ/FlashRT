@@ -80,6 +80,8 @@ ALPAMAYO15_KERNEL_SYMBOLS = (
     "alpamayo15_layernorm_bf16",
     "alpamayo15_silu_mul_split_bf16",
     "alpamayo15_quantize_fp8_rows_bf16",
+    "alpamayo15_rms_fp8_rows_bf16",
+    "alpamayo15_silu_mul_fp8_rows_bf16",
     # tcgen05 GEMMs (csrc/gemm/alpamayo15_bf16_gemm_sm100.cu), same build gate
     "alpamayo15_bf16_gemm_sm100",
     "alpamayo15_bf16_gemm_sm100_workspace",
@@ -803,14 +805,24 @@ class Alpamayo15Thor:
         layers = lm.layers
         p8 = self._p8
 
-        def lin(src, akey, w, wname, li, out, col0=0):
+        def norm(delta, w):
+            """``h = RMSNorm(x += delta) * w``; in the W8A8 tier the producer writes the FP8 rows of h directly."""
+            if p8 is None:
+                fvk.alpamayo15_rms_bf16(x.data_ptr(), delta.data_ptr() if delta is not None else 0, w.data_ptr(),
+                                        h.data_ptr(), P, H, self.eps, s)
+            else:
+                fvk.alpamayo15_rms_fp8_rows_bf16(x.data_ptr(), delta.data_ptr() if delta is not None else 0, w.data_ptr(),
+                                                 b["h8"].data_ptr(), b["h_s"].data_ptr(), P, H, self.eps, s)
+
+        def lin(src, akey, w, wname, li, out, col0=0, quantized=False):
             """``out = src @ w.T``: cuBLAS on the BF16 weight ``w``, or (W8A8 tier) per-row FP8 rows of ``src``
-            (buffers ``akey``) times rows ``col0:`` of the FP8 copy ``wname`` of layer ``li``."""
+            (buffers ``akey``, written by the producer when ``quantized``) times rows ``col0:`` of the FP8 copy
+            ``wname`` of layer ``li``."""
             if p8 is None:
                 torch.mm(src, w.t(), out=out)
                 return
             q8, q_s = b[akey + "8"][:P], b[akey + "_s"][:P]
-            if col0 == 0:
+            if col0 == 0 and not quantized:
                 fvk.alpamayo15_quantize_fp8_rows_bf16(src.data_ptr(), src.stride(0), q8.data_ptr(), q_s.data_ptr(), P,
                                                       src.shape[1], s)
             w8, w_s = p8[li][wname]
@@ -822,10 +834,10 @@ class Alpamayo15Thor:
                                    tile=PREFILL_FP8_TILE)
             else:
                 self._gemm.fp8(q8, q_s, w8[col0:col0 + N], w_s[col0:col0 + N], out, tile=PREFILL_FP8_TILE)
-        fvk.alpamayo15_rms_bf16(x.data_ptr(), 0, layers[0].input_layernorm.weight.data_ptr(), h.data_ptr(), P, H, self.eps, s)
+        norm(None, layers[0].input_layernorm.weight)
         for li, layer in enumerate(layers):
             a = layer.self_attn
-            lin(h, "h", self.w_qkv[li], "qkv", li, qkv)
+            lin(h, "h", self.w_qkv[li], "qkv", li, qkv, quantized=True)
             kc, vc = self.k_cache[li, 0, :P], self.v_cache[li, 0, :P]
             fvk.alpamayo15_vlm_qk_prep_bf16(
                 qkv.data_ptr(), a.q_norm.weight.data_ptr(), a.k_norm.weight.data_ptr(),
@@ -834,21 +846,21 @@ class Alpamayo15Thor:
             self._fa4(q.view(1, P, NH, D), kc.unsqueeze(0), vc.unsqueeze(0), softmax_scale=self.scale,
                       causal=True, pack_gqa=True, out=attn.view(1, P, NH, D))
             lin(attn, "attn", a.o_proj.weight, "o", li, o)
-            fvk.alpamayo15_rms_bf16(x.data_ptr(), o.data_ptr(), layer.post_attention_layernorm.weight.data_ptr(),
-                                    h.data_ptr(), P, H, self.eps, s)
-            lin(h, "h", self.w_gu[li][:F_], "gu", li, g)             # cuBLAS is slower on the fused gate | up shape: two GEMMs
-            lin(h, "h", self.w_gu[li][F_:], "gu", li, u, col0=F_)
-            fvk.alpamayo15_silu_mul_split_bf16(g.data_ptr(), u.data_ptr(), F_, g.data_ptr(), P, F_, s)   # in place
-            lin(g, "g", layer.mlp.down_proj.weight, "down", li, d)
+            norm(o, layer.post_attention_layernorm.weight)
+            lin(h, "h", self.w_gu[li][:F_], "gu", li, g, quantized=True)   # cuBLAS is slower on the fused gate | up shape: two GEMMs
+            lin(h, "h", self.w_gu[li][F_:], "gu", li, u, col0=F_, quantized=True)
+            if p8 is None:
+                fvk.alpamayo15_silu_mul_split_bf16(g.data_ptr(), u.data_ptr(), F_, g.data_ptr(), P, F_, s)   # in place
+            else:
+                fvk.alpamayo15_silu_mul_fp8_rows_bf16(g.data_ptr(), u.data_ptr(), F_, b["g8"].data_ptr(), b["g_s"].data_ptr(), P, F_, s)
+            lin(g, "g", layer.mlp.down_proj.weight, "down", li, d, quantized=True)
             if li < len(deepstack):
                 fvk.residual_add(x.data_ptr(), d.data_ptr(), P * H, s)
                 x[vis_idx] = x[vis_idx] + deepstack[li].to(BF16)
                 if li + 1 < len(layers):
-                    fvk.alpamayo15_rms_bf16(x.data_ptr(), 0, layers[li + 1].input_layernorm.weight.data_ptr(),
-                                            h.data_ptr(), P, H, self.eps, s)
+                    norm(None, layers[li + 1].input_layernorm.weight)
             elif li + 1 < len(layers):
-                fvk.alpamayo15_rms_bf16(x.data_ptr(), d.data_ptr(), layers[li + 1].input_layernorm.weight.data_ptr(),
-                                        h.data_ptr(), P, H, self.eps, s)
+                norm(d, layers[li + 1].input_layernorm.weight)
             else:
                 fvk.residual_add(x.data_ptr(), d.data_ptr(), P * H, s)
         with _autocast():
