@@ -9,7 +9,7 @@ The two algorithms are independently selectable; their speedups do not multiply.
 | Arm | Weights | Procedure | Execution |
 |---|---|---|---|
 | official | NVIDIA Alpamayo | full 16-frame request, 10 expert calls | official SDPA |
-| flashrt_full | same NVIDIA weights | same full-request procedure | FlashRT BF16; optional FP8 decode |
+| flashrt_full | same NVIDIA weights | same full-request procedure | FlashRT BF16; optional INT8/FP8 decode, FP8 expert and FP8 prefill tiers |
 | flashdrive | z-lab base, PARO, DFlash | streaming KV reuse, speculative reasoning, W4A8 and velocity caching | author implementation |
 | fd_flashrt | same z-lab weights | same FlashDrive procedure | FlashRT primitive backends |
 
@@ -234,7 +234,7 @@ numerical contracts, measurements and limitations.
 
 FlashRT runs NVIDIA [Alpamayo 1.5](https://github.com/NVlabs/alpamayo1.5)
 (`nvidia/Alpamayo-1.5-10B`) on Jetson AGX Thor (`sm_110`) in BF16, with an
-opt-in FP8 decode-weight tier (see [FP8 decode tier](#fp8-decode-tier)). The request
+opt-in precision tiers (see [Precision tiers](#precision-tiers)). The request
 semantics of the official `sample_trajectories_from_data_with_vlm_rollout`
 are preserved: the same multi-camera prompt, chain-of-causation reasoning with
 the official sampler (trajectory tokens masked, temperature, top-p, multinomial
@@ -245,10 +245,10 @@ and the official noise draw and trajectory integration.
 
 | Stage | Official (Hugging Face eager) | FlashRT Thor |
 |---|---|---|
-| Vision tower (27 layers, 16 frames) | per-frame attention calls, FP32 LayerNorm/RoPE round trips, CPU-built position tables | batched FA4 attention on the interleaved q/k/v, BF16 LayerNorm with FP32 math, fused in-place FP32 RoPE, per-grid cached tables, patch embedding as one GEMM |
-| LM prefill (36 layers) | eager modules, `DynamicCache` | fused q/k/v GEMM, fused head RMSNorm + M-RoPE writing K/V straight into a static cache, FA4 causal attention, fused residual + RMSNorm, SiLU-mul |
+| Vision tower (27 layers, 16 frames) | per-frame attention calls, FP32 LayerNorm/RoPE round trips, CPU-built position tables | one CUDA graph per frame grid: patch embedding (+ position embedding), qkv / proj / fc1 / fc2 and the mergers on tcgen05 GEMMs with bias, GELU and residual fused into the epilogues, LayerNorm kernel, fused in-place FP32 RoPE, batched FA4 attention on the interleaved q/k/v, per-grid cached tables |
+| LM prefill (36 layers) | eager modules, `DynamicCache` | fused q/k/v GEMM, fused head RMSNorm + M-RoPE writing K/V straight into a static cache, FA4 causal attention, fused residual + RMSNorm, vectorized SiLU-mul |
 | Reasoning decode | `generate()` | one CUDA graph per token: fused GEMVs, split-KV FA4 decode attention, sampler on device |
-| Diffusion expert (10 Euler steps) | 10 eager expert calls (or bounded per-length graphs) | all 10 steps in one CUDA graph; one graph serves every reasoning length |
+| Diffusion expert (10 Euler steps) | 10 eager expert calls (or bounded per-length graphs) | all 10 steps in one CUDA graph on tcgen05 GEMMs (64-row tiles, fused q/k/v and gate\|up weights, split SiLU-mul); one graph serves every reasoning length |
 | `num_traj_samples = N` | prompt (images included) repeated N times through vision and prefill | vision and prefill once; the prompt K/V is shared by all samples |
 
 The static cache holds `[prompt | reasoning | action]` per sample. Each
@@ -275,7 +275,10 @@ sequences (vision RoPE bit-exact, the others within one BF16 ulp from FP32
 reduction order; the module is built with flush-to-zero). GEMV/GEMM and attention kernels keep FP32 accumulation but
 differ from the eager kernels in reduction order, so near-tie sampling steps
 can choose a different token, exactly as switching the official model between
-its SDPA and FlashAttention-2 backends does. With several samples, the
+its SDPA and FlashAttention-2 backends does. The tcgen05 GEMM epilogues round
+bias + activation (+ residual) once where the module graph rounds after each
+op; `vision_gemm` / `expert_gemm` = `"torch"` keep cuBLAS and the torch
+elementwise ops for comparison. With several samples, the
 shared-prompt and per-sample attention passes are merged from BF16 partial
 outputs (one extra rounding) and the reasoning lm_head runs as a vocab-major
 GEMM, so per-sample numerics are not bit-identical to a single-sample run.
@@ -313,7 +316,10 @@ out = fe.infer(image_frames,      # (n_cameras, n_frames, 3, H, W) uint8
 out["pred_xyz"], out["pred_rot"], out["cot"][0]
 # several trajectory samples: construct with max_samples=16, then
 # fe.infer(..., num_traj_samples=16) -> pred_xyz (1, 1, 16, 64, 3)
-# opt-in FP8 decode weights: engine_kwargs={"decode_weights": "fp8"}
+# opt-in precision tiers: engine_kwargs={"decode_weights": "int8"}   # or "fp8"
+#                         engine_kwargs={"expert_weights": "fp8"}
+# cuBLAS / torch elementwise instead of the tcgen05 paths:
+#                         engine_kwargs={"vision_gemm": "torch", "expert_gemm": "torch"}
 ```
 
 `load_model(config="alpamayo15")` raises a redirect: the model takes camera
@@ -388,35 +394,93 @@ With several samples the official model repeats the whole prompt (images
 included) per sample; FlashRT encodes it once, which is where the N=6/16
 speedups come from.
 
-## FP8 decode tier
+### Current engine (tcgen05 vision and expert, precision tiers)
 
-`Alpamayo15Thor(model, decode_weights="fp8")` (frontend:
-`engine_kwargs={"decode_weights": "fp8"}`) stores per-row FP8 E4M3 copies
-(scale = row absmax / 448, round-to-nearest-even) of the reasoning-decode
-projections (q/k/v, o, gate/up, down) and the LM head, and runs them through
-`alpamayo15_w8a16_gemm_bf16`: BF16 activations, exact e4m3 -> bf16 widening,
-FP32 tensor-core accumulation, up to 16 samples. The projections take about
-half the time of their BF16 versions at the same 240-255 GB/s, and decode drops
-from 68.3 to 35.4 ms per token. Vision, prefill, the diffusion expert and the
-sampler keep BF16 arithmetic, but the expert attends over reasoning K/V
-produced by the FP8 projections. The BF16 weights stay resident for prefill;
-the FP8 copies add 7.6 GB (7.1 GiB).
+FlashDrive's default clip (`87147a1b`, 117 steady windows of the full-request
+protocol below: 4 cameras x 4 frames, 128-token budget, seed 0, N=1),
+CUDA-event stage times per request and the window mean. The commit before
+this engine (cuBLAS vision and expert) is the first row; the tier rows ran 24
+steady windows of the same clip (the same windows for every row):
 
-This is a numerics change, not a reproduction of the official model.
-Teacher-forced on official tokens, the sampling distribution moves by a mean
-KL (temperature 0.6) of 8e-5 to 1e-4 on two clips and 2e-3 on a long,
-ambiguous clip where 1 of 67 argmax decisions flips (BF16: 5e-6 to 2e-4, no
-flips). Free-running, it changes the sampled reasoning on 6/40 N=1 requests,
-24/96 N=6 samples and 42/128 N=16 samples (official FlashAttention-2 vs SDPA:
-2/40 and 5/96). On these eight clips the paired minADE difference to official
-SDPA is -3 cm at N=1 (95% CI -39..30), -7 cm at N=6 (-38..13) and +7 cm at
-N=16 (-5..27, eight requests); these intervals are wide and do not show
-equivalence. Single requests move by up to 5 m in either direction, all on the
-long, ambiguous clip `8b5bcb48` (where one official SDPA run itself exhausts the
-256-token budget); on the other clips minADE moves by at most 0.4 m. Against
-the BF16 engine at N=16 (16 requests) the mean is +21 cm (-4..59), driven by
-`8b5bcb48` (+0.7 m and +2.9 m). Validate on your own scenarios before enabling it; the default is
-BF16.
+| Configuration | request ms (mean / median) | vision | prefill LM | decode ms/token | diffusion | peak GB |
+|---|---|---|---|---|---|---|
+| previous engine (cuBLAS vision / expert, BF16) | 1947 / 1894 | 181 | 520 | 68.2 | 230 | 22.1 |
+| this engine, defaults (BF16) | 1937 / 1932 | 150 | 545 | 68.3 | 214 | 22.3 |
+| `decode_weights="int8"` | 1459 (24 w.) | 150 | 545 | 38.0 | 215 | 29.3 |
+| `expert_weights="fp8"` | 1818 (24 w.) | 148 | 543 | 68.5 | 130 | 24.4 |
+| `prefill_weights="fp8"` | 1727 (24 w.) | 151 | 307 | 68.3 | 214 | 28.8 |
+| all three tiers | 1136 (24 w.) | 149 | 308 | 37.6 | 129 | 38.0 |
+
+Nine clips of `nvidia/PhysicalAI-Autonomous-Vehicles` (the FlashDrive default
+clip with 120 windows and eight more with 60; windows from t0 = 1.7 s, 0.1 s
+apart; the same windows as the streaming tables below), seed 0, 573 steady
+windows per arm, one process per arm. Latency is per request from inputs on
+the host to the trajectory on the host; bracketed ranges are 95% bootstrap
+intervals over clips, paired differences are per (clip, window):
+
+| Path | mean ms | median ms | p90 ms | p99 ms | peak GB | ADE | paired ms vs default | paired ADE vs default | paired ADE vs official |
+|---|---|---|---|---|---|---|---|---|---|
+| Official Alpamayo 1.5 (BF16, SDPA) | 3320 [3109, 3606] | 3164 | 3745 | 5939 | 21.6 | 2.867 | | | - |
+| previous engine (cuBLAS vision / expert) | 2159 [1958, 2438] | 2012 | 2555 | 4583 | 22.1 | 2.852 | | | -0.015 [-0.086, +0.024] |
+| this engine, defaults (BF16) | 2159 [1946, 2467] | 1994 | 2545 | 4917 | 22.3 | 2.881 | - | - | +0.014 [-0.016, +0.057] |
+| `decode_weights="int8"` | 1611 [1489, 1795] | 1518 | 1826 | 3259 | 29.3 | 2.872 | -548 [-672, -459] | -0.009 [-0.063, +0.040] | +0.005 [-0.026, +0.048] |
+| `expert_weights="fp8"` | 2083 [1869, 2391] | 1919 | 2468 | 4823 | 24.4 | 2.879 | -76 [-78, -74] | -0.002 [-0.005, -0.000] | +0.012 [-0.018, +0.060] |
+| `prefill_weights="fp8"` | 1911 [1718, 2161] | 1768 | 2317 | 4294 | 28.8 | 2.836 | -248 [-296, -224] | -0.045 [-0.114, +0.005] | -0.031 [-0.089, +0.004] |
+| all three tiers | 1290 [1167, 1460] | 1195 | 1509 | 2780 | 38.0 | 2.848 | -869 [-992, -776] | -0.033 [-0.093, +0.006] | -0.019 [-0.036, -0.006] |
+
+The default engine generates the same tokens as the previous engine on 549 of
+573 requests; the INT8 decode tier on 532, the FP8 prefill tier on 531 and all
+three tiers on 527 (the FP8 expert tier leaves the tokens unchanged, so its
+latency interval is tight). FDE moves with ADE on every row (all three tiers:
+-0.132 m [-0.352, +0.002] against the default). Reasoning is sampled
+(temperature 0.6), so these are distribution-level comparisons; the official
+model and the engines agree on at most one request's token stream. Against the
+official model, all three tiers are 2.57x faster on the mean and 2.65x on the
+median at an ADE 0.019 m lower.
+
+The same 112 of 117 windows produce identical reasoning tokens on the previous
+and the current default engine (the five others flip at near ties, as every
+tcgen05 vision/expert form does), and on identical tokens the current engine
+is 20 ms faster per request. The prefill column grew by 25 ms although its
+kernels did not change: cuBLAS's 2-CTA gate/up kernel runs 15% slower in this
+pipeline than before (2.08 -> 2.39 ms), while the same GEMM measures 1.66 ms
+in isolation inside the same process; the board's over-current throttle
+(sysfs `oc3_event_cnt`, 20-90 events per window) is the suspected cause and is
+not a property of the code.
+
+## Precision tiers
+
+The default engine keeps the official BF16 weights everywhere. Three opt-in
+tiers trade numerics for weight bytes; each is a numerics change, not a
+reproduction of the official model, and should be validated on your own
+scenarios.
+
+`decode_weights="int8"` / `"fp8"` (frontend: `engine_kwargs={"decode_weights":
+"int8"}`) store per-row copies of the reasoning-decode projections (q/k/v, o,
+gate/up, down) and the LM head: symmetric INT8 (scale = row absmax / 127) or
+FP8 E4M3 (scale = row absmax / 448, round-to-nearest-even), and run them
+through `alpamayo15_w8a16_gemm_bf16`: BF16 activations, exact widening of the
+codes, FP32 tensor-core accumulation, up to 16 samples. Both halve the decode
+weight stream (68 -> 35-38 ms per token); INT8 carries about 4x less weight
+error than E4M3 for the same bytes and is the recommended one. Vision,
+prefill, the diffusion expert and the sampler keep BF16 arithmetic, but the
+expert attends over reasoning K/V produced by the quantized projections. The
+BF16 weights stay resident for prefill; the copies add 7.6 GB (7.1 GiB).
+
+`expert_weights="fp8"` runs the diffusion expert's projections as W8A8: per-row
+FP8 E4M3 copies of the fused q/k/v, o, fused gate|up and down weights, per-row
+FP8 activations quantized by a kernel before each GEMM, and the scales applied
+in the tcgen05 GEMM epilogue. The expert's weight stream halves (its 10 Euler
+steps go from 215 to 130 ms); +4.6 GB.
+
+`prefill_weights="fp8"` does the same for the 36 prefill layers: per-row FP8
+activations (h, attention output, SiLU-mul output) and per-row FP8 weights on
+256 x 128 x 128 tiles of a 2-SM UMMA (about 250 TFLOPS on Thor against
+150-185 for cuBLAS BF16); the K=12288 down projection runs as four column
+blocks so that each weight block stays in the L2 (1.5 instead of 3.9 ms per
+layer); the RMSNorm and SiLU-mul producers write the FP8 rows and scales
+directly. Prefill drops from about 545 to 307 ms; +7.6 GB. This tier changes
+the prompt K/V and therefore every later token.
 
 ## Limitations
 
