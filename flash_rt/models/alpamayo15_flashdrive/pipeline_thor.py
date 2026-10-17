@@ -73,7 +73,7 @@ FLASHDRIVE_KERNEL_SYMBOLS = ("flashdrive_qk_prep_bf16", "flashdrive_rope_rows", 
                              "flashdrive_bf16_gemm_small", "flashdrive_draft_qkv_prep_bf16", "flashdrive_w4a8_rotate_dense",
                              "flashdrive_w4a8_quant", "flashdrive_layernorm_bf16", "flashdrive_silu_mul_split_bf16",
                              "flashdrive_quantize_fp8_rows_bf16", "flashdrive_set_pdl", "flashdrive_w4a8_gemm_tile",
-                             "flashdrive_bf16_gemm_frag")
+                             "flashdrive_bf16_gemm_frag", "flashdrive_w4a8_act_prep_tile")
 TILE_MIN_N = 2048           # few-row W4A8 GEMMs with at least this many output channels stream one warp per 16-row tile
 ENGINE_GEMMS = ("cutlass", "torch")    # BF16 GEMMs of the vision tower and the action expert
 DECODE_WEIGHTS = ("bf16", "fp8")       # LM head and DFlash draft linears of the decode graphs
@@ -301,34 +301,38 @@ class _W4A8Group:
                 self.small.append((pack_w4a8_small(w, self.K, N), z.contiguous(), sg))
                 del w, z
 
-    def __call__(self, fvk, x: torch.Tensor) -> list[torch.Tensor]:
-        from vllm import _custom_ops as ops
-        from vllm.model_executor.layers.quantization.utils.marlin_utils import should_use_atomic_add_reduce
-        M = x.shape[0]
+    def _buffers(self, M: int) -> dict:
         n = len(self.mods)
         b = self._scratch.get((M, self.K, n))
         if b is None:
             Ma = (M + 31) // 32 * 32             # the GEMMs read whole token tiles (8 rows mma, 32 rows tcgen05): zeros
-            b = {"xr": [torch.empty(M, self.K, device=DEV, dtype=torch.float16) for _ in range(n)],
-                 "part": [torch.empty(M, self.K // 128, device=DEV, dtype=torch.float32) for _ in range(n)],
-                 "xq": [torch.zeros(Ma, self.K, device=DEV, dtype=torch.int8) for _ in range(n)],
+            b = {"xq": [torch.zeros(Ma, self.K, device=DEV, dtype=torch.int8) for _ in range(n)],
                  "as": [torch.zeros(Ma, 1, device=DEV, dtype=torch.float32) for _ in range(n)]}
+            if self.rot is not None or M <= SMALL_MAX_ROWS:   # two-pass preparation: FP16 rows and per-group maxima
+                b["xr"] = [torch.empty(M, self.K, device=DEV, dtype=torch.float16) for _ in range(n)]
+                b["part"] = [torch.empty(M, self.K // 128, device=DEV, dtype=torch.float32) for _ in range(n)]
             self._scratch[(M, self.K, n)] = b
+        return b
+
+    def prep(self, fvk, mode: int, src: torch.Tensor | None, M: int, src2: torch.Tensor | None = None,
+             residual: torch.Tensor | None = None, norm_w: torch.Tensor | None = None, eps: float = 0.0) -> None:
+        """Fused producer + activation preparation of ``M`` rows (``flashdrive_w4a8_act_prep_tile``): mode 0 plain bf16
+        rows, mode 1 residual (+= bf16(delta fp16) when ``src`` is given) RMSNorm, mode 2 SiLU-mul of fp16 gate | up."""
+        b = self._buffers(M)
         ptrs = lambda ts: [t.data_ptr() for t in ts]
-        stream = torch.cuda.current_stream().cuda_stream
-        if self.rot is not None:          # dense rotation on tensor cores, then the shared quantization pass
-            fvk.flashdrive_w4a8_rotate_dense(x.data_ptr(), x.stride(0), M, self.K, ptrs(self.rot),
-                                             ptrs(m.rotation.channel_scales for m in self.mods), ptrs(b["xr"]),
-                                             ptrs(b["part"]), stream)
-            fvk.flashdrive_w4a8_quant(M, self.K, ptrs(b["xr"]), ptrs(b["part"]),
-                                      ptrs(m.qlinear.input_global_scale for m in self.mods), ptrs(b["xq"]), ptrs(b["as"]),
-                                      stream)
-        else:
-            fvk.flashdrive_w4a8_act_prep(
-                x.data_ptr(), x.stride(0), M, self.K, ptrs(m.rotation.theta for m in self.mods),
-                ptrs(m.rotation.pairs for m in self.mods), ptrs(m.rotation.channel_scales for m in self.mods),
-                ptrs(m.qlinear.input_global_scale for m in self.mods), ptrs(b["xr"]), ptrs(b["part"]), ptrs(b["xq"]),
-                ptrs(b["as"]), stream)
+        fvk.flashdrive_w4a8_act_prep_tile(
+            mode, src.data_ptr() if src is not None else 0, src2.data_ptr() if src2 is not None else 0,
+            (src if src is not None else residual).stride(0), residual.data_ptr() if residual is not None else 0,
+            residual.stride(0) if residual is not None else 0, norm_w.data_ptr() if norm_w is not None else 0, eps, M,
+            self.K, ptrs(m.rotation.theta for m in self.mods), ptrs(m.rotation.pairs for m in self.mods),
+            ptrs(m.rotation.channel_scales for m in self.mods), ptrs(m.qlinear.input_global_scale for m in self.mods),
+            ptrs(b["xq"]), ptrs(b["as"]), 0, 0, torch.cuda.current_stream().cuda_stream)
+
+    def gemm(self, fvk, M: int) -> list[torch.Tensor]:
+        """The GEMMs of the group on the prepared INT8 activations of ``M`` rows."""
+        from vllm import _custom_ops as ops
+        from vllm.model_executor.layers.quantization.utils.marlin_utils import should_use_atomic_add_reduce
+        b = self._buffers(M)
         outs = []
         if self.int8 is not None and M >= TCGEN05_MIN_ROWS:
             for (w8, sg), xq, a_s, N in zip(self.int8, b["xq"], b["as"], self.N):
@@ -346,10 +350,32 @@ class _W4A8Group:
             q = m.qlinear
             out = ops.marlin_gemm(xq[:M], None, q.qweight, q.bias, q.scales, a_s, None, q.qzeros, q.g_idx,
                                   q.g_idx_sort_indices, q.workspace, q.quant_type, size_m=M, size_n=N, size_k=self.K,
-                                  use_atomic_add=should_use_atomic_add_reduce(M, N, self.K, x.device, torch.float16),
+                                  use_atomic_add=should_use_atomic_add_reduce(M, N, self.K, xq.device, torch.float16),
                                   use_fp32_reduce=True, is_zp_float=False)
             outs.append(out)
         return outs
+
+    def __call__(self, fvk, x: torch.Tensor) -> list[torch.Tensor]:
+        M = x.shape[0]
+        b = self._buffers(M)
+        ptrs = lambda ts: [t.data_ptr() for t in ts]
+        stream = torch.cuda.current_stream().cuda_stream
+        if self.rot is not None:          # dense rotation on tensor cores, then the shared quantization pass
+            fvk.flashdrive_w4a8_rotate_dense(x.data_ptr(), x.stride(0), M, self.K, ptrs(self.rot),
+                                             ptrs(m.rotation.channel_scales for m in self.mods), ptrs(b["xr"]),
+                                             ptrs(b["part"]), stream)
+            fvk.flashdrive_w4a8_quant(M, self.K, ptrs(b["xr"]), ptrs(b["part"]),
+                                      ptrs(m.qlinear.input_global_scale for m in self.mods), ptrs(b["xq"]), ptrs(b["as"]),
+                                      stream)
+        elif M > SMALL_MAX_ROWS:          # row tiles: producer-fused preparation
+            self.prep(fvk, 0, x, M)
+        else:                             # a few rows: the two-pass kernels spread the groups over the SMs
+            fvk.flashdrive_w4a8_act_prep(
+                x.data_ptr(), x.stride(0), M, self.K, ptrs(m.rotation.theta for m in self.mods),
+                ptrs(m.rotation.pairs for m in self.mods), ptrs(m.rotation.channel_scales for m in self.mods),
+                ptrs(m.qlinear.input_global_scale for m in self.mods), ptrs(b["xr"]), ptrs(b["part"]), ptrs(b["xq"]),
+                ptrs(b["as"]), stream)
+        return self.gemm(fvk, M)
 
     def _gemm_int8(self, fvk, xq, w8, sg, a_s, M, N) -> torch.Tensor:
         key = ("int8", M, self.K, N)
@@ -1085,12 +1111,22 @@ class FlashDriveThor:
         H, D, NH, KV, S, F_, eps = self.hidden, self.head_dim, self.n_heads, self.n_kv, st["S"], self.ffn, self.eps
         x, h, q, act = b["x"], b["h"], b["q"], b["act"]
         cap_ids = sorted(lm._capture_layer_ids)
-        fvk.alpamayo15_rms_bf16(x.data_ptr(), 0, layers[0].input_layernorm.weight.data_ptr(), h.data_ptr(), n, H, eps, s)
+        # FlashRT W4A8 path over many rows (streaming-window prefill): the producer of each W4A8 input (RMSNorm,
+        # SiLU-mul, attention output) and its activation preparation run as one kernel over row tiles; the normalized
+        # rows are never materialised (h only for the LM head). A few rows (verification, trajectory start) keep the
+        # separate kernels, whose grids spread the rotation groups over the SMs.
+        fused = self.backends["w4a8"] == "fused" and self._w4[0]["qkv"].rot is None and n > SMALL_MAX_ROWS
+        if fused:
+            self._w4[0]["qkv"].prep(fvk, 1, None, n, residual=x, norm_w=layers[0].input_layernorm.weight, eps=eps)
+        else:
+            fvk.alpamayo15_rms_bf16(x.data_ptr(), 0, layers[0].input_layernorm.weight.data_ptr(), h.data_ptr(), n, H, eps, s)
         for li, layer in enumerate(layers):
             a = layer.self_attn
             # fused: FP16 GEMM outputs consumed directly (cast to BF16 on load, as FlashDrive's wrapper casts)
             w4 = self._w4[li] if self.backends["w4a8"] == "fused" else None
-            if w4 is not None:
+            if fused:
+                qp, kp, vp = w4["qkv"].gemm(fvk, n)
+            elif w4 is not None:
                 qp, kp, vp = w4["qkv"](fvk, h)
             else:
                 qp, kp, vp = a.q_proj(h), a.k_proj(h), a.v_proj(h)    # FlashDrive's W4A8 (ParoQuant) projections
@@ -1102,6 +1138,30 @@ class FlashDriveThor:
                 slot.data_ptr() if slot is not None else 0, n, NH, KV, eps, s, f16_in=int(w4 is not None))
             attend(st, li, q, b["attn"])
             post_w = layer.post_attention_layernorm.weight.data_ptr()
+            nxt = layers[li + 1].input_layernorm.weight if li + 1 < len(layers) else lm.norm.weight
+            if fused:
+                w4["o"].prep(fvk, 0, b["attn"], n)
+                o_out = w4["o"].gemm(fvk, n)[0]
+                w4["gu"].prep(fvk, 1, o_out, n, residual=x, norm_w=layer.post_attention_layernorm.weight, eps=eps)
+                g, u = w4["gu"].gemm(fvk, n)
+                w4["down"].prep(fvk, 2, g, n, src2=u)
+                d = w4["down"].gemm(fvk, n)[0]
+                if deep is not None and li < len(deep):   # residual += down, DeepStack injection, next input norm
+                    d16 = d.to(BF16)
+                    fvk.residual_add(x.data_ptr(), d16.data_ptr(), n * H, s)
+                    x.index_add_(0, vis_idx, deep[li])
+                    if li + 1 < len(layers):
+                        self._w4[li + 1]["qkv"].prep(fvk, 1, None, n, residual=x, norm_w=nxt, eps=eps)
+                    else:
+                        fvk.alpamayo15_rms_bf16(x.data_ptr(), 0, nxt.data_ptr(), h.data_ptr(), n, H, eps, s)
+                elif li + 1 < len(layers):                # residual += down, next input norm, next layer's q|k|v preparation
+                    self._w4[li + 1]["qkv"].prep(fvk, 1, d, n, residual=x, norm_w=nxt, eps=eps)
+                else:
+                    fvk.flashdrive_rms_f16delta_bf16(x.data_ptr(), d.data_ptr(), nxt.data_ptr(), h.data_ptr(), n, H, eps, s)
+                if li in cap_ids:
+                    j = cap_ids.index(li)
+                    b["ctx"][:, j * H:(j + 1) * H].copy_(x[cap_from:])
+                continue
             if w4 is not None:
                 fvk.flashdrive_rms_f16delta_bf16(x.data_ptr(), w4["o"](fvk, b["attn"])[0].data_ptr(), post_w,
                                                  h.data_ptr(), n, H, eps, s)

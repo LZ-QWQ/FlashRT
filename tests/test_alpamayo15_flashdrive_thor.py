@@ -403,6 +403,77 @@ def test_w4a8_act_prep_bit_exact_with_paroquant_and_vllm(rows, K):
         assert torch.equal(r.view(torch.int16), x_rot.view(torch.int16))   # FP16 workspace, bitwise (inf/NaN rows)
 
 
+@pytest.mark.parametrize("mode,rows,K,tile,cluster", [
+    (0, 8, 4096, 0, 0), (1, 8, 4096, 0, 0), (1, 1, 4096, 16, 2), (2, 8, 12288, 0, 0), (1, 16, 4096, 8, 4),
+    (1, 9, 3584, 0, 0), (2, 9, 18944, 0, 0),            # verification block: one tile spread over a cluster
+    (0, 40, 3584, 16, 2), (1, 40, 3584, 8, 1), (1, 37, 3584, 16, 7), (2, 40, 18944, 16, 0), (2, 33, 18944, 8, 0)])
+def test_act_prep_tile_matches_separate_kernels(mode, rows, K, tile, cluster):
+    """The fused tile producer + preparation equals the separate kernels bitwise: producer (plain / rms_f16delta /
+    silu_mul_f16in) followed by the two-pass ParoQuant preparation; every tile size and cluster shape."""
+    fvk = _kernels()
+    torch.manual_seed(28)
+    s_ = torch.cuda.current_stream().cuda_stream
+    n_sets = 3 if mode == 1 else 1
+    sets = []
+    for _ in range(n_sets):
+        theta = (torch.randn(8, K // 2, device="cuda") * 2).to(torch.float16)
+        perm = torch.stack([torch.cat([torch.randperm(128) for _ in range(K // 128)]) for _ in range(8)])
+        sets.append((theta, perm.to(torch.int16).cuda(), (torch.rand(1, K, device="cuda") + 0.5).to(torch.float16),
+                     torch.tensor(6.5e-6, device="cuda", dtype=torch.float32)))
+    p = lambda ts: [t.data_ptr() for t in ts]
+    eps = 1e-6
+    Ra = (rows + 31) // 32 * 32
+    w = (torch.rand(K, device="cuda") + 0.5).to(BF16)
+    res = torch.randn(rows, K, device="cuda").to(BF16)
+    delta = (torch.randn(rows, K, device="cuda") * 0.3).to(torch.float16)
+    gate = (torch.randn(rows, K, device="cuda") * 2).to(torch.float16)
+    up = torch.randn(rows, K, device="cuda").to(torch.float16)
+    x0 = torch.randn(rows, K, device="cuda").to(BF16)
+    # reference: separate kernels
+    res_ref = res.clone()
+    if mode == 0:
+        h = x0
+    elif mode == 1:
+        h = torch.empty_like(res_ref)
+        fvk.flashdrive_rms_f16delta_bf16(res_ref.data_ptr(), delta.data_ptr(), w.data_ptr(), h.data_ptr(), rows, K, eps, s_)
+    else:
+        h = torch.empty(rows, K, device="cuda", dtype=BF16)
+        fvk.flashdrive_silu_mul_f16in_bf16(gate.data_ptr(), up.data_ptr(), h.data_ptr(), rows * K, s_)
+    xq = [torch.zeros(Ra, K, device="cuda", dtype=torch.int8) for _ in sets]
+    a_s = [torch.zeros(Ra, device="cuda", dtype=torch.float32) for _ in sets]
+    xr = [torch.empty(rows, K, device="cuda", dtype=torch.float16) for _ in sets]
+    part = [torch.empty(rows, K // 128, device="cuda", dtype=torch.float32) for _ in sets]
+    fvk.flashdrive_w4a8_act_prep(h.data_ptr(), K, rows, K, p(t[0] for t in sets), p(t[1] for t in sets), p(t[2] for t in sets),
+                                 p(t[3] for t in sets), p(xr), p(part), p(xq), p(a_s), s_)
+    # fused tile kernel
+    res_f = res.clone()
+    xq2 = [torch.zeros(Ra, K, device="cuda", dtype=torch.int8) for _ in sets]
+    a_s2 = [torch.zeros(Ra, device="cuda", dtype=torch.float32) for _ in sets]
+    src = {0: x0, 1: delta, 2: gate}[mode]
+    fvk.flashdrive_w4a8_act_prep_tile(mode, src.data_ptr(), up.data_ptr() if mode == 2 else 0, K, res_f.data_ptr() if mode == 1 else 0,
+                                      K, w.data_ptr() if mode == 1 else 0, eps, rows, K, p(t[0] for t in sets), p(t[1] for t in sets),
+                                      p(t[2] for t in sets), p(t[3] for t in sets), p(xq2), p(a_s2), tile, cluster, s_)
+    torch.cuda.synchronize()
+    for q, q2, a, a2 in zip(xq, xq2, a_s, a_s2):
+        assert torch.equal(q, q2)
+        assert torch.equal(a.view(torch.int32), a2.view(torch.int32))
+    if mode == 1:
+        assert torch.equal(res_f, res_ref)
+        # without a delta: plain RMSNorm of the residual (rms_bf16 contract)
+        h2 = torch.empty_like(res)
+        fvk.alpamayo15_rms_bf16(res.clone().data_ptr(), 0, w.data_ptr(), h2.data_ptr(), rows, K, eps, s_)
+        fvk.flashdrive_w4a8_act_prep(h2.data_ptr(), K, rows, K, p(t[0] for t in sets), p(t[1] for t in sets), p(t[2] for t in sets),
+                                     p(t[3] for t in sets), p(xr), p(part), p(xq), p(a_s), s_)
+        r3 = res.clone()
+        fvk.flashdrive_w4a8_act_prep_tile(1, 0, 0, K, r3.data_ptr(), K, w.data_ptr(), eps, rows, K, p(t[0] for t in sets),
+                                          p(t[1] for t in sets), p(t[2] for t in sets), p(t[3] for t in sets), p(xq2), p(a_s2),
+                                          tile, cluster, s_)
+        torch.cuda.synchronize()
+        assert torch.equal(r3, res)
+        for q, q2 in zip(xq, xq2):
+            assert torch.equal(q, q2)
+
+
 def test_shift_cache_matches_flashdrive_shift_and_rotation():
     """One launch moves every layer's frame blocks f+1 -> f (FlashDrive's gather + scatter) and rotates the
     moved keys into the VLM view (BF16 rule at the destination rows)."""

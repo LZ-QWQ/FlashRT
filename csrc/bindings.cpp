@@ -5790,6 +5790,38 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("x"), py::arg("ld_x"), py::arg("w_frag"), py::arg("y"), py::arg("ld_y"), py::arg("y_f32"), py::arg("M"),
         py::arg("N"), py::arg("K"), py::arg("stream") = 0);
 
+    m.def("flashdrive_w4a8_act_prep_tile",
+        [](int mode, uintptr_t src, uintptr_t src2, int src_ld, uintptr_t residual, int res_ld, uintptr_t norm_w, float eps,
+           int rows, int K, const std::vector<uintptr_t>& theta, const std::vector<uintptr_t>& pairs,
+           const std::vector<uintptr_t>& scales, const std::vector<uintptr_t>& igs, const std::vector<uintptr_t>& xq,
+           const std::vector<uintptr_t>& a_scale, int tile_rows, int cluster, uintptr_t stream) {
+            const int n = static_cast<int>(theta.size());
+            const auto shape = kernel_shape({{"mode", mode}, {"rows", rows}, {"K", K}, {"n_sets", n}, {"tile_rows", tile_rows},
+                                             {"cluster", cluster}});
+            require_kernel(n >= 1 && n <= 3 && pairs.size() == theta.size() && scales.size() == theta.size() &&
+                           igs.size() == theta.size() && xq.size() == theta.size() && a_scale.size() == theta.size(),
+                           "flashdrive_w4a8_act_prep_tile", "1-3 rotation sets with matching argument lists", shape);
+            std::vector<const void*> th(n), pr(n), sc(n);
+            std::vector<const float*> gs(n);
+            std::vector<void*> q(n);
+            std::vector<float*> as(n);
+            for (int i = 0; i < n; ++i) {
+                th[i] = reinterpret_cast<const void*>(theta[i]); pr[i] = reinterpret_cast<const void*>(pairs[i]);
+                sc[i] = reinterpret_cast<const void*>(scales[i]); gs[i] = reinterpret_cast<const float*>(igs[i]);
+                q[i] = reinterpret_cast<void*>(xq[i]); as[i] = reinterpret_cast<float*>(a_scale[i]);
+            }
+            const int rc = flash_rt::kernels::flashdrive_w4a8_act_prep_tile(
+                mode, reinterpret_cast<const void*>(src), reinterpret_cast<const void*>(src2), src_ld,
+                reinterpret_cast<void*>(residual), res_ld, reinterpret_cast<const void*>(norm_w), eps, rows, K, n, th.data(),
+                pr.data(), sc.data(), gs.data(), q.data(), as.data(), tile_rows, cluster, to_stream(stream));
+            require_kernel(rc == 0, "flashdrive_w4a8_act_prep_tile",
+                           "invalid shape/alignment or launch failure (rc=" + std::to_string(rc) + ")", shape);
+        },
+        py::arg("mode"), py::arg("src"), py::arg("src2"), py::arg("src_ld"), py::arg("residual"), py::arg("res_ld"),
+        py::arg("norm_w"), py::arg("eps"), py::arg("rows"), py::arg("K"), py::arg("theta"), py::arg("pairs"), py::arg("scales"),
+        py::arg("igs"), py::arg("xq"), py::arg("a_scale"), py::arg("tile_rows") = 0, py::arg("cluster") = 0,
+        py::arg("stream") = 0);
+
     m.def("flashdrive_set_pdl", [](bool on) { flash_rt::kernels::flashdrive_set_pdl(on); }, py::arg("on"),
           "Programmatic dependent launch for every FlashDrive-backend kernel and GEMM (process-wide).");
     // BF16 tcgen05 GEMM with fused bias / GELU / residual (csrc/gemm/alpamayo15_bf16_gemm_sm100.cu).

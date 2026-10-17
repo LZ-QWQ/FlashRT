@@ -8,6 +8,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+#include <cooperative_groups.h>
 
 #include <cstdint>
 #include <utility>
@@ -47,6 +48,34 @@ inline cudaError_t fd_launch(void (*kernel)(KArgs...), dim3 grid, dim3 block, si
   attr[0].val.programmaticStreamSerializationAllowed = 1;
   cfg.attrs = attr;
   cfg.numAttrs = g_fd_pdl ? 1 : 0;
+  return cudaLaunchKernelEx(&cfg, kernel, std::forward<Args>(args)...);
+}
+
+// Same, with a thread-block cluster of cluster_y CTAs along grid.y when cluster_y > 1.
+template <typename... KArgs, typename... Args>
+inline cudaError_t fd_launch_cluster(void (*kernel)(KArgs...), dim3 grid, dim3 block, size_t smem, cudaStream_t stream,
+                                     unsigned cluster_y, Args&&... args) {
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = grid;
+  cfg.blockDim = block;
+  cfg.dynamicSmemBytes = smem;
+  cfg.stream = stream;
+  cudaLaunchAttribute attr[2];
+  int n = 0;
+  if (g_fd_pdl) {
+    attr[n].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[n].val.programmaticStreamSerializationAllowed = 1;
+    ++n;
+  }
+  if (cluster_y > 1) {
+    attr[n].id = cudaLaunchAttributeClusterDimension;
+    attr[n].val.clusterDim.x = 1;
+    attr[n].val.clusterDim.y = cluster_y;
+    attr[n].val.clusterDim.z = 1;
+    ++n;
+  }
+  cfg.attrs = attr;
+  cfg.numAttrs = n;
   return cudaLaunchKernelEx(&cfg, kernel, std::forward<Args>(args)...);
 }
 }  // namespace
@@ -1134,6 +1163,410 @@ __global__ void __launch_bounds__(128) fd_bf16_frag_kernel(const __nv_bfloat16* 
   fd_pdl_trigger();
 }
 
+
+// ---------------------------------------------------------------------------
+// Fused producer + W4A8 activation preparation for a tile of R rows.
+// Grid (row tiles, C): CTA (t, c) owns rows [R t, R t + R) and column span c of
+// K; C > 1 CTAs of one tile form a thread-block cluster and exchange the row
+// absmax (and nothing else) through distributed shared memory. Shared memory
+// holds the tile column-major in 16-byte chunks of 8 rows, xs[channel][R], one
+// pad chunk per 8 channels, so one access of a rotation lane moves 8 rows of a
+// channel and the producers' transposing stores stay conflict-free.
+//   producer (per set; recomputed from the L2-resident inputs instead of
+//   keeping a BF16 copy; 16-byte loads of 8 channels x 8 rows):  mode 0 bf16 x;
+//   mode 1 residual += bf16(delta fp16) (first set only; skipped when src is
+//   null) then Qwen3 RMSNorm * w with the rms_f16delta summation order (the
+//   sequential partial of "thread t over channels t, t + 256, ..." then the
+//   256-thread tree; every CTA of the cluster sums the whole row, each writes
+//   its own span of the residual after the cluster has read it);  mode 2
+//   bf16(silu(bf16 g)) * bf16(u) from fp16 gate | up (silu_mul_f16in).
+//   then per set: half(bf16) * scale, the 8 ParoQuant layers (warp per
+//   128-channel group, pair tables loaded once per tile), row absmax, INT8
+//   quantization straight from shared memory. Arithmetic per element is that of
+//   fd_rms_f16delta_kernel / fd_silu_mul_f16in_kernel / fd_w4a8_rotate_kernel /
+//   fd_w4a8_quant_kernel (bit-exact with the separate kernels).
+// ---------------------------------------------------------------------------
+struct ActPrepRowSet {
+  const __half* theta;
+  const int16_t* pairs;
+  const __half* scales;
+  const float* igs;
+  int8_t* xq;
+  float* a_scale;
+};
+struct ActPrepRowSets { ActPrepRowSet s[3]; };
+
+struct ActPrepTileArgs {
+  int mode;
+  const void* src;
+  const void* src2;
+  int src_ld;
+  __nv_bfloat16* residual;
+  int res_ld;
+  const __nv_bfloat16* norm_w;
+  float eps;
+  ActPrepRowSets sets;
+  int n_sets;
+  int rows;
+  int K;
+  int span;       // channels per CTA (multiple of 128)
+};
+
+constexpr int kPrepThreads = 256;
+constexpr size_t kPrepSmemMax = 112 * 1024;   // dynamic shared memory per CTA the host plans with (two CTAs per SM)
+
+__host__ __device__ constexpr size_t fd_prep_smem_bytes(int span, int R) {
+  // xs chunks (+ one pad chunk per 8 channels), or the 256 partial sums of each row of the mode-1 reduction
+  const size_t xs = (size_t)(span * (R / 8) + span / 8) * 16;
+  const size_t part = (size_t)R * kPrepThreads * sizeof(float);
+  return xs > part ? xs : part;
+}
+
+__device__ __forceinline__ unsigned fd_pack2(__half lo, __half hi) {
+  return (unsigned)__half_as_ushort(lo) | ((unsigned)__half_as_ushort(hi) << 16);
+}
+__device__ __forceinline__ __half fd_lo(unsigned u) { return __ushort_as_half((unsigned short)(u & 0xFFFFu)); }
+__device__ __forceinline__ __half fd_hi(unsigned u) { return __ushort_as_half((unsigned short)(u >> 16)); }
+__device__ __forceinline__ __nv_bfloat16 fd_blo(unsigned u) { return __ushort_as_bfloat16((unsigned short)(u & 0xFFFFu)); }
+__device__ __forceinline__ __nv_bfloat16 fd_bhi(unsigned u) { return __ushort_as_bfloat16((unsigned short)(u >> 16)); }
+__device__ __forceinline__ unsigned fd_u4(const uint4& v, int k) {   // k is a compile-time constant after unrolling
+  return k == 0 ? v.x : k == 1 ? v.y : k == 2 ? v.z : v.w;
+}
+__device__ __forceinline__ __half fd_h8(const uint4& v, int q) { return q & 1 ? fd_hi(fd_u4(v, q >> 1)) : fd_lo(fd_u4(v, q >> 1)); }
+__device__ __forceinline__ __nv_bfloat16 fd_b8(const uint4& v, int q) {
+  return q & 1 ? fd_bhi(fd_u4(v, q >> 1)) : fd_blo(fd_u4(v, q >> 1));
+}
+__device__ __forceinline__ __half2 fd_u2h(unsigned u) { union { unsigned u; __half2 h; } c; c.u = u; return c.h; }
+__device__ __forceinline__ unsigned fd_h2u(__half2 h) { union { unsigned u; __half2 h; } c; c.h = h; return c.u; }
+__device__ __forceinline__ __half fd_prep_scale(__nv_bfloat16 v, __half sc) {
+  return __hmul(__float2half_rn(bf(v)), sc);
+}
+__device__ __forceinline__ __nv_bfloat16 fd_res_delta(__nv_bfloat16 r, __half d) {
+  return to_bf(__fadd_rn(bf(r), bf(to_bf(__half2float(d)))));
+}
+
+template <int R, bool kCluster>
+__global__ void __launch_bounds__(kPrepThreads) fd_w4a8_act_prep_tile_kernel(ActPrepTileArgs a) {
+  static_assert(R == 8 || R == 16, "tile rows: 8 or 16 (one or two 16-byte chunks per channel)");
+  constexpr int kChunks = R / 8;
+  fd_pdl_wait();
+  extern __shared__ __align__(16) unsigned char fd_tile_smem[];
+  uint4* xs4 = reinterpret_cast<uint4*>(fd_tile_smem);            // chunk (channel, ch) at slot channel*kChunks + ch + channel/8
+  float* part = reinterpret_cast<float*>(fd_tile_smem);           // [R][256] partial sums (mode 1, before xs is written)
+  __shared__ float red[32];
+  __shared__ float wmax[8][R];
+  __shared__ float rmax[R];
+  __shared__ float rall[R];
+  __shared__ float inv_s[R];
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int row0 = blockIdx.x * R;
+  const int nrow = min(R, a.rows - row0);
+  const int K = a.K, span = a.span;
+  const int c0 = blockIdx.y * span;
+  const int span_here = max(0, min(span, K - c0));
+  const int ng = span_here / kRotGroup;
+  const int nblk = span_here / 8;                                  // 8-channel blocks of the span
+  auto slot = [](int col, int ch) { return col * kChunks + ch + (col >> 3); };
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  cooperative_groups::cluster_group cluster = cooperative_groups::this_cluster();
+#endif
+  auto tile_sync = [&]() {
+    if constexpr (kCluster) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+      cluster.sync();
+#endif
+    } else {
+      __syncthreads();
+    }
+  };
+
+  for (int si = 0; si < a.n_sets; ++si) {
+    const ActPrepRowSet& st = a.sets.s[si];
+    // ---------------- producer -> xs (FP16, channel-scaled) ----------------
+    if (a.mode == 1) {
+      const bool with_delta = (si == 0) && a.src != nullptr;
+      const __half* dl = static_cast<const __half*>(a.src);
+      if (si == 0) {
+        // pass 1: sum of squares of every row of the tile over the whole row. Thread (chain c = tid % 32, row group
+        // tid / 32) keeps the 8 sequential partials of rms_f16delta's threads 8c..8c+7 (channels 8c + q + 256 k, k
+        // ascending), then the 256 partials of a row go through the same 256-thread tree.
+        const int chain = tid & 31, rg = tid >> 5;
+#pragma unroll
+        for (int h = 0; h < kChunks; ++h) {
+          const int m = rg + 8 * h;
+          float p[8];
+#pragma unroll
+          for (int q = 0; q < 8; ++q) p[q] = 0.0f;
+          if (m < nrow) {
+            const __nv_bfloat16* rrow = a.residual + (size_t)(row0 + m) * a.res_ld;
+            const __half* drow = with_delta ? dl + (size_t)(row0 + m) * a.src_ld : nullptr;
+            for (int k = 0; k < K; k += kPrepThreads) {
+              const int col = k + 8 * chain;
+              const uint4 rv = *reinterpret_cast<const uint4*>(rrow + col);
+              uint4 dv = make_uint4(0u, 0u, 0u, 0u);
+              if (with_delta) dv = *reinterpret_cast<const uint4*>(drow + col);
+#pragma unroll
+              for (int q = 0; q < 8; ++q) {
+                __nv_bfloat16 v = fd_b8(rv, q);
+                if (with_delta) v = fd_res_delta(v, fd_h8(dv, q));
+                const float f = bf(v);
+                p[q] += __fmul_rn(f, f);
+              }
+            }
+          }
+#pragma unroll
+          for (int q = 0; q < 8; ++q) part[m * kPrepThreads + 8 * chain + q] = p[q];
+        }
+        __syncthreads();
+        for (int m = 0; m < nrow; ++m) {
+          const float tot = block_sum256(part[m * kPrepThreads + tid], red);
+          if (tid == 0) inv_s[m] = rsqrtf(__fadd_rn(tot / (float)K, a.eps));
+        }
+        tile_sync();   // every CTA of the tile has read the residual (and part is dead) before any span is rewritten
+      }
+      // pass 2: own span -- residual update (first set), normalization, channel scale
+      for (int cb = tid; cb < nblk; cb += kPrepThreads) {
+        const int col = c0 + 8 * cb;
+#pragma unroll
+        for (int ch = 0; ch < kChunks; ++ch) {
+        const uint4 sc = *reinterpret_cast<const uint4*>(st.scales + col);
+        const uint4 wv = *reinterpret_cast<const uint4*>(a.norm_w + col);
+        uint4 rv[8];
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+          const int m = 8 * ch + r;
+          rv[r] = make_uint4(0u, 0u, 0u, 0u);
+          if (m < nrow) {
+            __nv_bfloat16* rp = a.residual + (size_t)(row0 + m) * a.res_ld + col;
+            rv[r] = *reinterpret_cast<const uint4*>(rp);
+            if (with_delta) {
+              const uint4 dv = *reinterpret_cast<const uint4*>(dl + (size_t)(row0 + m) * a.src_ld + col);
+              auto upd = [&](int k) {
+                const __nv_bfloat16 lo = fd_res_delta(fd_blo(fd_u4(rv[r], k)), fd_lo(fd_u4(dv, k)));
+                const __nv_bfloat16 hi = fd_res_delta(fd_bhi(fd_u4(rv[r], k)), fd_hi(fd_u4(dv, k)));
+                return (unsigned)__bfloat16_as_ushort(lo) | ((unsigned)__bfloat16_as_ushort(hi) << 16);
+              };
+              const uint4 nv = make_uint4(upd(0), upd(1), upd(2), upd(3));
+              rv[r] = nv;
+              *reinterpret_cast<uint4*>(rp) = nv;
+            }
+          }
+        }
+#pragma unroll
+        for (int q = 0; q < 8; ++q) {
+          const __half sq = fd_h8(sc, q);
+          const float w = bf(fd_b8(wv, q));
+          __half h[8];
+#pragma unroll
+          for (int r = 0; r < 8; ++r) {
+            const int m = 8 * ch + r;
+            const __nv_bfloat16 n1 = to_bf(__fmul_rn(bf(fd_b8(rv[r], q)), m < nrow ? inv_s[m] : 0.0f));
+            h[r] = fd_prep_scale(to_bf(__fmul_rn(w, bf(n1))), sq);
+          }
+          xs4[slot(8 * cb + q, ch)] = make_uint4(fd_pack2(h[0], h[1]), fd_pack2(h[2], h[3]), fd_pack2(h[4], h[5]),
+                                                fd_pack2(h[6], h[7]));
+        }
+        }
+      }
+    } else if (a.mode == 2) {
+      const __half* g = static_cast<const __half*>(a.src);
+      const __half* u = static_cast<const __half*>(a.src2);
+      for (int cb = tid; cb < nblk; cb += kPrepThreads) {
+        const int col = c0 + 8 * cb;
+#pragma unroll
+        for (int ch = 0; ch < kChunks; ++ch) {
+        const uint4 sc = *reinterpret_cast<const uint4*>(st.scales + col);
+        uint4 gv[8], uv[8];
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+          const int m = 8 * ch + r;
+          gv[r] = make_uint4(0u, 0u, 0u, 0u);
+          uv[r] = gv[r];
+          if (m < nrow) {
+            const size_t off = (size_t)(row0 + m) * a.src_ld + col;
+            gv[r] = *reinterpret_cast<const uint4*>(g + off);
+            uv[r] = *reinterpret_cast<const uint4*>(u + off);
+          }
+        }
+#pragma unroll
+        for (int q = 0; q < 8; ++q) {
+          const __half sq = fd_h8(sc, q);
+          __half h[8];
+#pragma unroll
+          for (int r = 0; r < 8; ++r) {
+            const float gb = bf(to_bf(__half2float(fd_h8(gv[r], q))));
+            const float ub = bf(to_bf(__half2float(fd_h8(uv[r], q))));
+            const float sl = bf(to_bf(gb / (1.0f + expf(-gb))));
+            h[r] = fd_prep_scale(to_bf(__fmul_rn(sl, ub)), sq);
+          }
+          xs4[slot(8 * cb + q, ch)] = make_uint4(fd_pack2(h[0], h[1]), fd_pack2(h[2], h[3]), fd_pack2(h[4], h[5]),
+                                                fd_pack2(h[6], h[7]));
+        }
+        }
+      }
+    } else {
+      const __nv_bfloat16* x = static_cast<const __nv_bfloat16*>(a.src);
+      for (int cb = tid; cb < nblk; cb += kPrepThreads) {
+        const int col = c0 + 8 * cb;
+#pragma unroll
+        for (int ch = 0; ch < kChunks; ++ch) {
+        const uint4 sc = *reinterpret_cast<const uint4*>(st.scales + col);
+        uint4 xv[8];
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+          const int m = 8 * ch + r;
+          xv[r] = make_uint4(0u, 0u, 0u, 0u);
+          if (m < nrow) xv[r] = *reinterpret_cast<const uint4*>(x + (size_t)(row0 + m) * a.src_ld + col);
+        }
+#pragma unroll
+        for (int q = 0; q < 8; ++q) {
+          const __half sq = fd_h8(sc, q);
+          __half h[8];
+#pragma unroll
+          for (int r = 0; r < 8; ++r) h[r] = fd_prep_scale(fd_b8(xv[r], q), sq);
+          xs4[slot(8 * cb + q, ch)] = make_uint4(fd_pack2(h[0], h[1]), fd_pack2(h[2], h[3]), fd_pack2(h[4], h[5]),
+                                                fd_pack2(h[6], h[7]));
+        }
+        }
+      }
+    }
+    __syncthreads();
+
+    // ---------------- rotation: warp per 128-channel group, 2 pairs per lane per layer ----------------
+    for (int gi = warp; gi < ng; gi += kPrepThreads / 32) {
+      const int gcol = c0 + gi * kRotGroup;
+      float th[kRotLayers][2];
+      int ij[kRotLayers][2];
+#pragma unroll
+      for (int r = 0; r < kRotLayers; ++r) {
+#pragma unroll
+        for (int p = 0; p < 2; ++p) {
+          const int pr = lane + 32 * p;
+          th[r][p] = __half2float(st.theta[(size_t)r * (K / 2) + gcol / 2 + pr]);
+          ij[r][p] = *reinterpret_cast<const int*>(st.pairs + (size_t)r * K + gcol + 2 * pr);
+        }
+      }
+      const int gl = gi * kRotGroup;      // span-local first channel of the group
+#pragma unroll
+      for (int r = 0; r < kRotLayers; ++r) {
+#pragma unroll
+        for (int p = 0; p < 2; ++p) {
+          const int i = gl + (ij[r][p] & 0xFFFF), j = gl + (ij[r][p] >> 16);
+          float s_, c_;
+          __sincosf(th[r][p], &s_, &c_);
+#pragma unroll
+          for (int ch = 0; ch < kChunks; ++ch) {
+            const uint4 vi = xs4[slot(i, ch)];
+            const uint4 vj = xs4[slot(j, ch)];
+            auto rot_i = [&](int k) {
+              const float2 xi = __half22float2(fd_u2h(fd_u4(vi, k)));
+              const float2 xj = __half22float2(fd_u2h(fd_u4(vj, k)));
+              return fd_h2u(__floats2half2_rn(fmaf(c_, xi.x, s_ * xj.x), fmaf(c_, xi.y, s_ * xj.y)));
+            };
+            auto rot_j = [&](int k) {
+              const float2 xi = __half22float2(fd_u2h(fd_u4(vi, k)));
+              const float2 xj = __half22float2(fd_u2h(fd_u4(vj, k)));
+              return fd_h2u(__floats2half2_rn(fmaf(c_, xj.x, -s_ * xi.x), fmaf(c_, xj.y, -s_ * xi.y)));
+            };
+            xs4[slot(i, ch)] = make_uint4(rot_i(0), rot_i(1), rot_i(2), rot_i(3));
+            xs4[slot(j, ch)] = make_uint4(rot_j(0), rot_j(1), rot_j(2), rot_j(3));
+          }
+        }
+        __syncwarp();
+      }
+    }
+    __syncthreads();
+
+    // ---------------- row absmax over the span ----------------
+    {
+      float mx[R];
+#pragma unroll
+      for (int m = 0; m < R; ++m) mx[m] = 0.0f;
+      for (int cb = tid; cb < nblk; cb += kPrepThreads) {
+#pragma unroll
+        for (int ch = 0; ch < kChunks; ++ch) {
+#pragma unroll
+        for (int q = 0; q < 8; ++q) {
+          const uint4 v = xs4[slot(8 * cb + q, ch)];
+#pragma unroll
+          for (int k = 0; k < 4; ++k) {
+            const float2 f = __half22float2(fd_u2h(fd_u4(v, k)));
+            mx[8 * ch + 2 * k] = fmaxf(mx[8 * ch + 2 * k], fabsf(f.x));
+            mx[8 * ch + 2 * k + 1] = fmaxf(mx[8 * ch + 2 * k + 1], fabsf(f.y));
+          }
+        }
+        }
+      }
+#pragma unroll
+      for (int m = 0; m < R; ++m) {
+        float v = mx[m];
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+        if (lane == 0) wmax[warp][m] = v;
+      }
+      __syncthreads();
+      if (tid < R) {
+        float v = 0.0f;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) v = fmaxf(v, wmax[w][tid]);
+        rmax[tid] = v;
+      }
+      if constexpr (kCluster) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+        cluster.sync();
+        if (tid < R) {
+          float v = 0.0f;
+          for (unsigned rk = 0; rk < cluster.num_blocks(); ++rk) v = fmaxf(v, *cluster.map_shared_rank(&rmax[tid], rk));
+          rall[tid] = v;
+        }
+        cluster.sync();   // peers are done reading rmax before the next set rewrites it
+#endif
+      } else {
+        __syncthreads();
+        if (tid < R) rall[tid] = rmax[tid];
+        __syncthreads();
+      }
+    }
+
+    // ---------------- INT8 quantization straight from shared memory ----------------
+    {
+      float inv[R], amax[R];
+#pragma unroll
+      for (int m = 0; m < R; ++m) {
+        amax[m] = fmaxf(rall[m], 1e-10f);
+        inv[m] = div_full(127.0f, amax[m]);
+      }
+      for (int cb = tid; cb < nblk; cb += kPrepThreads) {
+        const int col = c0 + 8 * cb;
+#pragma unroll
+        for (int ch = 0; ch < kChunks; ++ch) {
+        uint4 v[8];
+#pragma unroll
+        for (int q = 0; q < 8; ++q) v[q] = xs4[slot(8 * cb + q, ch)];
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+          const int m = 8 * ch + r;
+          if (m < nrow) {
+            unsigned lo = 0u, hi = 0u;
+#pragma unroll
+            for (int q = 0; q < 8; ++q) {
+              const unsigned u = fd_u4(v[q], r >> 1);
+              const float f = __half2float(r & 1 ? fd_hi(u) : fd_lo(u));
+              const unsigned b = (unsigned)(static_cast<int>(round_half_away_triton(__fmul_rn(inv[m], f))) & 0xFF);
+              if (q < 4) lo |= b << (8 * q); else hi |= b << (8 * (q - 4));
+            }
+            *reinterpret_cast<uint2*>(st.xq + (size_t)(row0 + m) * K + col) = make_uint2(lo, hi);
+          }
+        }
+        }
+      }
+      if (blockIdx.y == 0 && tid < nrow) st.a_scale[row0 + tid] = __fmul_rn(div_full(amax[tid], 127.0f), *st.igs);
+    }
+    __syncthreads();   // xs is rewritten by the next set's producer
+  }
+  fd_pdl_trigger();
+}
+
 }  // namespace
 
 int flashdrive_qk_prep_bf16(const void* q, const void* k, const void* v, int q_ld, int k_ld, int v_ld,
@@ -1450,6 +1883,71 @@ int flashdrive_bf16_gemm_frag(const void* x, int ld_x, const void* w_frag, void*
     else { if (ks == 1) FD_FRAG(2, 1, false); else if (ks == 2) FD_FRAG(2, 2, false); else FD_FRAG(2, 4, false); }
   }
 #undef FD_FRAG
+  return cudaPeekAtLastError() == cudaSuccess ? 0 : 4;
+}
+
+namespace {
+template <int R, bool kCluster>
+int fd_prep_tile_launch(const ActPrepTileArgs& a, int tiles, int C, size_t smem, cudaStream_t stream) {
+  static size_t configured = 0;
+  if (smem > configured) {
+    if (cudaFuncSetAttribute(fd_w4a8_act_prep_tile_kernel<R, kCluster>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             (int)kPrepSmemMax) != cudaSuccess)
+      return 6;
+    configured = kPrepSmemMax;
+  }
+  return fd_launch_cluster(fd_w4a8_act_prep_tile_kernel<R, kCluster>, dim3(tiles, C), dim3(kPrepThreads), smem, stream,
+                           (unsigned)C, a) == cudaSuccess ? 0 : 4;
+}
+}  // namespace
+
+int flashdrive_w4a8_act_prep_tile(int mode, const void* src, const void* src2, int src_ld, void* residual, int res_ld,
+                                  const void* norm_w, float eps, int rows, int K, int n_sets, const void* const* theta,
+                                  const void* const* pairs, const void* const* scales, const float* const* igs,
+                                  void* const* xq, float* const* a_scale, int tile_rows, int cluster,
+                                  cudaStream_t stream) {
+  if (rows <= 0 || K <= 0 || (K % kRotGroup) != 0 || n_sets < 1 || n_sets > 3) return 2;
+  if (mode < 0 || mode > 2 || (mode != 1 && !src) || (mode == 1 && (!residual || !norm_w)) || (mode == 2 && !src2)) return 1;
+  if (mode == 1 ? (res_ld < K || (src && src_ld < K)) : src_ld < K) return 2;
+  if (tile_rows != 0 && tile_rows != 8 && tile_rows != 16) return 2;
+  if (cluster < 0 || cluster > 8) return 2;
+  ActPrepTileArgs a{};
+  for (int i = 0; i < n_sets; ++i) {
+    if (!theta[i] || !pairs[i] || !scales[i] || !igs[i] || !xq[i] || !a_scale[i]) return 1;
+    if ((reinterpret_cast<uintptr_t>(pairs[i]) & 3u) != 0) return 5;
+    a.sets.s[i] = ActPrepRowSet{static_cast<const __half*>(theta[i]), static_cast<const int16_t*>(pairs[i]),
+                                static_cast<const __half*>(scales[i]), igs[i], static_cast<int8_t*>(xq[i]), a_scale[i]};
+  }
+  const int ng = K / kRotGroup;
+  const int R = tile_rows ? tile_rows : 8;
+  auto smem_of = [&](int C) { return fd_prep_smem_bytes(((ng + C - 1) / C) * kRotGroup, R); };
+  auto covers = [&](int C) { return (C - 1) * ((ng + C - 1) / C) < ng; };   // every CTA of the cluster owns a group
+  int C = cluster;
+  if (C == 0) {
+    if (rows <= R) {                 // one tile: spread it over as many SMs as the groups allow
+      for (C = 8; C > 1; --C)
+        if (covers(C) && smem_of(C) <= kPrepSmemMax) break;
+    } else {                         // many tiles: the fewest CTAs per tile whose span fits
+      for (C = 1; C <= 8; ++C)
+        if (covers(C) && smem_of(C) <= kPrepSmemMax) break;
+      if (C > 8) return 2;
+    }
+  }
+  if (!covers(C)) return 2;
+  const size_t smem = smem_of(C);
+  if (smem > kPrepSmemMax) return 2;
+  if (((reinterpret_cast<uintptr_t>(src) | reinterpret_cast<uintptr_t>(src2) | reinterpret_cast<uintptr_t>(residual) |
+        reinterpret_cast<uintptr_t>(norm_w)) & 15u) != 0 || (src_ld % 8) != 0 || (res_ld % 8) != 0)
+    return 5;                                   // 16-byte loads of 8 channels
+  a.mode = mode; a.src = src; a.src2 = src2; a.src_ld = src_ld;
+  a.residual = static_cast<__nv_bfloat16*>(residual); a.res_ld = res_ld;
+  a.norm_w = static_cast<const __nv_bfloat16*>(norm_w); a.eps = eps;
+  a.n_sets = n_sets; a.rows = rows; a.K = K; a.span = ((ng + C - 1) / C) * kRotGroup;
+  const int tiles = (rows + R - 1) / R;
+  int rc;
+  if (R == 16) rc = C > 1 ? fd_prep_tile_launch<16, true>(a, tiles, C, smem, stream) : fd_prep_tile_launch<16, false>(a, tiles, C, smem, stream);
+  else         rc = C > 1 ? fd_prep_tile_launch<8, true>(a, tiles, C, smem, stream) : fd_prep_tile_launch<8, false>(a, tiles, C, smem, stream);
+  if (rc) return rc;
   return cudaPeekAtLastError() == cudaSuccess ? 0 : 4;
 }
 

@@ -168,5 +168,20 @@ int flashdrive_w4a8_gemm_tile(const void* xq, const float* a_scale, const void* 
 int flashdrive_bf16_gemm_frag(const void* x, int ld_x, const void* w_frag, void* y, int ld_y, int y_f32, int M, int N,
                               int K, cudaStream_t stream);
 
+// Fused producer + W4A8 activation preparation for tiles of 8 or 16 rows (any row count: the streaming-window
+// prefill as well as the verification block). The consumer kernel of a GEMM output -- mode 0: bf16 rows src; mode 1:
+// residual (bf16, leading dim res_ld) += bf16(delta fp16 = src) (skipped when src is null) then Qwen3 RMSNorm * norm_w
+// (the rms_f16delta / rms_bf16 contract, residual updated in place); mode 2: bf16(silu(bf16 src)) * bf16(src2) from
+// fp16 halves (the silu_mul_f16in contract) -- followed, for each of n_sets rotation sets, by the ParoQuant rotation and
+// per-token INT8 quantization, bit-exact with flashdrive_w4a8_act_prep on the producer's output. Same set arguments
+// as flashdrive_w4a8_act_prep without the FP16 / partial workspaces; leading dims in elements; K % 128 == 0.
+// tile_rows (0 = default, 8 or 16) rows per CTA; cluster (0 = automatic, 1..8) CTAs per tile, each owning a span of
+// K; clusters of more than one CTA exchange the row absmax through distributed shared memory.
+int flashdrive_w4a8_act_prep_tile(int mode, const void* src, const void* src2, int src_ld, void* residual, int res_ld,
+                                  const void* norm_w, float eps, int rows, int K, int n_sets, const void* const* theta,
+                                  const void* const* pairs, const void* const* scales, const float* const* igs,
+                                  void* const* xq, float* const* a_scale, int tile_rows, int cluster,
+                                  cudaStream_t stream);
+
 }  // namespace kernels
 }  // namespace flash_rt
