@@ -47,7 +47,12 @@ head) with BF16 activations and FP32 accumulation. Decode is weight-streaming
 bound, so this halves its bytes; INT8 carries about 4x less weight error than
 E4M3 for the same bytes. The expert still attends over the reasoning-token K/V
 written by those projections, so trajectories can move even when the sampled
-tokens are identical. ``expert_weights="fp8"`` runs the diffusion expert's
+tokens are identical. ``decode_weights="w4a8"`` instead runs the decode
+projections as ParoQuant W4A8 linears from the ``z-lab/Alpamayo-1.5-10B-PARO``
+checkpoint (``paro_checkpoint``): learned pairwise rotations of the activations,
+per-token INT8 activations, UINT4 weights with zero points and integer group
+scales (Marlin's arithmetic on FlashRT's few-row kernels), the LM head as INT8;
+about a quarter of the BF16 weight stream. ``expert_weights="fp8"`` runs the diffusion expert's
 projections as W8A8 (per-row FP8 activations and weights, scales applied in
 the GEMM epilogue), halving its weight stream; ``prefill_weights="fp8"`` does
 the same for the 36 prefill layers on 2-SM tcgen05 tiles.
@@ -82,19 +87,25 @@ ALPAMAYO15_KERNEL_SYMBOLS = (
     "alpamayo15_quantize_fp8_rows_bf16",
     "alpamayo15_rms_fp8_rows_bf16",
     "alpamayo15_silu_mul_fp8_rows_bf16",
+    "alpamayo15_res_rms_f32_fp8_rows_bf16",
+    "alpamayo15_layernorm_fp8_rows_bf16",
+    "alpamayo15_set_pdl",
     # tcgen05 GEMMs (csrc/gemm/alpamayo15_bf16_gemm_sm100.cu), same build gate
     "alpamayo15_bf16_gemm_sm100",
     "alpamayo15_bf16_gemm_sm100_workspace",
     "alpamayo15_fp8_gemm_sm100",
     "alpamayo15_fp8_gemm_sm100_workspace",
+    "alpamayo15_fp8_gemm_act_sm100",
+    "alpamayo15_fp8_gemm_act_sm100_workspace",
     "alpamayo15_int8_gemm_sm100",
     "alpamayo15_int8_gemm_sm100_workspace",
 )
 GEMM_BACKENDS = ("cutlass", "torch")         # BF16 GEMMs of the vision tower and the action expert
 VISION_TILE = 2                              # tcgen05 tile of the vision GEMMs: 256 x 128 on a 2-SM UMMA
-DECODE_WEIGHTS = ("bf16", "fp8", "int8")
+DECODE_WEIGHTS = ("bf16", "fp8", "int8", "w4a8")
 EXPERT_WEIGHTS = ("bf16", "fp8")
 PREFILL_WEIGHTS = ("bf16", "fp8")
+VISION_WEIGHTS = ("bf16", "fp8")
 PREFILL_FP8_TILE = 2        # FP8 prefill GEMMs: 256 x 128 x 128 tiles on a 2-SM UMMA
 PREFILL_DOWN_SPLIT = 4      # the K=12288 down projection as 4 column blocks (weight blocks that fit the L2: 1.47 vs 3.9 ms)
 
@@ -299,6 +310,24 @@ class _Gemm:
                                             ws.data_ptr(), ws.numel(), torch.cuda.current_stream().cuda_stream, tile, D.stride(0))
         return D
 
+    def fp8_act(self, A8: torch.Tensor, a_s: torch.Tensor, W8: torch.Tensor, w_s: torch.Tensor, D: torch.Tensor,
+                bias: torch.Tensor | None = None, C: torch.Tensor | None = None, act: int = 0) -> torch.Tensor:
+        """``D = act((A8 @ W8.T) * a_s[m] * w_s[n] + bias[n]) (+ C)`` on the 2-SM FP8 GEMM (vision tier); C / D row-major
+        blocks of one leading dimension; act 0 identity, 1 GELU tanh, 2 GELU erf (residual with identity only)."""
+        M, K = A8.shape
+        N = W8.shape[0]
+        key = ("fp8act", M, N, K, act, C is not None)
+        ws = self._ws.get(key)
+        if ws is None:
+            nbytes = self._fvk.alpamayo15_fp8_gemm_act_sm100_workspace(M, N, K, act, int(C is not None))
+            ws = torch.empty(max(int(nbytes), 16), dtype=torch.uint8, device=DEV)
+            self._ws[key] = ws
+        self._fvk.alpamayo15_fp8_gemm_act_sm100(A8.data_ptr(), W8.data_ptr(), a_s.data_ptr(), w_s.data_ptr(),
+                                                bias.data_ptr() if bias is not None else 0, C.data_ptr() if C is not None else 0,
+                                                D.data_ptr(), M, N, K, act, D.stride(0), ws.data_ptr(), ws.numel(),
+                                                torch.cuda.current_stream().cuda_stream)
+        return D
+
 
 class Alpamayo15Thor:
     """Static-buffer CUDA-graph engine for one official Alpamayo 1.5 model.
@@ -322,12 +351,24 @@ class Alpamayo15Thor:
             faster than the tcgen05 BF16 GEMM at those shapes on Thor.
         decode_weights: ``"bf16"`` (official weights), ``"fp8"`` or ``"int8"``
             (opt-in per-row copies for the reasoning-decode projections and the
-            LM head; about +7.6 GB, changes decode numerics - see module notes).
+            LM head; about +7.6 GB, changes decode numerics - see module notes),
+            or ``"w4a8"`` (the ParoQuant W4A8 linears of ``paro_checkpoint`` for
+            the projections, INT8 for the LM head; about +4.9 GB).
+        paro_checkpoint: directory of the ``z-lab/Alpamayo-1.5-10B-PARO``
+            safetensors (``decode_weights="w4a8"`` only).
+        pdl: launch the engine's kernels and GEMMs with programmatic dependent
+            launch (a kernel's prologue overlaps its predecessor's tail inside
+            the CUDA graphs). Process-wide switch shared with the FlashDrive
+            backend; off by default.
         expert_weights: ``"bf16"`` (official weights) or ``"fp8"`` (opt-in W8A8
             expert projections; about +4.6 GB, changes expert numerics).
         prefill_weights: ``"bf16"`` (official weights on cuBLAS) or ``"fp8"``
             (opt-in W8A8 prefill projections on the FP8 tcgen05 GEMM; about
             +7.6 GB, changes the prompt K/V and therefore every later token).
+        vision_weights: ``"bf16"`` or ``"fp8"`` (opt-in W8A8 vision blocks: qkv,
+            proj, fc1 and fc2 with per-row FP8 activations, bias / GELU /
+            residual in the epilogue; patch embedding and mergers stay BF16;
+            about +0.45 GB, changes the image features).
     """
 
     def __init__(
@@ -348,17 +389,26 @@ class Alpamayo15Thor:
         expert_gemm: str = "cutlass",
         expert_weights: str = "bf16",
         prefill_weights: str = "bf16",
+        vision_weights: str = "bf16",
+        paro_checkpoint: str | None = None,
+        pdl: bool = False,
     ) -> None:
         if prefill not in ("native", "official"):
             raise ValueError(f"unknown prefill {prefill!r}")
         if decode_weights not in DECODE_WEIGHTS:
             raise ValueError(f"unknown decode_weights {decode_weights!r}; choose from {DECODE_WEIGHTS}")
         if decode_weights != "bf16" and max_samples > 16:
-            raise ValueError(f"decode_weights={decode_weights!r} supports max_samples <= 16 (the W8A16 kernel serves up to 16 rows)")
+            raise ValueError(f"decode_weights={decode_weights!r} supports max_samples <= 16 (the few-row kernels serve up to 16 rows)")
+        if (decode_weights == "w4a8") != (paro_checkpoint is not None):
+            raise ValueError("decode_weights='w4a8' takes the ParoQuant checkpoint directory as paro_checkpoint (and only then)")
         if expert_weights not in EXPERT_WEIGHTS:
             raise ValueError(f"unknown expert_weights {expert_weights!r}; choose from {EXPERT_WEIGHTS}")
         if prefill_weights not in PREFILL_WEIGHTS:
             raise ValueError(f"unknown prefill_weights {prefill_weights!r}; choose from {PREFILL_WEIGHTS}")
+        if vision_weights not in VISION_WEIGHTS:
+            raise ValueError(f"unknown vision_weights {vision_weights!r}; choose from {VISION_WEIGHTS}")
+        if vision_weights == "fp8" and vision_gemm != "cutlass":
+            raise ValueError("vision_weights='fp8' runs on the FlashRT GEMMs (vision_gemm='cutlass')")
         for name, choice in (("vision_gemm", vision_gemm), ("expert_gemm", expert_gemm)):
             if choice not in GEMM_BACKENDS:
                 raise ValueError(f"unknown {name} {choice!r}; choose from {GEMM_BACKENDS}")
@@ -411,8 +461,10 @@ class Alpamayo15Thor:
         self.prefill_impl = prefill
         self.decode_weights = decode_weights
         self.vision_gemm, self.expert_gemm = vision_gemm, expert_gemm
-        self.expert_weights, self.prefill_weights = expert_weights, prefill_weights
+        self.expert_weights, self.prefill_weights, self.vision_weights = expert_weights, prefill_weights, vision_weights
         self._gemm = _Gemm(fvk)
+        self.pdl = bool(pdl)
+        fvk.alpamayo15_set_pdl(self.pdl)
         self.max_seq = self.max_prompt + self.max_new + self.n_act
         self.scale = self.head_dim ** -0.5
 
@@ -462,9 +514,12 @@ class Alpamayo15Thor:
         self._expert_graphs: dict[int, torch.cuda.CUDAGraph] = {}
 
         self._fuse_weights()
-        self._q8 = self._quantize_decode_weights(decode_weights) if decode_weights != "bf16" else None
+        self._q8 = self._quantize_decode_weights("int8" if decode_weights == "w4a8" else decode_weights) \
+            if decode_weights != "bf16" else None
+        self._w4 = self._load_w4a8_decode(paro_checkpoint) if decode_weights == "w4a8" else None
         self._e8 = self._quantize_expert_weights() if expert_weights == "fp8" else None
         self._p8 = self._quantize_prefill_weights() if prefill_weights == "fp8" else None
+        self._v8 = self._quantize_vision_weights() if vision_weights == "fp8" else None
         self._pf = None
         self._db = None
         self._eb = None
@@ -511,17 +566,41 @@ class Alpamayo15Thor:
 
     @torch.no_grad()
     def _quantize_decode_weights(self, fmt: str) -> dict:
-        """Per-row FP8 or INT8 fragment copies of the decode projections (the BF16 originals stay for prefill)."""
+        """Per-row FP8 or INT8 fragment copies of the decode projections (the BF16 originals stay for prefill); with
+        the W4A8 tier only the LM head."""
         quant = quantize_int8_rows if fmt == "int8" else quantize_fp8_rows
         q8 = {"qkv": [], "o": [], "gu": [], "down": [], "fmt": 1 if fmt == "int8" else 0}
-        for li, layer in enumerate(self.lm.layers):
-            q8["qkv"].append(fp8_fragment_layout(*quant(self.w_qkv[li])))
-            q8["o"].append(fp8_fragment_layout(*quant(layer.self_attn.o_proj.weight)))
-            q8["gu"].append(fp8_fragment_layout(*quant(self.w_gu[li])))
-            q8["down"].append(fp8_fragment_layout(*quant(layer.mlp.down_proj.weight)))
+        if self.decode_weights != "w4a8":
+            for li, layer in enumerate(self.lm.layers):
+                q8["qkv"].append(fp8_fragment_layout(*quant(self.w_qkv[li])))
+                q8["o"].append(fp8_fragment_layout(*quant(layer.self_attn.o_proj.weight)))
+                q8["gu"].append(fp8_fragment_layout(*quant(self.w_gu[li])))
+                q8["down"].append(fp8_fragment_layout(*quant(layer.mlp.down_proj.weight)))
         q8["lm_head"] = fp8_fragment_layout(*quant(self.vlm.lm_head.weight))
         torch.cuda.empty_cache()
         return q8
+
+    @torch.no_grad()
+    def _load_w4a8_decode(self, path: str) -> list[dict]:
+        """The ParoQuant W4A8 linears of every layer as decode groups (q|k|v, o, gate|up, down)."""
+        from flash_rt.models.alpamayo15.marlin_w4a8 import W4A8DecodeGroup, load_paro_language_model
+        missing = [n for n in ("flashdrive_w4a8_act_prep", "flashdrive_w4a8_gemm_tile", "flashdrive_w4a8_gemm_small")
+                   if not hasattr(self._fvk, n)]
+        if missing:
+            raise RuntimeError(f"FlashRT was built without the W4A8 few-row kernels ({', '.join(missing)})")
+        layers = load_paro_language_model(path, self.n_layers)
+        H, F_ = self.hidden, self.ffn
+        groups, maps = [], {}
+        for li, lin in enumerate(layers):
+            if lin["q_proj"]["N"] != self.n_heads * self.head_dim or lin["k_proj"]["N"] != self.n_kv * self.head_dim \
+                    or lin["q_proj"]["K"] != H or lin["gate_proj"]["N"] != F_ or lin["down_proj"]["K"] != F_:
+                raise ValueError(f"layer {li}: ParoQuant linear shapes do not match the model")
+            grp = lambda names: W4A8DecodeGroup(self._fvk, [lin[n] for n in names], self.max_samples, maps)
+            groups.append({"qkv": grp(("q_proj", "k_proj", "v_proj")), "o": grp(("o_proj",)),
+                           "gu": grp(("gate_proj", "up_proj")), "down": grp(("down_proj",))})
+        del maps
+        torch.cuda.empty_cache()
+        return groups
 
     @torch.no_grad()
     def _quantize_expert_weights(self) -> list:
@@ -551,10 +630,26 @@ class Alpamayo15Thor:
         torch.cuda.empty_cache()
         return p8
 
+    @torch.no_grad()
+    def _quantize_vision_weights(self) -> list:
+        """Per-row FP8 E4M3 copies of every vision block's qkv / proj / fc1 / fc2 weights."""
+        v8 = []
+        for blk in self.vlm.model.visual.blocks:
+            q = {}
+            for name, lin in (("qkv", blk.attn.qkv), ("proj", blk.attn.proj), ("fc1", blk.mlp.linear_fc1), ("fc2", blk.mlp.linear_fc2)):
+                codes, scale = quantize_fp8_rows(lin.weight)
+                q[name] = (codes.contiguous(), scale.contiguous())
+            v8.append(q)
+        torch.cuda.empty_cache()
+        return v8
+
     def _proj(self, x: torch.Tensor, w: torch.Tensor, key: str, li: int, out: torch.Tensor, stream: int) -> None:
-        """``out = x @ w.T`` from the BF16 weight or, in the FP8 / INT8 tier, its fragment copy."""
+        """``out = x @ w.T`` from the BF16 weight or, in the FP8 / INT8 / W4A8 tiers, its quantized form."""
         if self._q8 is None:
             torch.mm(x, w.t(), out=out)
+            return
+        if self._w4 is not None and li >= 0:
+            self._w4[li][key](x, out, stream)
             return
         frag, scale = self._q8[key][li] if li >= 0 else self._q8[key]
         if not (x.is_contiguous() and out.is_contiguous() and x.shape[0] == out.shape[0]):
@@ -702,22 +797,43 @@ class Alpamayo15Thor:
         L = t * gh * gw
         h = torch.empty(S, Din, device=DEV, dtype=BF16)
         qkv = torch.empty(S, 3 * Din, device=DEV, dtype=BF16)
-        f1 = torch.empty(S, V.blocks[0].mlp.linear_fc1.weight.shape[0], device=DEV, dtype=BF16)
+        Ffc = V.blocks[0].mlp.linear_fc1.weight.shape[0]
+        f1 = torch.empty(S, Ffc, device=DEV, dtype=BF16)
         x2 = torch.empty_like(x)
+        v8 = getattr(self, "_v8", None)
+        if v8 is not None:              # W8A8 blocks: FP8 rows of the LayerNorm outputs, the attention output and GELU(fc1)
+            u8 = lambda *shape: torch.empty(*shape, device=DEV, dtype=torch.uint8)
+            f32 = lambda n: torch.empty(n, device=DEV, dtype=torch.float32)
+            h8, h_s, o8, o_s, f18, f1_s = u8(S, Din), f32(S), u8(S, Din), f32(S), u8(S, Ffc), f32(S)
         deep = []
         for li, blk in enumerate(V.blocks):
             a, m = blk.attn, blk.mlp
-            fvk.alpamayo15_layernorm_bf16(x.data_ptr(), blk.norm1.weight.data_ptr(), blk.norm1.bias.data_ptr(), h.data_ptr(),
-                                          S, Din, blk.norm1.eps, s)
-            g(h, a.qkv.weight, qkv, bias=a.qkv.bias, tile=T)
+            if v8 is None:
+                fvk.alpamayo15_layernorm_bf16(x.data_ptr(), blk.norm1.weight.data_ptr(), blk.norm1.bias.data_ptr(), h.data_ptr(),
+                                              S, Din, blk.norm1.eps, s)
+                g(h, a.qkv.weight, qkv, bias=a.qkv.bias, tile=T)
+            else:
+                fvk.alpamayo15_layernorm_fp8_rows_bf16(x.data_ptr(), blk.norm1.weight.data_ptr(), blk.norm1.bias.data_ptr(),
+                                                       h8.data_ptr(), h_s.data_ptr(), S, Din, blk.norm1.eps, s)
+                g.fp8_act(h8, h_s, *v8[li]["qkv"], qkv, bias=a.qkv.bias)
             fvk.alpamayo15_vision_rope_qk_bf16(qkv.data_ptr(), cos.data_ptr(), sin.data_ptr(), S, nh, hd, s)
             q, k, v = qkv.view(S, 3, nh, hd).unbind(1)
             o, _ = self._fa4(*(z.view(n_img, L, nh, hd) for z in (q, k, v)), softmax_scale=a.scaling, causal=False)
-            g(o.reshape(S, Din), a.proj.weight, x2, bias=a.proj.bias, C=x, tile=T)     # x2 = x + proj(o)
-            fvk.alpamayo15_layernorm_bf16(x2.data_ptr(), blk.norm2.weight.data_ptr(), blk.norm2.bias.data_ptr(), h.data_ptr(),
-                                          S, Din, blk.norm2.eps, s)
-            g(h, m.linear_fc1.weight, f1, bias=m.linear_fc1.bias, act=1, tile=T)
-            g(f1, m.linear_fc2.weight, x, bias=m.linear_fc2.bias, C=x2, tile=T)         # x = x2 + fc2(gelu(fc1(h)))
+            o = o.reshape(S, Din)
+            if v8 is None:
+                g(o, a.proj.weight, x2, bias=a.proj.bias, C=x, tile=T)                   # x2 = x + proj(o)
+                fvk.alpamayo15_layernorm_bf16(x2.data_ptr(), blk.norm2.weight.data_ptr(), blk.norm2.bias.data_ptr(), h.data_ptr(),
+                                              S, Din, blk.norm2.eps, s)
+                g(h, m.linear_fc1.weight, f1, bias=m.linear_fc1.bias, act=1, tile=T)
+                g(f1, m.linear_fc2.weight, x, bias=m.linear_fc2.bias, C=x2, tile=T)     # x = x2 + fc2(gelu(fc1(h)))
+            else:
+                fvk.alpamayo15_quantize_fp8_rows_bf16(o.data_ptr(), Din, o8.data_ptr(), o_s.data_ptr(), S, Din, s)
+                g.fp8_act(o8, o_s, *v8[li]["proj"], x2, bias=a.proj.bias, C=x)
+                fvk.alpamayo15_layernorm_fp8_rows_bf16(x2.data_ptr(), blk.norm2.weight.data_ptr(), blk.norm2.bias.data_ptr(),
+                                                       h8.data_ptr(), h_s.data_ptr(), S, Din, blk.norm2.eps, s)
+                g.fp8_act(h8, h_s, *v8[li]["fc1"], f1, bias=m.linear_fc1.bias, act=1)
+                fvk.alpamayo15_quantize_fp8_rows_bf16(f1.data_ptr(), Ffc, f18.data_ptr(), f1_s.data_ptr(), S, Ffc, s)
+                g.fp8_act(f18, f1_s, *v8[li]["fc2"], x, bias=m.linear_fc2.bias, C=x2)
             if li in V.deepstack_visual_indexes:
                 deep.append(self._merger(V.deepstack_merger_list[V.deepstack_visual_indexes.index(li)], x, S, Din))
         return self._merger(V.merger, x, S, Din), deep
@@ -1036,13 +1152,24 @@ class Alpamayo15Thor:
         e8 = self._e8
         cut = self.expert_gemm == "cutlass"
 
-        def lin(src, akey, w, wname, li, out):
+        def norm(delta, w):
+            """``hn = RMSNorm(res += delta) * w`` on the FP32 residual; the W8A8 tier writes hn's FP8 rows directly."""
+            if e8 is None:
+                fvk.alpamayo15_res_rms_f32_bf16(res.data_ptr(), delta.data_ptr() if delta is not None else 0, w.data_ptr(),
+                                                hn.data_ptr(), rows, E, eps, s)
+            else:
+                fvk.alpamayo15_res_rms_f32_fp8_rows_bf16(res.data_ptr(), delta.data_ptr() if delta is not None else 0,
+                                                         w.data_ptr(), b["hn8"].data_ptr(), b["hn_s"].data_ptr(), rows, E, eps, s)
+
+        def lin(src, akey, w, wname, li, out, quantized=False):
             """``out = src @ w.T``: tcgen05 / cuBLAS on the BF16 weight, or (W8A8 tier) per-row FP8 rows of ``src``
-            (buffers ``akey``) times the FP8 copy ``wname`` of layer ``li``, scales applied in the epilogue."""
+            (buffers ``akey``, written by the producer when ``quantized``) times the FP8 copy ``wname`` of layer
+            ``li``, scales applied in the epilogue."""
             if e8 is not None:
                 q8, q_s = b[akey + "8"][:rows], b[akey + "_s"][:rows]
-                fvk.alpamayo15_quantize_fp8_rows_bf16(src.data_ptr(), src.stride(0), q8.data_ptr(), q_s.data_ptr(), rows,
-                                                      src.shape[1], s)
+                if not quantized:
+                    fvk.alpamayo15_quantize_fp8_rows_bf16(src.data_ptr(), src.stride(0), q8.data_ptr(), q_s.data_ptr(), rows,
+                                                          src.shape[1], s)
                 w8, w_s = e8[li][wname]
                 self._gemm.fp8(q8, q_s, w8, w_s, out)
             elif cut:
@@ -1050,11 +1177,10 @@ class Alpamayo15Thor:
             else:
                 torch.mm(src, w.t(), out=out)
         res.copy_(m.action_in_proj(x, t).view(rows, E))                 # fp32 residual stream
-        fvk.alpamayo15_res_rms_f32_bf16(res.data_ptr(), 0, layers[0].input_layernorm.weight.data_ptr(),
-                                        hn.data_ptr(), rows, E, eps, s)
+        norm(None, layers[0].input_layernorm.weight)
         for li, layer in enumerate(layers):
             a = layer.self_attn
-            lin(hn, "hn", self.e_w_qkv[li], "qkv", li, qkv)
+            lin(hn, "hn", self.e_w_qkv[li], "qkv", li, qkv, quantized=True)
             fvk.alpamayo15_expert_qk_prep_bf16(
                 qkv.data_ptr(), a.q_norm.weight.data_ptr(), a.k_norm.weight.data_ptr(),
                 self.e_cos.data_ptr(), self.e_sin.data_ptr(), q.data_ptr(),
@@ -1062,14 +1188,19 @@ class Alpamayo15Thor:
                 rows, HQ, KV, KV * D, A, S, eps, s)
             attn = self._attend(li, q.view(rows, HQ, D), n, A, self.d_eseq, self.d_esuf, self.expert_splits)
             lin(attn, "attn", a.o_proj.weight, "o", li, o)
-            fvk.alpamayo15_res_rms_f32_bf16(res.data_ptr(), o.data_ptr(),
-                                            layer.post_attention_layernorm.weight.data_ptr(),
-                                            hn.data_ptr(), rows, E, eps, s)
-            lin(hn, "hn", self.e_w_gu[li], "gu", li, gu)
-            fvk.alpamayo15_silu_mul_split_bf16(gu.data_ptr(), gu[:, ff:].data_ptr(), 2 * ff, act.data_ptr(), rows, ff, s)
-            lin(act, "a", layer.mlp.down_proj.weight, "down", li, d)
+            norm(o, layer.post_attention_layernorm.weight)
+            lin(hn, "hn", self.e_w_gu[li], "gu", li, gu, quantized=True)
+            if e8 is None:
+                fvk.alpamayo15_silu_mul_split_bf16(gu.data_ptr(), gu[:, ff:].data_ptr(), 2 * ff, act.data_ptr(), rows, ff, s)
+            else:
+                fvk.alpamayo15_silu_mul_fp8_rows_bf16(gu.data_ptr(), gu[:, ff:].data_ptr(), 2 * ff, b["a8"].data_ptr(),
+                                                      b["a_s"].data_ptr(), rows, ff, s)
+            lin(act, "a", layer.mlp.down_proj.weight, "down", li, d, quantized=True)
             nxt = layers[li + 1].input_layernorm.weight if li + 1 < len(layers) else self.expert.norm.weight
-            fvk.alpamayo15_res_rms_f32_bf16(res.data_ptr(), d.data_ptr(), nxt.data_ptr(), hn.data_ptr(), rows, E, eps, s)
+            if li + 1 < len(layers):
+                norm(d, nxt)
+            else:                                   # the final norm feeds the BF16 action_out_proj
+                fvk.alpamayo15_res_rms_f32_bf16(res.data_ptr(), d.data_ptr(), nxt.data_ptr(), hn.data_ptr(), rows, E, eps, s)
         return F.linear(hn, m.action_out_proj.weight, m.action_out_proj.bias).view(-1, A, self.act_dim)
 
     def _denoise(self, n: int) -> None:

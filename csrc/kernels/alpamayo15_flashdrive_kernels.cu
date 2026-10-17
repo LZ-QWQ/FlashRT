@@ -4,6 +4,7 @@
 // alpamayo15_flashdrive_kernels.cuh for the cache contract and rounding rules.
 
 #include "alpamayo15_flashdrive_kernels.cuh"
+#include "alpamayo15_fp8_rows.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -479,10 +480,17 @@ __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_gr
 
 struct SmMeta { unsigned z0, z1; int s0, s1; };
 
+// GEMM output element: fp16 (Marlin's output type) or bf16, rows ld_out elements apart.
+__device__ __forceinline__ void fd_store_out(void* out, int out_bf16, size_t idx, float v) {
+  if (out_bf16) static_cast<__nv_bfloat16*>(out)[idx] = __float2bfloat16_rn(v);
+  else static_cast<__half*>(out)[idx] = __float2half_rn(v);
+}
+
 template <int MT>
 __global__ void __launch_bounds__(kSmWarps * 32) fd_w4a8_small_kernel(
     const int8_t* __restrict__ xq, const float* __restrict__ a_scale, const uint4* __restrict__ w_pack,
-    const unsigned char* __restrict__ zp, const int* __restrict__ sg, __half* __restrict__ out, int M, int N, int K) {
+    const unsigned char* __restrict__ zp, const int* __restrict__ sg, void* __restrict__ out, int ld_out, int out_bf16,
+    int M, int N, int K) {
   fd_pdl_wait();
   extern __shared__ __align__(16) unsigned char fd_sm_dyn[];
   uint4 (*wring)[kSmStages][2][32] = reinterpret_cast<uint4 (*)[kSmStages][2][32]>(fd_sm_dyn);   // [warp][stage][chunk][lane]
@@ -537,7 +545,7 @@ __global__ void __launch_bounds__(kSmWarps * 32) fd_w4a8_small_kernel(
       int v = 0;
 #pragma unroll
       for (int w = 0; w < kSmWarps; ++w) v += rt[w][r][m];
-      out[(size_t)m * N + 16 * T + r] = __float2half_rn(__fmul_rn(__int2float_rn(v), a_scale[m]));
+      fd_store_out(out, out_bf16, (size_t)m * ld_out + 16 * T + r, __fmul_rn(__int2float_rn(v), a_scale[m]));
     }
   };
   // prologue: fill the ring
@@ -922,6 +930,49 @@ __global__ void __launch_bounds__(256) fd_layernorm_kernel(const __nv_bfloat16* 
 }
 
 
+// fd_layernorm_kernel whose BF16 row goes to FP8 codes + a row scale (the W8A8 vision tier): identical codes to the
+// LayerNorm followed by alpamayo15_quantize_fp8_rows_bf16. dim <= 16384.
+__global__ void __launch_bounds__(256) fd_layernorm_fp8_rows_kernel(const __nv_bfloat16* __restrict__ x,
+                                                                    const __nv_bfloat16* __restrict__ w,
+                                                                    const __nv_bfloat16* __restrict__ b,
+                                                                    uint8_t* __restrict__ q, float* __restrict__ scale,
+                                                                    int dim, float eps) {
+  fd_pdl_wait();
+  __shared__ float smem[32];
+  __shared__ __align__(16) __nv_bfloat16 srow[16384];
+  const int row = blockIdx.x;
+  const Bf4* xr = reinterpret_cast<const Bf4*>(x + (size_t)row * dim);
+  const int n4 = dim >> 2;
+  float v[16][4];
+  float sum = 0.0f;
+  int cnt = 0;
+  for (int i = threadIdx.x; i < n4; i += 256, ++cnt) {
+    const Bf4 t = xr[i];
+#pragma unroll
+    for (int e = 0; e < 4; ++e) { v[cnt][e] = bf(t.v[e]); sum += v[cnt][e]; }
+  }
+  const float mean = block_sum256(sum, smem) / (float)dim;
+  float sq = 0.0f;
+  for (int c = 0; c < cnt; ++c)
+#pragma unroll
+    for (int e = 0; e < 4; ++e) { const float d = v[c][e] - mean; sq += d * d; }
+  const float rstd = rsqrtf(block_sum256(sq, smem) / (float)dim + eps);
+  const Bf4* wr = reinterpret_cast<const Bf4*>(w);
+  const Bf4* br = reinterpret_cast<const Bf4*>(b);
+  Bf4* o = reinterpret_cast<Bf4*>(srow);
+  cnt = 0;
+  for (int i = threadIdx.x; i < n4; i += 256, ++cnt) {
+    const Bf4 ww = wr[i], bb = br[i];
+    Bf4 r;
+#pragma unroll
+    for (int e = 0; e < 4; ++e) r.v[e] = to_bf((v[cnt][e] - mean) * rstd * bf(ww.v[e]) + bf(bb.v[e]));
+    o[i] = r;
+  }
+  __syncthreads();
+  fp8rows::quantize_row_fp8(srow, q, scale, row, dim, smem);
+  fd_pdl_trigger();
+}
+
 // out[r, f] = bf16(silu(gate[r, f])) * up[r, f] over rows of leading dimension ld (the gate | up halves of one GEMM
 // output row with up = gate + F, ld = 2F, or two separate outputs with ld = F), rounded as silu_mul_qwen36_bf16.
 __global__ void fd_silu_mul_split_kernel(const __nv_bfloat16* __restrict__ gate, const __nv_bfloat16* __restrict__ up,
@@ -1000,7 +1051,8 @@ __device__ __forceinline__ uint4 fd_ld_stream16(const uint4* p) {
 template <int MT, int KS>
 __global__ void __launch_bounds__(128) fd_w4a8_tile_kernel(const int8_t* __restrict__ xq, const float* __restrict__ a_scale,
                                                            const uint4* __restrict__ w_pack, const unsigned char* __restrict__ zp,
-                                                           const int* __restrict__ sg, __half* __restrict__ out, int M, int N, int K) {
+                                                           const int* __restrict__ sg, void* __restrict__ out, int ld_out,
+                                                           int out_bf16, int M, int N, int K) {
   fd_pdl_wait();
   __shared__ int red[4][MT * 4][32];
   const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3, warp = threadIdx.x >> 5;
@@ -1083,12 +1135,12 @@ __global__ void __launch_bounds__(128) fd_w4a8_tile_kernel(const int8_t* __restr
   for (int mt = 0; mt < MT; ++mt) {
     const int m0 = 8 * mt + 2 * t, m1 = m0 + 1;
     if (m0 < M) {
-      out[(size_t)m0 * N + n0] = __float2half_rn(__fmul_rn(__int2float_rn(total[mt][0]), a_scale[m0]));
-      out[(size_t)m0 * N + n1] = __float2half_rn(__fmul_rn(__int2float_rn(total[mt][2]), a_scale[m0]));
+      fd_store_out(out, out_bf16, (size_t)m0 * ld_out + n0, __fmul_rn(__int2float_rn(total[mt][0]), a_scale[m0]));
+      fd_store_out(out, out_bf16, (size_t)m0 * ld_out + n1, __fmul_rn(__int2float_rn(total[mt][2]), a_scale[m0]));
     }
     if (m1 < M) {
-      out[(size_t)m1 * N + n0] = __float2half_rn(__fmul_rn(__int2float_rn(total[mt][1]), a_scale[m1]));
-      out[(size_t)m1 * N + n1] = __float2half_rn(__fmul_rn(__int2float_rn(total[mt][3]), a_scale[m1]));
+      fd_store_out(out, out_bf16, (size_t)m1 * ld_out + n0, __fmul_rn(__int2float_rn(total[mt][1]), a_scale[m1]));
+      fd_store_out(out, out_bf16, (size_t)m1 * ld_out + n1, __fmul_rn(__int2float_rn(total[mt][3]), a_scale[m1]));
     }
   }
   fd_pdl_trigger();
@@ -1690,7 +1742,9 @@ int flashdrive_shift_cache(const void* const* k_ptrs, const void* const* v_ptrs,
 }
 
 int flashdrive_w4a8_gemm_small(const void* xq, const float* a_scale, const void* w_pack, const void* zp,
-                               const int* sg, void* out, int M, int N, int K, cudaStream_t stream) {
+                               const int* sg, void* out, int M, int N, int K, cudaStream_t stream, int ld_out, int out_bf16) {
+  if (ld_out <= 0) ld_out = N;
+  if (ld_out < N || (ld_out % 2) != 0) return 2;
   if (!xq || !a_scale || !w_pack || !zp || !sg || !out) return 1;
   if (M <= 0 || M > 16 || N <= 0 || (N % 16) != 0 || K <= 0 || (K % (kRotGroup * kSmWarps)) != 0) return 2;
   if ((reinterpret_cast<uintptr_t>(w_pack) & 15u) != 0 || (reinterpret_cast<uintptr_t>(xq) & 3u) != 0 ||
@@ -1711,11 +1765,11 @@ int flashdrive_w4a8_gemm_small(const void* xq, const float* a_scale, const void*
   if (M <= 8) {
     fd_launch(fd_w4a8_small_kernel<1>, dim3(grid), dim3(kSmWarps * 32), (size_t)(kRingBytes), stream, 
         static_cast<const int8_t*>(xq), a_scale, static_cast<const uint4*>(w_pack),
-        static_cast<const unsigned char*>(zp), sg, static_cast<__half*>(out), M, N, K);
+        static_cast<const unsigned char*>(zp), sg, out, ld_out, out_bf16, M, N, K);
   } else {
     fd_launch(fd_w4a8_small_kernel<2>, dim3(grid), dim3(kSmWarps * 32), (size_t)(kRingBytes), stream, 
         static_cast<const int8_t*>(xq), a_scale, static_cast<const uint4*>(w_pack),
-        static_cast<const unsigned char*>(zp), sg, static_cast<__half*>(out), M, N, K);
+        static_cast<const unsigned char*>(zp), sg, out, ld_out, out_bf16, M, N, K);
   }
   return cudaPeekAtLastError() == cudaSuccess ? 0 : 4;
 }
@@ -1811,6 +1865,16 @@ int alpamayo15_layernorm_bf16(const void* x, const void* w, const void* b, void*
   return cudaPeekAtLastError() == cudaSuccess ? 0 : 4;
 }
 
+int alpamayo15_layernorm_fp8_rows_bf16(const void* x, const void* w, const void* b, void* q, float* scale, int rows, int dim,
+                                       float eps, cudaStream_t stream) {
+  if (!x || !w || !b || !q || !scale) return 1;
+  if (rows <= 0 || dim <= 0 || (dim % 8) != 0 || dim > 16384) return 2;
+  if (!aligned8(x) || !aligned8(w) || !aligned8(b) || (reinterpret_cast<uintptr_t>(q) & 3u) != 0) return 5;
+  fd_launch(fd_layernorm_fp8_rows_kernel, dim3(rows), dim3(256), (size_t)(0), stream, static_cast<const __nv_bfloat16*>(x),
+            static_cast<const __nv_bfloat16*>(w), static_cast<const __nv_bfloat16*>(b), static_cast<uint8_t*>(q), scale, dim, eps);
+  return cudaPeekAtLastError() == cudaSuccess ? 0 : 4;
+}
+
 int alpamayo15_silu_mul_split_bf16(const void* gate, const void* up, int ld, void* out, int rows, int F,
                                    cudaStream_t stream) {
   if (!gate || !up || !out) return 1;
@@ -1833,8 +1897,8 @@ int alpamayo15_quantize_fp8_rows_bf16(const void* x, int ld_x, void* q, float* s
   return cudaPeekAtLastError() == cudaSuccess ? 0 : 4;
 }
 
-void flashdrive_set_pdl(bool on) { g_fd_pdl = on; }
-bool flashdrive_pdl() { return g_fd_pdl; }
+void alpamayo15_set_pdl(bool on) { g_fd_pdl = on; }
+bool alpamayo15_pdl() { return g_fd_pdl; }
 
 namespace {
 // K splits per tile so that at least ~128 CTAs stream concurrently (and K stays divisible).
@@ -1846,7 +1910,9 @@ int tile_ks(int NT, int K, int kunit) {
 }  // namespace
 
 int flashdrive_w4a8_gemm_tile(const void* xq, const float* a_scale, const void* w_pack, const void* zp, const int* sg,
-                              void* out, int M, int N, int K, cudaStream_t stream) {
+                              void* out, int M, int N, int K, cudaStream_t stream, int ld_out, int out_bf16) {
+  if (ld_out <= 0) ld_out = N;
+  if (ld_out < N || (ld_out % 2) != 0) return 2;
   if (!xq || !a_scale || !w_pack || !zp || !sg || !out) return 1;
   if (M <= 0 || M > 16 || N <= 0 || (N % 16) != 0 || K <= 0 || (K % kRotGroup) != 0) return 2;
   if ((reinterpret_cast<uintptr_t>(w_pack) & 15u) != 0 || (reinterpret_cast<uintptr_t>(xq) & 3u) != 0 ||
@@ -1857,8 +1923,7 @@ int flashdrive_w4a8_gemm_tile(const void* xq, const float* a_scale, const void* 
   const auto* x8 = static_cast<const int8_t*>(xq);
   const auto* wp = static_cast<const uint4*>(w_pack);
   const auto* z8 = static_cast<const unsigned char*>(zp);
-  auto* o = static_cast<__half*>(out);
-#define FD_TILE(MT, KS) fd_launch(fd_w4a8_tile_kernel<MT, KS>, grid, dim3(128), (size_t)0, stream, x8, a_scale, wp, z8, sg, o, M, N, K)
+#define FD_TILE(MT, KS) fd_launch(fd_w4a8_tile_kernel<MT, KS>, grid, dim3(128), (size_t)0, stream, x8, a_scale, wp, z8, sg, out, ld_out, out_bf16, M, N, K)
   if (M <= 8) { if (ks == 1) FD_TILE(1, 1); else if (ks == 2) FD_TILE(1, 2); else FD_TILE(1, 4); }
   else { if (ks == 1) FD_TILE(2, 1); else if (ks == 2) FD_TILE(2, 2); else FD_TILE(2, 4); }
 #undef FD_TILE

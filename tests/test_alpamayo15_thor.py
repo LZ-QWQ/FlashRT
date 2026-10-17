@@ -496,7 +496,11 @@ def test_silu_mul_split_matches_torch():
                                     ({"prefill_weights": "int8"}, "prefill_weights"),
                                     ({"vision_gemm": "cublas"}, "vision_gemm"),
                                     ({"expert_weights": "fp8", "expert_gemm": "torch"}, "expert_gemm='cutlass'"),
-                                    ({"decode_weights": "int8", "max_samples": 17}, "max_samples <= 16")])
+                                    ({"decode_weights": "int8", "max_samples": 17}, "max_samples <= 16"),
+                                    ({"decode_weights": "w4a8"}, "paro_checkpoint"),
+                                    ({"vision_weights": "fp8", "vision_gemm": "torch"}, "vision_gemm='cutlass'"),
+                                    ({"vision_weights": "int8"}, "vision_weights"),
+                                    ({"paro_checkpoint": "x"}, "paro_checkpoint")])
 def test_engine_option_validation(kw, msg):
     with pytest.raises(ValueError, match=msg):
         Alpamayo15Thor(SimpleNamespace(), **kw)
@@ -578,5 +582,97 @@ def test_fused_fp8_row_producers_match_separate_kernels(rows, dim, with_delta):
     fvk.alpamayo15_silu_mul_split_bf16(g.data_ptr(), u.data_ptr(), F, act.data_ptr(), rows, F, s)
     fvk.alpamayo15_quantize_fp8_rows_bf16(act.data_ptr(), F, q_ref.data_ptr(), s_ref.data_ptr(), rows, F, s)
     fvk.alpamayo15_silu_mul_fp8_rows_bf16(g.data_ptr(), u.data_ptr(), F, q.data_ptr(), sc.data_ptr(), rows, F, s)
+    torch.cuda.synchronize()
+    assert torch.equal(sc, s_ref) and torch.equal(q, q_ref)
+    # fp32-residual (expert) variant
+    res_ref = torch.randn(rows, dim, device="cuda") * 1.5
+    res_fused = res_ref.clone()
+    fvk.alpamayo15_res_rms_f32_bf16(res_ref.data_ptr(), delta.data_ptr() if with_delta else 0, w.data_ptr(), h.data_ptr(), rows, dim, 1e-6, s)
+    fvk.alpamayo15_quantize_fp8_rows_bf16(h.data_ptr(), dim, q_ref.data_ptr(), s_ref.data_ptr(), rows, dim, s)
+    fvk.alpamayo15_res_rms_f32_fp8_rows_bf16(res_fused.data_ptr(), delta.data_ptr() if with_delta else 0, w.data_ptr(), q.data_ptr(),
+                                             sc.data_ptr(), rows, dim, 1e-6, s)
+    torch.cuda.synchronize()
+    assert torch.equal(res_fused, res_ref) and torch.equal(sc, s_ref) and torch.equal(q, q_ref)
+
+
+def test_marlin_w4a8_layout_roundtrip():
+    """The Marlin index maps invert the forward tile permutation; the few-row operand packing keeps every nibble."""
+    from flash_rt.models.alpamayo15.marlin_w4a8 import (_permute_weights_a8, _scale_perms, _weight_perm_a8, marlin_w4a8_unpack,
+                                                        pack_w4a8_small)
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    torch.manual_seed(41)
+    K, N = 1024, 256
+    G = K // 128
+    w = torch.randint(0, 16, (K, N), dtype=torch.int32)
+    z = torch.randint(0, 16, (G, N), dtype=torch.int32)
+    s_int = torch.randint(0, 4097, (G, N), dtype=torch.int32)
+    # forward Marlin packing (vLLM's layout): permuted nibbles into int32 words, permuted scales / zero points
+    pw = _permute_weights_a8(w, K, N, _weight_perm_a8())                                 # [K/16, 16 N]
+    qweight = torch.zeros(K // 16, N * 2, dtype=torch.int32)
+    for i in range(8):
+        qweight |= pw.reshape(K // 16, N * 2, 8)[..., i] << (4 * i)
+    scale_perm, scale_perm_single = _scale_perms()
+    scales = s_int.reshape(-1, len(scale_perm_single))[:, torch.tensor(scale_perm_single)].reshape(G, N).to(torch.int16).view(torch.float16)
+    zp = z.reshape(-1, len(scale_perm))[:, torch.tensor(scale_perm)].reshape(G, N)
+    qzeros = torch.zeros(G, N // 8, dtype=torch.int32)
+    for i in range(8):
+        qzeros |= zp.reshape(G, N // 8, 8)[..., i] << (4 * i)
+    w_u, z_u, s_u = marlin_w4a8_unpack(qweight, scales, qzeros, K, N)
+    assert torch.equal(w_u.cpu().int(), w) and torch.equal(z_u.cpu().int(), z) and torch.equal(s_u.cpu(), s_int)
+    packed = pack_w4a8_small(w_u, K, N)
+    assert packed.shape == (N // 16, K // 64, 32, 16)
+    lo, hi = packed & 0xF, packed >> 4
+    assert torch.equal(torch.sort(torch.cat([lo.reshape(-1), hi.reshape(-1)]).int())[0], torch.sort(w.reshape(-1).to(packed.device))[0])
+
+
+@pytest.mark.parametrize("M,N,K,act,res", [(2880, 3456, 1152, 0, False), (2880, 1152, 1152, 0, True), (2880, 4304, 1152, 1, False),
+                                           (2880, 1152, 4304, 0, True), (300, 256, 64, 2, False)])
+def test_fp8_gemm_with_bias_activation_residual(M, N, K, act, res):
+    """D = act((A8 @ W8.T) * a_s * w_s + bias) (+ C) on the 2-SM FP8 GEMM against the FP32 reference."""
+    fvk = _kernels()
+    torch.manual_seed(27)
+    x = (torch.randn(M, K, device="cuda") * 2).to(BF16)
+    w = (torch.randn(N, K, device="cuda") * 0.05).to(BF16)
+    bias = (torch.randn(N, device="cuda") * 0.1).to(BF16)
+    C = torch.randn(M, N, device="cuda").to(BF16) if res else None
+    q8, a_s = quantize_fp8_rows(x)
+    w8, w_s = quantize_fp8_rows(w)
+    D = torch.empty(M, N, device="cuda", dtype=BF16)
+    _Gemm(fvk).fp8_act(q8, a_s, w8, w_s, D, bias=bias, C=C, act=act)
+    torch.cuda.synchronize()
+    ref = (q8.view(torch.float8_e4m3fn).float() @ w8.view(torch.float8_e4m3fn).float().t()) * a_s[:, None] * w_s[None, :] + bias.float()
+    if act == 1:
+        ref = torch.nn.functional.gelu(ref, approximate="tanh")
+    elif act == 2:
+        ref = torch.nn.functional.gelu(ref)
+    if C is not None:
+        ref = ref + C.float()
+    err = (D.float() - ref).abs()
+    tol = ref.abs() * 2 ** -7 + 2 ** -6 * float(ref.abs().mean()) + 2 ** -6
+    assert bool((err <= tol).all()), float((err / tol).max())
+    if res:                           # column blocks of a wider output
+        D2 = torch.full((M, N), float("nan"), device="cuda", dtype=BF16)
+        half = N // 2
+        _Gemm(fvk).fp8_act(q8, a_s, w8[:half], w_s[:half], D2[:, :half], bias=bias[:half], C=C[:, :half], act=act)
+        _Gemm(fvk).fp8_act(q8, a_s, w8[half:], w_s[half:], D2[:, half:], bias=bias[half:], C=C[:, half:], act=act)
+        torch.cuda.synchronize()
+        assert torch.equal(D2, D)
+
+
+@pytest.mark.parametrize("rows,dim", [(2880, 1152), (37, 1152), (64, 4608)])
+def test_layernorm_fp8_rows_matches_separate_kernels(rows, dim):
+    fvk = _kernels()
+    torch.manual_seed(28)
+    s = _stream()
+    x = (torch.randn(rows, dim, device="cuda") * 2 + 0.3).to(BF16)
+    w = (torch.rand(dim, device="cuda") + 0.5).to(BF16)
+    b = (torch.randn(dim, device="cuda") * 0.1).to(BF16)
+    h = torch.empty_like(x)
+    fvk.alpamayo15_layernorm_bf16(x.data_ptr(), w.data_ptr(), b.data_ptr(), h.data_ptr(), rows, dim, 1e-6, s)
+    q_ref = torch.empty(rows, dim, device="cuda", dtype=torch.uint8); s_ref = torch.empty(rows, device="cuda")
+    fvk.alpamayo15_quantize_fp8_rows_bf16(h.data_ptr(), dim, q_ref.data_ptr(), s_ref.data_ptr(), rows, dim, s)
+    q = torch.full((rows, dim), 7, device="cuda", dtype=torch.uint8); sc = torch.zeros(rows, device="cuda")
+    fvk.alpamayo15_layernorm_fp8_rows_bf16(x.data_ptr(), w.data_ptr(), b.data_ptr(), q.data_ptr(), sc.data_ptr(), rows, dim, 1e-6, s)
     torch.cuda.synchronize()
     assert torch.equal(sc, s_ref) and torch.equal(q, q_ref)

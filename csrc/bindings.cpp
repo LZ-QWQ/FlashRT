@@ -268,6 +268,9 @@ extern "C" int flashrt_a15_bf16_gemm_sm100_workspace(int, int, int, int, int, in
 extern "C" int flashrt_a15_bf16_gemm_sm100(const void*, const void*, const void*, const void*, void*, int, int, int, int, int,
                                            void*, unsigned long long, int, cudaStream_t);
 extern "C" int flashrt_a15_fp8_gemm_sm100_workspace(int, int, int, int, unsigned long long*);
+extern "C" int flashrt_a15_fp8_gemm_act_sm100_workspace(int, int, int, int, int, unsigned long long*);
+extern "C" int flashrt_a15_fp8_gemm_act_sm100(const void*, const void*, const float*, const float*, const void*, const void*, void*,
+                                              int, int, int, int, int, void*, unsigned long long, int, cudaStream_t);
 extern "C" int flashrt_a15_fp8_gemm_sm100(const void*, const void*, const float*, const float*, void*, int, int, int, int, int, void*,
                                           unsigned long long, int, cudaStream_t);
 extern "C" int flashrt_a15_int8_gemm_sm100_workspace(int, int, int, int, unsigned long long*);
@@ -5413,6 +5416,22 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("residual"), py::arg("delta"), py::arg("weight"), py::arg("q"), py::arg("scale"), py::arg("rows"),
         py::arg("dim"), py::arg("eps"), py::arg("stream") = 0);
 
+    m.def("alpamayo15_res_rms_f32_fp8_rows_bf16",
+        [](uintptr_t residual, uintptr_t delta, uintptr_t weight, uintptr_t q, uintptr_t scale,
+           int rows, int dim, float eps, uintptr_t stream) {
+            const auto shape = kernel_shape({{"rows", rows}, {"dim", dim}});
+            require_kernel_ptrs("alpamayo15_res_rms_f32_fp8_rows_bf16",
+                {{"residual", residual}, {"weight", weight}, {"q", q}, {"scale", scale}}, shape);
+            const int rc = flash_rt::kernels::alpamayo15_res_rms_f32_fp8_rows_bf16(
+                reinterpret_cast<float*>(residual), reinterpret_cast<const void*>(delta),
+                reinterpret_cast<const void*>(weight), reinterpret_cast<void*>(q), reinterpret_cast<float*>(scale),
+                rows, dim, eps, to_stream(stream));
+            require_kernel(rc == 0, "alpamayo15_res_rms_f32_fp8_rows_bf16",
+                           "invalid shape/alignment or launch failure (rc=" + std::to_string(rc) + ")", shape);
+        },
+        py::arg("residual"), py::arg("delta"), py::arg("weight"), py::arg("q"), py::arg("scale"), py::arg("rows"),
+        py::arg("dim"), py::arg("eps"), py::arg("stream") = 0);
+
     m.def("alpamayo15_silu_mul_fp8_rows_bf16",
         [](uintptr_t gate, uintptr_t up, int ld, uintptr_t q, uintptr_t scale, int rows, int F, uintptr_t stream) {
             const auto shape = kernel_shape({{"rows", rows}, {"F", F}, {"ld", ld}});
@@ -5533,7 +5552,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
                 reinterpret_cast<const void*>(xq), reinterpret_cast<const void*>(w8),
                 reinterpret_cast<const int*>(sf_group), reinterpret_cast<const int*>(sf_ones),
                 reinterpret_cast<const float*>(a_scale), reinterpret_cast<void*>(out), M, N, K,
-                reinterpret_cast<void*>(workspace), workspace_bytes, (flash_rt::kernels::flashdrive_pdl() ? 1 : 0) | (ktile == 256 ? 2 : 0) | (sm_pair ? 4 : 0), to_stream(stream));
+                reinterpret_cast<void*>(workspace), workspace_bytes, (flash_rt::kernels::alpamayo15_pdl() ? 1 : 0) | (ktile == 256 ? 2 : 0) | (sm_pair ? 4 : 0), to_stream(stream));
             require_kernel(rc == 0, "flashdrive_w4a8_gemm_sm100",
                            "invalid shape/alignment/workspace or launch failure (rc=" + std::to_string(rc) + ")", shape);
         },
@@ -5638,7 +5657,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
 
     m.def("flashdrive_w4a8_gemm_small",
         [](uintptr_t xq, uintptr_t a_scale, uintptr_t w_pack, uintptr_t zp, uintptr_t sg, uintptr_t out, int M, int N,
-           int K, uintptr_t stream) {
+           int K, uintptr_t stream, int ld_out, int out_bf16) {
             const auto shape = kernel_shape({{"M", M}, {"N", N}, {"K", K}});
             require_kernel_ptrs("flashdrive_w4a8_gemm_small",
                                 {{"xq", xq}, {"a_scale", a_scale}, {"w_pack", w_pack}, {"zp", zp}, {"sg", sg}, {"out", out}},
@@ -5646,12 +5665,12 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
             const int rc = flash_rt::kernels::flashdrive_w4a8_gemm_small(
                 reinterpret_cast<const void*>(xq), reinterpret_cast<const float*>(a_scale),
                 reinterpret_cast<const void*>(w_pack), reinterpret_cast<const void*>(zp),
-                reinterpret_cast<const int*>(sg), reinterpret_cast<void*>(out), M, N, K, to_stream(stream));
+                reinterpret_cast<const int*>(sg), reinterpret_cast<void*>(out), M, N, K, to_stream(stream), ld_out, out_bf16);
             require_kernel(rc == 0, "flashdrive_w4a8_gemm_small",
                            "invalid shape/alignment or launch failure (rc=" + std::to_string(rc) + ")", shape);
         },
         py::arg("xq"), py::arg("a_scale"), py::arg("w_pack"), py::arg("zp"), py::arg("sg"), py::arg("out"), py::arg("M"),
-        py::arg("N"), py::arg("K"), py::arg("stream") = 0);
+        py::arg("N"), py::arg("K"), py::arg("stream") = 0, py::arg("ld_out") = 0, py::arg("out_bf16") = 0);
 
     m.def("flashdrive_bf16_gemm_small",
         [](uintptr_t x, int ld_x, uintptr_t w, uintptr_t y, int ld_y, int y_f32, int M, int N, int K, uintptr_t stream) {
@@ -5746,6 +5765,18 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("x"), py::arg("w"), py::arg("b"), py::arg("out"), py::arg("rows"), py::arg("dim"), py::arg("eps"),
         py::arg("stream") = 0);
 
+    m.def("alpamayo15_layernorm_fp8_rows_bf16",
+        [](uintptr_t x, uintptr_t w, uintptr_t b, uintptr_t q, uintptr_t scale, int rows, int dim, float eps, uintptr_t stream) {
+            const auto shape = kernel_shape({{"rows", rows}, {"dim", dim}});
+            require_kernel_ptrs("alpamayo15_layernorm_fp8_rows_bf16", {{"x", x}, {"w", w}, {"b", b}, {"q", q}, {"scale", scale}}, shape);
+            const int rc = flash_rt::kernels::alpamayo15_layernorm_fp8_rows_bf16(
+                reinterpret_cast<const void*>(x), reinterpret_cast<const void*>(w), reinterpret_cast<const void*>(b),
+                reinterpret_cast<void*>(q), reinterpret_cast<float*>(scale), rows, dim, eps, to_stream(stream));
+            require_kernel(rc == 0, "alpamayo15_layernorm_fp8_rows_bf16",
+                           "invalid shape/alignment or launch failure (rc=" + std::to_string(rc) + ")", shape);
+        },
+        py::arg("x"), py::arg("w"), py::arg("b"), py::arg("q"), py::arg("scale"), py::arg("rows"), py::arg("dim"), py::arg("eps"),
+        py::arg("stream") = 0);
     m.def("alpamayo15_silu_mul_split_bf16",
         [](uintptr_t gate, uintptr_t up, int ld, uintptr_t out, int rows, int F, uintptr_t stream) {
             const auto shape = kernel_shape({{"rows", rows}, {"F", F}, {"ld", ld}});
@@ -5779,6 +5810,31 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
             return nbytes;
         },
         py::arg("M"), py::arg("N"), py::arg("K"), py::arg("tile") = 1);
+    m.def("alpamayo15_fp8_gemm_act_sm100_workspace",
+        [](int M, int N, int K, int act, int residual) {
+            unsigned long long nbytes = 0;
+            const int rc = flashrt_a15_fp8_gemm_act_sm100_workspace(M, N, K, act, residual, &nbytes);
+            require_kernel(rc == 0, "alpamayo15_fp8_gemm_act_sm100_workspace", "unsupported shape",
+                           kernel_shape({{"M", M}, {"N", N}, {"K", K}, {"act", act}, {"residual", residual}}));
+            return nbytes;
+        },
+        py::arg("M"), py::arg("N"), py::arg("K"), py::arg("act"), py::arg("residual"));
+    m.def("alpamayo15_fp8_gemm_act_sm100",
+        [](uintptr_t A, uintptr_t B, uintptr_t a_s, uintptr_t w_s, uintptr_t bias, uintptr_t C, uintptr_t D, int M, int N, int K,
+           int act, int ldd, uintptr_t workspace, unsigned long long workspace_bytes, uintptr_t stream) {
+            const auto shape = kernel_shape({{"M", M}, {"N", N}, {"K", K}, {"act", act}, {"ldd", ldd}});
+            require_kernel_ptrs("alpamayo15_fp8_gemm_act_sm100", {{"A", A}, {"B", B}, {"a_s", a_s}, {"w_s", w_s}, {"D", D}}, shape);
+            const int rc = flashrt_a15_fp8_gemm_act_sm100(
+                reinterpret_cast<const void*>(A), reinterpret_cast<const void*>(B), reinterpret_cast<const float*>(a_s),
+                reinterpret_cast<const float*>(w_s), reinterpret_cast<const void*>(bias), reinterpret_cast<const void*>(C),
+                reinterpret_cast<void*>(D), M, N, K, act, ldd > 0 ? ldd : N, reinterpret_cast<void*>(workspace), workspace_bytes,
+                flash_rt::kernels::alpamayo15_pdl(), to_stream(stream));
+            require_kernel(rc == 0, "alpamayo15_fp8_gemm_act_sm100",
+                           "unsupported shape/alignment or launch failure (rc=" + std::to_string(rc) + ")", shape);
+        },
+        py::arg("A"), py::arg("B"), py::arg("a_s"), py::arg("w_s"), py::arg("bias"), py::arg("C"), py::arg("D"), py::arg("M"),
+        py::arg("N"), py::arg("K"), py::arg("act"), py::arg("ldd"), py::arg("workspace"), py::arg("workspace_bytes"),
+        py::arg("stream") = 0);
     m.def("alpamayo15_fp8_gemm_sm100",
         [](uintptr_t A, uintptr_t B, uintptr_t a_s, uintptr_t w_s, uintptr_t D, int M, int N, int K, uintptr_t workspace,
            unsigned long long workspace_bytes, uintptr_t stream, int tile, int ldd) {
@@ -5787,7 +5843,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
             const int rc = flashrt_a15_fp8_gemm_sm100(
                 reinterpret_cast<const void*>(A), reinterpret_cast<const void*>(B), reinterpret_cast<const float*>(a_s),
                 reinterpret_cast<const float*>(w_s), reinterpret_cast<void*>(D), M, N, K, tile, ldd > 0 ? ldd : N,
-                reinterpret_cast<void*>(workspace), workspace_bytes, flash_rt::kernels::flashdrive_pdl(), to_stream(stream));
+                reinterpret_cast<void*>(workspace), workspace_bytes, flash_rt::kernels::alpamayo15_pdl(), to_stream(stream));
             require_kernel(rc == 0, "alpamayo15_fp8_gemm_sm100",
                            "unsupported shape/alignment or launch failure (rc=" + std::to_string(rc) + ")", shape);
         },
@@ -5811,7 +5867,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
             const int rc = flashrt_a15_int8_gemm_sm100(
                 reinterpret_cast<const void*>(A), reinterpret_cast<const void*>(B), reinterpret_cast<const float*>(a_s),
                 reinterpret_cast<const float*>(w_s), reinterpret_cast<void*>(D), M, N, K, tile,
-                reinterpret_cast<void*>(workspace), workspace_bytes, flash_rt::kernels::flashdrive_pdl(), to_stream(stream));
+                reinterpret_cast<void*>(workspace), workspace_bytes, flash_rt::kernels::alpamayo15_pdl(), to_stream(stream));
             require_kernel(rc == 0, "alpamayo15_int8_gemm_sm100",
                            "unsupported shape/alignment or launch failure (rc=" + std::to_string(rc) + ")", shape);
         },
@@ -5820,7 +5876,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
 
     m.def("flashdrive_w4a8_gemm_tile",
         [](uintptr_t xq, uintptr_t a_scale, uintptr_t w_pack, uintptr_t zp, uintptr_t sg, uintptr_t out, int M, int N,
-           int K, uintptr_t stream) {
+           int K, uintptr_t stream, int ld_out, int out_bf16) {
             const auto shape = kernel_shape({{"M", M}, {"N", N}, {"K", K}});
             require_kernel_ptrs("flashdrive_w4a8_gemm_tile",
                                 {{"xq", xq}, {"a_scale", a_scale}, {"w_pack", w_pack}, {"zp", zp}, {"sg", sg}, {"out", out}},
@@ -5828,12 +5884,12 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
             const int rc = flash_rt::kernels::flashdrive_w4a8_gemm_tile(
                 reinterpret_cast<const void*>(xq), reinterpret_cast<const float*>(a_scale),
                 reinterpret_cast<const void*>(w_pack), reinterpret_cast<const void*>(zp),
-                reinterpret_cast<const int*>(sg), reinterpret_cast<void*>(out), M, N, K, to_stream(stream));
+                reinterpret_cast<const int*>(sg), reinterpret_cast<void*>(out), M, N, K, to_stream(stream), ld_out, out_bf16);
             require_kernel(rc == 0, "flashdrive_w4a8_gemm_tile",
                            "invalid shape/alignment or launch failure (rc=" + std::to_string(rc) + ")", shape);
         },
         py::arg("xq"), py::arg("a_scale"), py::arg("w_pack"), py::arg("zp"), py::arg("sg"), py::arg("out"), py::arg("M"),
-        py::arg("N"), py::arg("K"), py::arg("stream") = 0);
+        py::arg("N"), py::arg("K"), py::arg("stream") = 0, py::arg("ld_out") = 0, py::arg("out_bf16") = 0);
 
     m.def("flashdrive_bf16_gemm_frag",
         [](uintptr_t x, int ld_x, uintptr_t w_frag, uintptr_t y, int ld_y, int y_f32, int M, int N, int K, uintptr_t stream) {
@@ -5880,7 +5936,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("igs"), py::arg("xq"), py::arg("a_scale"), py::arg("tile_rows") = 0, py::arg("cluster") = 0,
         py::arg("stream") = 0);
 
-    m.def("flashdrive_set_pdl", [](bool on) { flash_rt::kernels::flashdrive_set_pdl(on); }, py::arg("on"),
+    m.def("alpamayo15_set_pdl", [](bool on) { flash_rt::kernels::alpamayo15_set_pdl(on); }, py::arg("on"),
           "Programmatic dependent launch for every FlashDrive-backend kernel and GEMM (process-wide).");
     // BF16 tcgen05 GEMM with fused bias / GELU / residual (csrc/gemm/alpamayo15_bf16_gemm_sm100.cu).
     m.def("alpamayo15_bf16_gemm_sm100_workspace",
@@ -5900,7 +5956,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
             const int rc = flashrt_a15_bf16_gemm_sm100(
                 reinterpret_cast<const void*>(A), reinterpret_cast<const void*>(B), reinterpret_cast<const void*>(bias),
                 reinterpret_cast<const void*>(C), reinterpret_cast<void*>(D), M, N, K, act, tile,
-                reinterpret_cast<void*>(workspace), workspace_bytes, flash_rt::kernels::flashdrive_pdl(), to_stream(stream));
+                reinterpret_cast<void*>(workspace), workspace_bytes, flash_rt::kernels::alpamayo15_pdl(), to_stream(stream));
             require_kernel(rc == 0, "alpamayo15_bf16_gemm_sm100",
                            "unsupported shape/alignment or launch failure (rc=" + std::to_string(rc) + ")", shape);
         },

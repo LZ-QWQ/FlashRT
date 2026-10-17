@@ -57,6 +57,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from flash_rt.models.alpamayo15.marlin_w4a8 import marlin_w4a8_unpack, pack_w4a8_small  # noqa: F401  (shared Marlin layout)
 from flash_rt.models.alpamayo15.pipeline_thor import _Gemm, _capture  # noqa: F401  (shared tcgen05 GEMM / graph capture)
 
 BF16 = torch.bfloat16
@@ -74,7 +75,7 @@ FLASHDRIVE_KERNEL_SYMBOLS = ("flashdrive_qk_prep_bf16", "flashdrive_rope_rows", 
                              "flashdrive_rms_f16delta_bf16", "flashdrive_silu_mul_f16in_bf16",
                              "flashdrive_w4a8_gemm_sm100", "flashdrive_w4a8_gemm_sm100_sizes", "flashdrive_w4a8_gemm_small",
                              "flashdrive_bf16_gemm_small", "flashdrive_draft_qkv_prep_bf16", "flashdrive_w4a8_rotate_dense",
-                             "flashdrive_w4a8_quant", "flashdrive_set_pdl", "flashdrive_w4a8_gemm_tile",
+                             "flashdrive_w4a8_quant", "flashdrive_w4a8_gemm_tile",
                              "flashdrive_bf16_gemm_frag", "flashdrive_w4a8_act_prep_tile")
 TILE_MIN_N = 2048           # few-row W4A8 GEMMs with at least this many output channels stream one warp per 16-row tile
 ENGINE_GEMMS = ("cutlass", "torch")    # BF16 GEMMs of the vision tower and the action expert
@@ -183,42 +184,6 @@ def load_flashdrive(base: str, paro: str, dflash: str, *, torch_compile: str | N
     return model
 
 
-def marlin_w4a8_unpack(qweight: torch.Tensor, scales: torch.Tensor, qzeros: torch.Tensor, K: int, N: int,
-                       maps: dict | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Unpack a Marlin W4A8 linear (UINT4 + zero points, group 128, INT8-activation integer scales) into the
-    integers Marlin multiplies: ``w [K, N]`` uint8 (0..15), ``z [K/128, N]`` uint8 and ``s [K/128, N]`` int32.
-    The permutations are inverted through vLLM's own definitions of the Marlin layout (index maps)."""
-    from vllm.model_executor.layers.quantization.utils.marlin_utils import get_scale_perms
-    from vllm.model_executor.layers.quantization.utils.marlin_utils_test import get_weight_perm, marlin_permute_weights
-    G = K // 128
-    key = (K, N)
-    if maps is None or key not in maps:
-        P = marlin_permute_weights(torch.arange(K * N, dtype=torch.int32).reshape(K, N), K, N,
-                                   get_weight_perm(4, is_a_8bit=True), is_a_8bit=True)
-        scale_perm, scale_perm_single = get_scale_perms()
-        grid = torch.arange(G * N, dtype=torch.int32)
-        Ps = grid.reshape(-1, len(scale_perm_single))[:, torch.tensor(scale_perm_single)].reshape(-1)
-        Pz = grid.reshape(-1, len(scale_perm))[:, torch.tensor(scale_perm)].reshape(-1)
-        m = (P.reshape(-1).to(DEV, torch.long), Ps.to(DEV, torch.long), Pz.to(DEV, torch.long))
-        if maps is not None:
-            maps[key] = m
-    else:
-        m = maps[key]
-
-    def nibbles(t):                      # [R, C] int32 -> [R * 8C], nibble i of word j at 8j + i
-        return torch.stack([(t >> (4 * i)) & 0xF for i in range(8)], dim=-1).reshape(-1)
-
-    w = torch.empty(K * N, dtype=torch.uint8, device=DEV)
-    w[m[0]] = nibbles(qweight).to(torch.uint8)
-    z = torch.empty(G * N, dtype=torch.uint8, device=DEV)
-    z[m[2]] = nibbles(qzeros).to(torch.uint8)
-    s = torch.empty(G * N, dtype=torch.int32, device=DEV)
-    s[m[1]] = scales.view(torch.int16).reshape(-1).to(torch.int32)
-    if bool((s < 0).any()) or bool((s > 4096).any()):       # marlin_act_int8_process_scales: integers 0..4096
-        raise ValueError("unexpected Marlin INT8-activation group scales (expected integers in [0, 4096])")
-    return w.view(K, N), z.view(G, N), s.view(G, N)
-
-
 def marlin_w4a8_to_int8(qweight: torch.Tensor, scales: torch.Tensor, qzeros: torch.Tensor, K: int, N: int,
                         maps: dict | None = None) -> tuple[torch.Tensor, torch.Tensor]:
     """``(w8, s)``: ``w8 [N, K]`` int8 = ``w - z`` and ``s [K/128, N]`` int32 (the tcgen05 prefill GEMM operands)."""
@@ -286,20 +251,6 @@ def paro_rotation_matrices(theta: torch.Tensor, pairs: torch.Tensor, K: int) -> 
         R[gidx, i] = c * Ri + s_ * Rj
         R[gidx, j] = c * Rj - s_ * Ri
     return R.to(torch.float16).contiguous()
-
-
-def pack_w4a8_small(w: torch.Tensor, K: int, N: int) -> torch.Tensor:
-    """Pack ``w [K, N]`` uint8 (0..15) into the operand layout of ``flashdrive_w4a8_gemm_small``:
-    ``[N/16][K/64][32 lanes][16 bytes]``, each lane's bytes being its two mma.m16n8k32 A fragments (rows g, g+8
-    of the tile; k = 4t..4t+3 and 16+4t..16+4t+3 of each 32-wide step) for the chunk's two k steps, first step in
-    the low nibbles."""
-    if K % 64 or N % 16:
-        raise ValueError("pack_w4a8_small needs K % 64 == 0 and N % 16 == 0")
-    # n = 16 T + 8 rh + g ; k = 64 C + 32 ks + 16 half + 4 t + j
-    v = w.t().contiguous().view(N // 16, 2, 8, K // 64, 2, 2, 4, 4)          # [T, rh, g, C, ks, half, t, j]
-    v = v.permute(0, 3, 2, 6, 4, 5, 1, 7).contiguous()                      # [T, C, g, t, ks, half, rh, j]
-    v = v.view(N // 16, K // 64, 32, 2, 16)                                 # lane = 4 g + t; byte = 4 (2 half + rh) + j
-    return (v[..., 0, :] | (v[..., 1, :] << 4)).contiguous()
 
 
 class _W4A8Group:
@@ -682,7 +633,7 @@ class FlashDriveThor:
             raise RuntimeError(f"FlashRT was built without the FlashDrive backend kernels ({', '.join(missing)}); "
                                "rebuild with -DGPU_ARCH=110 -DFLASHRT_ENABLE_ALPAMAYO15=ON")
         self._fvk = fvk
-        fvk.flashdrive_set_pdl(bool(pdl))      # process-wide: programmatic dependent launch of the backend's kernels
+        fvk.alpamayo15_set_pdl(bool(pdl))      # process-wide: programmatic dependent launch of the backend's kernels
         backends["pdl"] = bool(pdl)
         self._gemm = _Gemm(fvk)
         self._fa4 = fa4_backend.fa4_fwd()

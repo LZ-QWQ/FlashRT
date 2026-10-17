@@ -101,10 +101,11 @@ int flashdrive_shift_cache(const void* const* k_ptrs, const void* const* v_ptrs,
 //   w_pack  [N/16][K/64][32 lanes][16 B]: nibbles of the two k32 A fragments of a 64-wide k chunk (low nibble =
 //           first fragment), see pack_w4a8_small in the pipeline
 //   zp      [K/128][N] uint8 zero points, sg [K/128][N] int32 group scales (0..4096)
-//   out     [M, N] fp16 row-major
+//   out     [M, N] row-major, rows ld_out elements apart (0 = N): fp16 (Marlin's output type) or bf16 (out_bf16 = 1)
 // M in [1, 16], N % 16 == 0, K % 1024 == 0 (eight 128-wide groups per K split).
 int flashdrive_w4a8_gemm_small(const void* xq, const float* a_scale, const void* w_pack, const void* zp,
-                               const int* sg, void* out, int M, int N, int K, cudaStream_t stream);
+                               const int* sg, void* out, int M, int N, int K, cudaStream_t stream, int ld_out = 0,
+                               int out_bf16 = 0);
 
 // BF16 GEMM for a few rows (DFlash draft projections, LM head on the block rows):
 //   y[m, n] = sum_k x[m, k] * w[n, k]   (mma.sync m16n8k16 bf16, FP32 accumulation; weights are the A operand read
@@ -143,6 +144,11 @@ int flashdrive_w4a8_quant(int rows, int K, int n_sets, const void* const* xr, co
 int alpamayo15_layernorm_bf16(const void* x, const void* w, const void* b, void* out, int rows, int dim, float eps,
                               cudaStream_t stream);
 
+// The LayerNorm above with the per-row FP8 E4M3 quantization fused (the W8A8 vision tier): q [rows, dim] e4m3 bytes,
+// scale [rows] fp32, same codes as the LayerNorm followed by alpamayo15_quantize_fp8_rows_bf16. dim % 8 == 0, <= 16384.
+int alpamayo15_layernorm_fp8_rows_bf16(const void* x, const void* w, const void* b, void* q, float* scale, int rows, int dim,
+                                       float eps, cudaStream_t stream);
+
 // out[r, f] = bf16(silu(bf16 gate[r, f])) * bf16 up[r, f] (the rounding of silu_mul_qwen36_bf16); gate and up are
 // bf16 rows of leading dimension ld: the halves of a fused gate | up GEMM output gu [rows, 2F] (gate = gu, up = gu + F,
 // ld = 2F) or two separate [rows, F] outputs (ld = F). out [rows, F] bf16. F % 4 == 0, ld % 4 == 0.
@@ -155,15 +161,15 @@ int alpamayo15_silu_mul_split_bf16(const void* gate, const void* up, int ld, voi
 int alpamayo15_quantize_fp8_rows_bf16(const void* x, int ld_x, void* q, float* scale, int rows, int K, cudaStream_t stream);
 
 // Process-wide programmatic-dependent-launch switch for every FlashDrive-backend kernel (off by default).
-void flashdrive_set_pdl(bool on);
-bool flashdrive_pdl();
+void alpamayo15_set_pdl(bool on);
+bool alpamayo15_pdl();
 
 // Streaming variants of the few-row GEMMs: one warp per 16-row weight tile over the full K (no K split, no shared
 // memory), four warps per CTA, 16-byte streaming loads -- the structure that reaches the DRAM rate on Thor for
 // N >= 2048 (many independent streams); the CTA-split kernels above stay for small N.
 //   W4A8: same operands as flashdrive_w4a8_gemm_small (M <= 16, N % 16 == 0, K % 128 == 0)
 int flashdrive_w4a8_gemm_tile(const void* xq, const float* a_scale, const void* w_pack, const void* zp, const int* sg,
-                              void* out, int M, int N, int K, cudaStream_t stream);
+                              void* out, int M, int N, int K, cudaStream_t stream, int ld_out = 0, int out_bf16 = 0);
 //   BF16 on fragment-ordered weights: w_frag [ceil(N/16)][K/16][32 lanes][16 B] (bf16_fragment_layout in the
 //   pipeline: lane 4g+c holds a0 = w[16T+g, 16kc+2c..+1], a1 = row +8, a2 = cols +8, a3 = both), K % 16 == 0;
 //   x [rows_alloc >= ceil(M/8)*8, K] bf16 with leading dim ld_x; y [M, N] bf16 (y_f32 = 0) or fp32, leading dim ld_y.

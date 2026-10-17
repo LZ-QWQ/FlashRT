@@ -317,7 +317,9 @@ out["pred_xyz"], out["pred_rot"], out["cot"][0]
 # several trajectory samples: construct with max_samples=16, then
 # fe.infer(..., num_traj_samples=16) -> pred_xyz (1, 1, 16, 64, 3)
 # opt-in precision tiers: engine_kwargs={"decode_weights": "int8"}   # or "fp8"
-#                         engine_kwargs={"expert_weights": "fp8"}
+#                         engine_kwargs={"decode_weights": "w4a8", "paro_checkpoint": "<Alpamayo-1.5-10B-PARO dir>"}
+#                         engine_kwargs={"expert_weights": "fp8"}, {"prefill_weights": "fp8"}, {"vision_weights": "fp8"}
+#                         engine_kwargs={"pdl": True}
 # cuBLAS / torch elementwise instead of the tcgen05 paths:
 #                         engine_kwargs={"vision_gemm": "torch", "expert_gemm": "torch"}
 ```
@@ -472,6 +474,25 @@ FP8 E4M3 copies of the fused q/k/v, o, fused gate|up and down weights, per-row
 FP8 activations quantized by a kernel before each GEMM, and the scales applied
 in the tcgen05 GEMM epilogue. The expert's weight stream halves (its 10 Euler
 steps go from 215 to 130 ms); +4.6 GB.
+
+`decode_weights="w4a8"` (with `paro_checkpoint=<directory>`) runs the decode
+projections as the ParoQuant W4A8 linears of `z-lab/Alpamayo-1.5-10B-PARO`
+(the checkpoint FlashDrive uses; its language-model tensors are the official
+weights quantized): a learned pairwise rotation of each input, per-token INT8
+activations, UINT4 weights with zero points and integer group scales, Marlin's
+arithmetic on FlashRT's few-row kernels, the LM head as INT8. The weight
+stream is a quarter of BF16 (decode 68 -> about 24 ms per token); the engine
+reads the Marlin buffers through its own copy of the layout maps, so the
+vLLM package is not needed. +4.9 GB.
+
+`vision_weights="fp8"` runs each vision block's qkv, proj, fc1 and fc2 as W8A8:
+LayerNorm outputs, the attention output and GELU(fc1) quantized per row, and
+the bias, GELU and residual applied in the FP8 GEMM epilogue; the patch
+embedding and the mergers stay BF16. Changes the image features. +0.45 GB.
+
+`pdl=True` launches every engine kernel and GEMM with programmatic dependent
+launch (a kernel's prologue overlaps its predecessor's tail inside the CUDA
+graphs). It is a process-wide switch shared with the FlashDrive backend.
 
 `prefill_weights="fp8"` does the same for the 36 prefill layers: per-row FP8
 activations (h, attention output, SiLU-mul output) and per-row FP8 weights on

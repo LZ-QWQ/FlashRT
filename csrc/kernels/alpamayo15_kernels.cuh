@@ -82,6 +82,9 @@ int alpamayo15_rms_fp8_rows_bf16(void* residual, const void* delta, const void* 
                                  int rows, int dim, float eps, cudaStream_t stream);
 int alpamayo15_silu_mul_fp8_rows_bf16(const void* gate, const void* up, int ld, void* q, float* scale, int rows, int F,
                                       cudaStream_t stream);
+//   res_rms_f32_fp8_rows  the FP32-residual expert RMSNorm (alpamayo15_res_rms_f32_bf16) -> q [rows, dim], scale [rows]
+int alpamayo15_res_rms_f32_fp8_rows_bf16(float* residual, const void* delta, const void* weight, void* q, float* scale,
+                                         int rows, int dim, float eps, cudaStream_t stream);
 
 // qkv : [rows, (Hq + 2*Hk) * 128] bf16; cos/sin : [rows, 128] bf16
 // q_out : [rows, Hq, 128] bf16

@@ -84,17 +84,29 @@ using Fp8ScaleTree = fe::Sm90EVT<fe::Sm90Compute<cutlass::multiplies, ElementD, 
     fe::Sm90EVT<fe::Sm90Compute<cutlass::multiplies, ElementCompute, ElementCompute, kRN>, fe::Sm90AccFetch, RowScaleNode<Tile>>,
     ColScaleNode<Tile>>;
 
-template <class Tile, bool k2Sm = false>
+// The same with bias / activation / residual (the W8A8 vision tier): D = act(acc * a_s[m] * w_s[n] + bias[n]) (+ C).
+template <class Tile>
+using Fp8Scaled = fe::Sm90EVT<fe::Sm90Compute<cutlass::multiplies, ElementCompute, ElementCompute, kRN>,
+    fe::Sm90EVT<fe::Sm90Compute<cutlass::multiplies, ElementCompute, ElementCompute, kRN>, fe::Sm90AccFetch, RowScaleNode<Tile>>,
+    ColScaleNode<Tile>>;
+template <class Tile>
+using Fp8ScaledBias = fe::Sm90EVT<fe::Sm90Compute<cutlass::plus, ElementCompute, ElementCompute, kRN>, Fp8Scaled<Tile>, BiasNode<Tile>>;
+template <class Tile, template <class> class Act>
+using Fp8ActTree = fe::Sm90EVT<fe::Sm90Compute<Act, ElementD, ElementCompute, kRN>, Fp8ScaledBias<Tile>>;
+template <class Tile>
+using Fp8ResTree = fe::Sm90EVT<fe::Sm90Compute<cutlass::plus, ElementD, ElementCompute, kRN>, Fp8ScaledBias<Tile>, fe::Sm90SrcFetch<ElementAB>>;
+
+template <class Tile, bool k2Sm = false, class Fusion_ = Fp8ScaleTree<Tile>, class ElemC = void>
 struct Fp8GemmDef {
   using Cluster = cute::conditional_t<k2Sm, Shape<_2, _1, _1>, Shape<_1, _1, _1>>;
   using MainSched = cute::conditional_t<k2Sm, cutlass::gemm::KernelTmaWarpSpecialized2SmSm100,
                                         cutlass::gemm::collective::KernelScheduleAuto>;
   using EpiSched = cute::conditional_t<k2Sm, cutlass::epilogue::TmaWarpSpecialized2Sm,
                                        cutlass::epilogue::collective::EpilogueScheduleAuto>;
-  using Fusion = Fp8ScaleTree<Tile>;
+  using Fusion = Fusion_;
   using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp, Tile, Cluster,
-      cutlass::epilogue::collective::EpilogueTileAuto, ElementAcc, ElementCompute, void,
+      cutlass::epilogue::collective::EpilogueTileAuto, ElementAcc, ElementCompute, ElemC,
       cutlass::layout::RowMajor, kAlign, ElementD, cutlass::layout::RowMajor, kAlign,
       EpiSched, Fusion>::CollectiveOp;
   using Mainloop = typename cutlass::gemm::collective::CollectiveBuilder<
@@ -108,6 +120,14 @@ struct Fp8GemmDef {
 using F8G64 = Fp8GemmDef<Shape<_64, _128, _128>>;            // tile 1: few-row operands (action expert)
 using F8G128 = Fp8GemmDef<Shape<_128, _128, _128>>;          // tile 0
 using F8G256P = Fp8GemmDef<Shape<_256, _128, _128>, true>;   // tile 2: 2-SM UMMA, 2 x 1 cluster (prefill)
+using Tile256F8 = Shape<_256, _128, _128>;
+template <class T> using IdentityActF = cutlass::epilogue::thread::Identity<T>;
+template <class T> using GeluTanhActF = cutlass::epilogue::thread::GELU_taylor<T>;
+template <class T> using GeluErfActF = cutlass::epilogue::thread::GELU<T>;
+using F8G256Bias = Fp8GemmDef<Tile256F8, true, Fp8ActTree<Tile256F8, IdentityActF>>;
+using F8G256Tanh = Fp8GemmDef<Tile256F8, true, Fp8ActTree<Tile256F8, GeluTanhActF>>;
+using F8G256Erf = Fp8GemmDef<Tile256F8, true, Fp8ActTree<Tile256F8, GeluErfActF>>;
+using F8G256Res = Fp8GemmDef<Tile256F8, true, Fp8ResTree<Tile256F8>, ElementAB>;
 
 // INT8 x INT8 -> FP16 with per-row activation scales and per-column weight scales (per-channel INT8 prefill tier):
 // D[m, n] = half(float(acc[m, n]) * a_s[m] * w_s[n]), int32 accumulation.
@@ -255,6 +275,45 @@ unsigned long long ws_size(int M, int N, int K) {
   return Def::Gemm::get_workspace_size(make_args<Def, kRes>(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K));
 }
 
+// bias / activation (/ residual C) forms: the scaled accumulator plus the bias is the first child of both trees.
+template <class G, bool kRes>
+typename G::Gemm::Arguments make_fp8_act_args(const void* A, const void* B, const float* a_s, const float* w_s,
+                                              const void* bias, const void* C, void* D, int M, int N, int K, int ldd) {
+  using Gemm = typename G::Gemm;
+  auto sA = cutlass::make_cute_packed_stride(typename Gemm::GemmKernel::StrideA{}, make_shape(M, K, 1));
+  auto sB = cutlass::make_cute_packed_stride(typename Gemm::GemmKernel::StrideB{}, make_shape(N, K, 1));
+  typename Gemm::GemmKernel::StrideD sD{int64_t(ldd), _1{}, int64_t(0)};
+  typename Gemm::GemmKernel::StrideC sC{int64_t(ldd), _1{}, int64_t(0)};
+  typename Gemm::Arguments args{cutlass::gemm::GemmUniversalMode::kGemm,
+                                {M, N, K, 1},
+                                {static_cast<const ElementF8*>(A), sA, static_cast<const ElementF8*>(B), sB},
+                                {{}, static_cast<const ElementAB*>(C), sC, static_cast<ElementD*>(D), sD}};
+  auto& sb = args.epilogue.thread.op_0;        // (acc * a_s * w_s) + bias
+  sb.op_0.op_0.op_1.ptr_col = a_s;
+  sb.op_0.op_0.op_1.null_default = 1.0f;
+  sb.op_0.op_0.op_1.dCol = {_1{}, _0{}, int64_t(0)};
+  sb.op_0.op_1.ptr_row = w_s;
+  sb.op_0.op_1.null_default = 1.0f;
+  sb.op_0.op_1.dRow = {_0{}, _1{}, int64_t(0)};
+  sb.op_1.ptr_row = static_cast<const ElementAB*>(bias);
+  sb.op_1.null_default = ElementAB(0);
+  sb.op_1.dRow = {_0{}, _1{}, int64_t(0)};
+  return args;
+}
+
+template <class G, bool kRes>
+int run_fp8_act(const void* A, const void* B, const float* a_s, const float* w_s, const void* bias, const void* C, void* D,
+                int M, int N, int K, int ldd, void* workspace, unsigned long long workspace_bytes, int pdl, cudaStream_t stream) {
+  using Gemm = typename G::Gemm;
+  auto args = make_fp8_act_args<G, kRes>(A, B, a_s, w_s, bias, C, D, M, N, K, ldd);
+  Gemm gemm;
+  if (Gemm::get_workspace_size(args) > workspace_bytes) return 3;
+  if (gemm.can_implement(args) != cutlass::Status::kSuccess) return 5;
+  if (gemm.initialize(args, workspace, stream) != cutlass::Status::kSuccess) return 6;
+  if (gemm.run(stream, nullptr, pdl != 0) != cutlass::Status::kSuccess) return 7;
+  return cudaPeekAtLastError() == cudaSuccess ? 0 : 4;
+}
+
 template <class G>
 int run_fp8(const void* A, const void* B, const float* a_s, const float* w_s, void* D, int M, int N, int K, int ldd,
             void* workspace, unsigned long long workspace_bytes, int pdl, cudaStream_t stream) {
@@ -309,6 +368,28 @@ int flashrt_a15_fp8_gemm_sm100_workspace(int M, int N, int K, int tile, unsigned
                    : tile == 1 ? F8G64::Gemm::get_workspace_size(make_fp8_args<F8G64>(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K, N))
                    : F8G128::Gemm::get_workspace_size(make_fp8_args<F8G128>(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K, N));
   return 0;
+}
+// FP8 GEMM with bias, activation (0 identity, 1 GELU tanh, 2 GELU erf) and optional residual C (identity only) on the
+// 2-SM 256 x 128 x 128 tile: D = act(acc * a_s[m] * w_s[n] + bias[n]) (+ C); C and D rows ldd elements apart.
+int flashrt_a15_fp8_gemm_act_sm100_workspace(int M, int N, int K, int act, int residual, unsigned long long* workspace_bytes) {
+  if (M <= 0 || N <= 0 || K <= 0 || (N % kAlign) || (K % 16) || act < 0 || act > 2 || (residual && act != 0)) return 2;
+  if (residual) *workspace_bytes = F8G256Res::Gemm::get_workspace_size(make_fp8_act_args<F8G256Res, true>(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K, N));
+  else if (act == 0) *workspace_bytes = F8G256Bias::Gemm::get_workspace_size(make_fp8_act_args<F8G256Bias, false>(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K, N));
+  else if (act == 1) *workspace_bytes = F8G256Tanh::Gemm::get_workspace_size(make_fp8_act_args<F8G256Tanh, false>(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K, N));
+  else *workspace_bytes = F8G256Erf::Gemm::get_workspace_size(make_fp8_act_args<F8G256Erf, false>(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K, N));
+  return 0;
+}
+int flashrt_a15_fp8_gemm_act_sm100(const void* A, const void* B, const float* a_s, const float* w_s, const void* bias,
+                                   const void* C, void* D, int M, int N, int K, int act, int ldd, void* workspace,
+                                   unsigned long long workspace_bytes, int pdl, cudaStream_t stream) {
+  if (!A || !B || !a_s || !w_s || !D || (workspace_bytes && !workspace)) return 1;
+  if (M <= 0 || N <= 0 || K <= 0 || (N % kAlign) || (K % 16) || act < 0 || act > 2 || (C && act != 0) || ldd < N || (ldd % kAlign)) return 2;
+  if (!aligned16(A) || !aligned16(B) || !aligned16(D) || !aligned16(a_s) || !aligned16(w_s) || (bias && !aligned16(bias)) ||
+      (C && !aligned16(C))) return 5;
+  if (C) return run_fp8_act<F8G256Res, true>(A, B, a_s, w_s, bias, C, D, M, N, K, ldd, workspace, workspace_bytes, pdl, stream);
+  if (act == 0) return run_fp8_act<F8G256Bias, false>(A, B, a_s, w_s, bias, nullptr, D, M, N, K, ldd, workspace, workspace_bytes, pdl, stream);
+  if (act == 1) return run_fp8_act<F8G256Tanh, false>(A, B, a_s, w_s, bias, nullptr, D, M, N, K, ldd, workspace, workspace_bytes, pdl, stream);
+  return run_fp8_act<F8G256Erf, false>(A, B, a_s, w_s, bias, nullptr, D, M, N, K, ldd, workspace, workspace_bytes, pdl, stream);
 }
 int flashrt_a15_fp8_gemm_sm100(const void* A, const void* B, const float* a_s, const float* w_s, void* D, int M, int N,
                                int K, int tile, int ldd, void* workspace, unsigned long long workspace_bytes, int pdl,
