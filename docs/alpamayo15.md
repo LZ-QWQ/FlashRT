@@ -490,8 +490,20 @@ FlashDrive's execution (eager or `torch.compile`). Calls must run under
 | `vision` | `_encode` | the FlashRT Alpamayo 1.5 vision tower (one-GEMM patch embedding, FP32 RoPE kernel, batched FA4 attention), one CUDA graph per frame grid |
 | `prefill` | `_dflash_prefill`, `_shift_streaming_kv_cache`, cache bookkeeping of `_first_prefill` | 36 decoder layers on FlashRT kernels (fused head norm + RoPE writing the cache, FA4, fused residual + RMSNorm, SiLU-mul) with FlashDrive's W4A8 projections; the window's rows attend by one FA4 varlen call; one CUDA graph per stream |
 | `decode` (needs `prefill="flashrt"`) | `_dflash_block_step`, `_dflash_traj_forward` | draft proposal, 8-row verification, posterior sampling (FlashDrive's `sample_tokens`) and acceptance decisions in one CUDA graph, replayed once per round; the trajectory-start forward as a one-row graph |
-| `w4a8="fused"` (default with `prefill="flashrt"`) | the W4A8 linears inside the above | one activation pass per shared input (FP16 cast, ParoQuant pairwise rotation, per-token INT8 quantization), vLLM's Marlin W4A8 GEMM on each linear's own buffers, and the FP16 GEMM outputs read directly by the next kernel (head norm + RoPE, residual + RMSNorm, SiLU-mul), which applies FlashDrive's cast to BF16 on load |
-| `w4a8_gemm="tcgen05"` (default with `w4a8="fused"`) | the W4A8 GEMMs of streaming-window prefill (groups of at least 256 rows) | an INT8 tensor-core (tcgen05) GEMM on the unpacked `w - z` weights with Marlin's integer group scales; verification and trajectory-start rows stay on Marlin, which is faster at a few rows |
+| `w4a8="fused"` (default with `prefill="flashrt"`) | the W4A8 linears inside the above | one activation pass per shared input (FP16 cast, ParoQuant pairwise rotation, per-token INT8 quantization) and the FP16 GEMM outputs read directly by the next kernel (head norm + RoPE, residual + RMSNorm, SiLU-mul), which applies FlashDrive's cast to BF16 on load |
+| `w4a8_gemm="tcgen05"` (default with `w4a8="fused"`) | the W4A8 GEMMs | FlashRT GEMMs computing Marlin's integer arithmetic: an INT8 tensor-core (tcgen05) GEMM on the unpacked `w - z` weights for streaming-window prefill (groups of at least 256 rows) and a few-row `mma.sync` kernel on the packed nibbles, zero points and integer group scales for verification and trajectory-start rows; `"marlin"` keeps vLLM's kernel for every group |
+| `decode` graphs | DFlash draft, LM head | the two-layer draft (fc + hidden norm, attention of the block rows over context + block keys on FA4, SiLU MLP) and the LM head on FlashRT's few-row BF16 GEMM (`mma.sync`, weights read in place) |
+| `vision_gemm="cutlass"` (default) | vision tower GEMMs | tcgen05 BF16 GEMMs with the bias, GELU (tanh / erf) and residual add fused into the epilogue; FlashRT LayerNorm; `"torch"` keeps cuBLAS and torch elementwise |
+| `expert_gemm="cutlass"` (default) | expert projections | tcgen05 BF16 GEMMs (64-row tiles) and a fused SiLU-mul over the gate|up output; `"torch"` keeps cuBLAS |
+| `_shift_streaming_kv_cache` | frame-block shift | one kernel moves every layer's frame blocks (keys, values) and rotates the moved keys into the VLM view |
+
+Every kernel and GEMM of the backend is launched with programmatic dependent launch (`pdl=True`, process-wide), so a
+kernel's prologue overlaps its predecessor's tail inside the CUDA graphs. Precision tiers (off by default, numerics
+changes to validate on your scenarios): `act_rot="dense"` (the ParoQuant rotation as one 128 x 128 FP16 matrix per
+channel group on tensor cores, one FP16 rounding instead of eight), `decode_weights="fp8"` (per-row FP8 E4M3 copies of
+the LM head and draft linears on the W8A16 kernel), `expert_weights="fp8"` (W8A8: per-row FP8 activations and weights on
+the FP8 tcgen05 GEMM, scales applied in the epilogue). `w4a8_ktile=256` runs the prefill GEMM with two groups per
+mainloop step (identical integers).
 
 ### Cache contract
 
@@ -548,9 +560,12 @@ passes it no mask), the expert rows `[0, action_start + 64)`.
 - `flashdrive`, its Alpamayo dependency (`alpamayo1_5`), `paroquant` (its
   rotation kernel is compiled on first use) and vLLM's Marlin W4A8 GEMM
   (`torch.ops._C.marlin_gemm` with INT8 activations), which FlashDrive's W4A8
-  layers call. vLLM wheels target other PyTorch builds and GPUs; on Thor's
-  platform PyTorch, build the Marlin kernels from the vLLM source for
-  `sm_110` (only the INT8-activation / UINT4-weight instantiations are used).
+  layers call in its own first-window prefill, in the `w4a8_gemm="marlin"`
+  ablation and in the backend's one-time agreement check of its GEMMs against
+  Marlin. vLLM wheels target other PyTorch builds and GPUs; on Thor's platform
+  PyTorch, build the Marlin kernels from the vLLM source for `sm_110` (only the
+  INT8-activation / UINT4-weight instantiations are used). The streaming
+  windows themselves run on FlashRT kernels only.
 
 ## Usage
 

@@ -1734,9 +1734,23 @@ if(FLASHRT_ENABLE_ALPAMAYO15)
   target_compile_options(alpamayo15_fd_w4a8_obj PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr -O3 ${GPU_GENCODE}>
   )
+  # BF16 GEMMs (vision tower, action expert) on tcgen05 with fused bias / GELU / residual epilogues.
+  add_library(alpamayo15_bf16_gemm_obj OBJECT csrc/gemm/alpamayo15_bf16_gemm_sm100.cu)
+  set_target_properties(alpamayo15_bf16_gemm_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(alpamayo15_bf16_gemm_obj PRIVATE
+    ${CUTLASS_INCLUDE}
+    ${CUTLASS_DIR}/tools/util/include
+  )
+  target_compile_options(alpamayo15_bf16_gemm_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr -O3 ${GPU_GENCODE}>
+  )
   target_sources(flash_rt_kernels PRIVATE csrc/kernels/alpamayo15_kernels.cu
                                          csrc/kernels/alpamayo15_flashdrive_kernels.cu
-                                         $<TARGET_OBJECTS:alpamayo15_fd_w4a8_obj>)
+                                         $<TARGET_OBJECTS:alpamayo15_fd_w4a8_obj>
+                                         $<TARGET_OBJECTS:alpamayo15_bf16_gemm_obj>)
   target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_ALPAMAYO15=1)
   message(STATUS "Alpamayo 1.5 kernels: ENABLED (sm_110)")
 else()

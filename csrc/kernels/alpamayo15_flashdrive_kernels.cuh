@@ -78,5 +78,95 @@ int flashdrive_w4a8_act_prep(const void* x, int ld_x, int rows, int K, int n_set
                              const float* const* igs, void* const* xr, float* const* part, void* const* xq,
                              float* const* a_scale, cudaStream_t stream);
 
+// FlashDrive's streaming frame-block shift of every layer's cache in one launch, plus the VLM view of the moved
+// rows: for every view v and frame pair f (F-1 pairs), cache rows [ranges[v][f+1][0], ranges[v][f+1][1]) of keys and
+// values move to rows [ranges[v][f][0], ranges[v][f][1]) (equal lengths; frames processed in increasing f so a
+// block is read before it is overwritten), and kvlm[l][dst] = BF16-rule rotation of the moved key at dst.
+//   k_ptrs / v_ptrs : device arrays of L pointers to the FlashDrive cache tensors (element (c, h, d) at
+//                     c * kv_rs + h * kv_hs + d, in elements)
+//   kvlm            : [L, S, Hk, 128] bf16 attention copy
+//   ranges          : device int32 [n_views, F, 2] (start, end) rows per view and frame
+//   cos / sin       : [S, 128] bf16 position tables
+int flashdrive_shift_cache(const void* const* k_ptrs, const void* const* v_ptrs, long long kv_rs, long long kv_hs,
+                           void* kvlm, const void* cos, const void* sin, const int* ranges, int n_views, int F,
+                           int L, int S, int Hk, cudaStream_t stream);
+
+// W4A8 GEMM for a few rows (verification block, trajectory-start row): Marlin's integer arithmetic
+//   out[m, n] = half( float( sum_g s[g, n] * sum_{k in g} x[m, k] * (w[k, n] - z[g, n]) ) * a_scale[m] )
+// on mma.sync m16n8k32 (int8 x int8 -> int32): weights are the A operand (16 output rows x 32 k), the INT8
+// activations the B operand (up to 16 tokens as two 8-column tiles). Group partials and their integer scaling are
+// exact int32 (as the tcgen05 prefill GEMM); the total is converted to float once and scaled per token.
+//   xq      [rows_alloc >= ceil(M/8)*8, K] int8 row-major (rows beyond M are read, never written back)
+//   a_scale [M] fp32
+//   w_pack  [N/16][K/64][32 lanes][16 B]: nibbles of the two k32 A fragments of a 64-wide k chunk (low nibble =
+//           first fragment), see pack_w4a8_small in the pipeline
+//   zp      [K/128][N] uint8 zero points, sg [K/128][N] int32 group scales (0..4096)
+//   out     [M, N] fp16 row-major
+// M in [1, 16], N % 16 == 0, K % 1024 == 0 (eight 128-wide groups per K split).
+int flashdrive_w4a8_gemm_small(const void* xq, const float* a_scale, const void* w_pack, const void* zp,
+                               const int* sg, void* out, int M, int N, int K, cudaStream_t stream);
+
+// BF16 GEMM for a few rows (DFlash draft projections, LM head on the block rows):
+//   y[m, n] = sum_k x[m, k] * w[n, k]   (mma.sync m16n8k16 bf16, FP32 accumulation; weights are the A operand read
+//   straight from the row-major [N, K] tensor, so no repacked copy is kept)
+//   x   [rows_alloc >= ceil(M/8)*8, K] bf16 row-major, leading dimension ld_x (rows beyond M are read, not written)
+//   w   [N, K] bf16 row-major (any N; the last 16-row tile is guarded), K % 512 == 0
+//   y   [M, N] row-major, leading dimension ld_y: bf16 (y_f32 = 0) or fp32 (y_f32 = 1)
+// M in [1, 16]. Deterministic (fixed reduction order).
+int flashdrive_bf16_gemm_small(const void* x, int ld_x, const void* w, void* y, int ld_y, int y_f32, int M, int N,
+                               int K, cudaStream_t stream);
+
+// DFlash draft attention operands: Qwen3 head RMSNorm + BF16-rule RoPE (as flashdrive_qk_prep_bf16, fp32_rule 0)
+// of q rows (positions ctx .. ctx + nq - 1 of the table) and of nk = ctx + nq key rows (positions 0 .. nk - 1);
+// values copied. q [nq, Hq*128], k/v [nk, Hk*128] bf16 with leading dims; cos/sin [nk, 128] bf16;
+// q_out [nq, Hq, 128], k_out/v_out [nk, Hk, 128] bf16.
+int flashdrive_draft_qkv_prep_bf16(const void* q, const void* k, const void* v, int q_ld, int k_ld, int v_ld,
+                                   const void* q_norm_w, const void* k_norm_w, const void* cos, const void* sin,
+                                   void* q_out, void* k_out, void* v_out, int nq, int ctx, int Hq, int Hk, float eps,
+                                   cudaStream_t stream);
+
+// Dense formulation of the ParoQuant rotation: y[m, g*128 + c] = sum_k R[g][c][k] * (half(x[m, g*128 + k]) * scale),
+// one 128 x 128 FP16 matrix per 128-channel group (the product of the 8 Givens layers, precomputed), FP32
+// accumulation on tensor cores, outputs rounded to FP16 once (not bit-identical to the layer-by-layer kernel: no
+// per-layer FP16 rounding). Writes the rotated rows (xr) and the per-(row, group) absmax (part) consumed by the
+// quantization pass of flashdrive_w4a8_act_prep. Per set: rot [K/128, 128, 128] fp16 (R[g][c][k]), scales [K] fp16,
+// xr [rows, K] fp16, part [rows, K/128] fp32. x [rows, K] bf16 with leading dim ld_x; K % 128 == 0; 1-3 sets.
+int flashdrive_w4a8_rotate_dense(const void* x, int ld_x, int rows, int K, int n_sets, const void* const* rot,
+                                 const void* const* scales, void* const* xr, float* const* part, cudaStream_t stream);
+
+// The quantization pass of flashdrive_w4a8_act_prep alone (xr/part -> xq/a_scale).
+int flashdrive_w4a8_quant(int rows, int K, int n_sets, const void* const* xr, const float* const* part,
+                          const float* const* igs, void* const* xq, float* const* a_scale, cudaStream_t stream);
+
+// LayerNorm of BF16 rows with FP32 statistics and arithmetic, one BF16 rounding (F.layer_norm on BF16 input with
+// BF16 weight/bias under autocast): out[r] = (x[r] - mean) * rsqrt(var + eps) * w + b. dim % 8 == 0 (8-byte vectors).
+int flashdrive_layernorm_bf16(const void* x, const void* w, const void* b, void* out, int rows, int dim, float eps,
+                              cudaStream_t stream);
+
+// out[r, f] = bf16(silu(bf16 gu[r, f])) * bf16 gu[r, F + f] (the rounding of silu_mul_qwen36_bf16) for a fused
+// gate | up GEMM output gu [rows, 2F] bf16; out [rows, F] bf16. F % 4 == 0.
+int flashdrive_silu_mul_split_bf16(const void* gu, void* out, int rows, int F, cudaStream_t stream);
+
+// Per-row FP8 E4M3 quantization of BF16 activations (the W8A8 expert tier): scale[r] = absmax(row) / 448 (1 for an
+// all-zero row), q = round-to-nearest-even(x / scale) saturated to +-448. x [rows, K] bf16 with leading dim ld_x,
+// q [rows, K] e4m3 bytes, scale [rows] fp32. K % 8 == 0.
+int flashdrive_quantize_fp8_rows_bf16(const void* x, int ld_x, void* q, float* scale, int rows, int K, cudaStream_t stream);
+
+// Process-wide programmatic-dependent-launch switch for every FlashDrive-backend kernel (off by default).
+void flashdrive_set_pdl(bool on);
+bool flashdrive_pdl();
+
+// Streaming variants of the few-row GEMMs: one warp per 16-row weight tile over the full K (no K split, no shared
+// memory), four warps per CTA, 16-byte streaming loads -- the structure that reaches the DRAM rate on Thor for
+// N >= 2048 (many independent streams); the CTA-split kernels above stay for small N.
+//   W4A8: same operands as flashdrive_w4a8_gemm_small (M <= 16, N % 16 == 0, K % 128 == 0)
+int flashdrive_w4a8_gemm_tile(const void* xq, const float* a_scale, const void* w_pack, const void* zp, const int* sg,
+                              void* out, int M, int N, int K, cudaStream_t stream);
+//   BF16 on fragment-ordered weights: w_frag [ceil(N/16)][K/16][32 lanes][16 B] (bf16_fragment_layout in the
+//   pipeline: lane 4g+c holds a0 = w[16T+g, 16kc+2c..+1], a1 = row +8, a2 = cols +8, a3 = both), K % 16 == 0;
+//   x [rows_alloc >= ceil(M/8)*8, K] bf16 with leading dim ld_x; y [M, N] bf16 (y_f32 = 0) or fp32, leading dim ld_y.
+int flashdrive_bf16_gemm_frag(const void* x, int ld_x, const void* w_frag, void* y, int ld_y, int y_f32, int M, int N,
+                              int K, cudaStream_t stream);
+
 }  // namespace kernels
 }  // namespace flash_rt

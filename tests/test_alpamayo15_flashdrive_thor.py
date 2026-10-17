@@ -403,6 +403,44 @@ def test_w4a8_act_prep_bit_exact_with_paroquant_and_vllm(rows, K):
         assert torch.equal(r.view(torch.int16), x_rot.view(torch.int16))   # FP16 workspace, bitwise (inf/NaN rows)
 
 
+def test_shift_cache_matches_flashdrive_shift_and_rotation():
+    """One launch moves every layer's frame blocks f+1 -> f (FlashDrive's gather + scatter) and rotates the
+    moved keys into the VLM view (BF16 rule at the destination rows)."""
+    fvk = _kernels()
+    torch.manual_seed(16)
+    L, S, Hk, D = 3, 700, 8, 128
+    frames = [[(10, 40), (40, 70), (70, 100), (100, 130)], [(140, 165), (165, 190), (190, 215), (215, 240)],
+              [(250, 300), (300, 350), (350, 400), (400, 450)], [(460, 470), (470, 480), (480, 490), (490, 500)]]
+    src = torch.cat([torch.arange(s0, s1) for v in frames for (_, _), (s0, s1) in zip(v[:-1], v[1:])]).cuda()
+    dst = torch.cat([torch.arange(d0, d1) for v in frames for (d0, d1), (_, _) in zip(v[:-1], v[1:])]).cuda()
+    k = [torch.randn(1, Hk, S, D, device="cuda").to(BF16) for _ in range(L)]
+    v = [torch.randn(1, Hk, S, D, device="cuda").to(BF16) for _ in range(L)]
+    cos = torch.randn(S, D, device="cuda").to(BF16)
+    sin = torch.randn(S, D, device="cuda").to(BF16)
+    kvlm = torch.randn(L, S, Hk, D, device="cuda").to(BF16)
+    k_ref = [t.clone() for t in k]
+    v_ref = [t.clone() for t in v]
+    kvlm_ref = kvlm.clone()
+    for t in k_ref + v_ref:
+        t.index_copy_(2, dst, t.index_select(2, src))
+    for li in range(L):
+        kr = k_ref[li][0].permute(1, 0, 2)                      # [S, Hk, D]
+        rows = kr[dst].float()
+        c, s_ = cos[dst].float().unsqueeze(1), sin[dst].float().unsqueeze(1)
+        half = D // 2
+        rot = torch.cat((-rows[..., half:], rows[..., :half]), dim=-1)
+        kvlm_ref[li, dst] = ((rows * c).to(BF16).float() + (rot * s_).to(BF16).float()).to(BF16)
+    ranges = torch.tensor(frames, dtype=torch.int32, device="cuda")
+    kp = torch.tensor([t.data_ptr() for t in k], dtype=torch.int64, device="cuda")
+    vp = torch.tensor([t.data_ptr() for t in v], dtype=torch.int64, device="cuda")
+    fvk.flashdrive_shift_cache(kp.data_ptr(), vp.data_ptr(), D, S * D, kvlm.data_ptr(), cos.data_ptr(), sin.data_ptr(),
+                               ranges.data_ptr(), len(frames), 4, L, S, Hk, torch.cuda.current_stream().cuda_stream)
+    torch.cuda.synchronize()
+    for a, b in zip(k + v, k_ref + v_ref):
+        assert torch.equal(a, b)
+    assert torch.equal(kvlm, kvlm_ref)
+
+
 def test_fa4_call_patterns_match_flashdrive_masks():
     """The backend's three FA4 calls against SDPA with FlashDrive's masks: streaming rows causal by cache position
     (shared-prefix varlen), verification rows causal over [0, cur + 8), the unmasked trajectory-start row. Each
@@ -537,6 +575,423 @@ def _release_model():
 
 @pytest.mark.skipif(not _CKPT, reason="set FLASHRT_FLASHDRIVE_CKPT to the z-lab checkpoint directory")
 @pytest.mark.usefixtures("_release_model")
+
+
+@pytest.mark.parametrize("M,N,K", [(1, 1024, 4096), (8, 4096, 4096), (7, 1024, 12288), (16, 2048, 4096), (13, 256, 1024)])
+def test_w4a8_small_gemm_is_exact(M, N, K):
+    """The few-row W4A8 GEMM computes Marlin's integers exactly (float64 reference) and agrees with the tcgen05
+    kernel (checked against Marlin itself in the previous test) on the same activations."""
+    fvk = _kernels()
+    from flash_rt.models.alpamayo15_flashdrive.pipeline_thor import pack_w4a8_small
+    torch.manual_seed(17)
+    G = K // 128
+    w = torch.randint(0, 16, (K, N), device="cuda", dtype=torch.uint8)
+    z = torch.randint(0, 16, (G, N), device="cuda", dtype=torch.uint8)
+    sg = torch.randint(0, 4097, (G, N), device="cuda", dtype=torch.int32)
+    Ma = (M + 7) // 8 * 8
+    xq = torch.randint(-128, 128, (Ma, K), device="cuda", dtype=torch.int8)
+    a_s = (torch.rand(M, device="cuda") * 2e-2 + 1e-3) * 7e-6
+    out = torch.empty(M, N, device="cuda", dtype=torch.float16)
+    fvk.flashdrive_w4a8_gemm_small(xq.data_ptr(), a_s.data_ptr(), pack_w4a8_small(w, K, N).data_ptr(), z.data_ptr(),
+                                   sg.data_ptr(), out.data_ptr(), M, N, K, torch.cuda.current_stream().cuda_stream)
+    torch.cuda.synchronize()
+    wz = (w.to(torch.int64) - z.to(torch.int64).repeat_interleave(128, 0))            # [K, N]
+    part = torch.einsum("mgk,gkn->mgn", xq[:M].to(torch.float64).view(M, G, 128), wz.to(torch.float64).view(G, 128, N))
+    total = (part * sg.to(torch.float64).unsqueeze(0)).sum(1)                           # exact in float64 (< 2^53)
+    assert torch.equal(total, total.round())
+    ref = (total.to(torch.int64).to(torch.float32) * a_s.unsqueeze(1)).to(torch.float16)
+    assert torch.equal(out, ref)
+    out_t = torch.empty(M, N, device="cuda", dtype=torch.float16)          # streaming warp-per-tile variant
+    fvk.flashdrive_w4a8_gemm_tile(xq.data_ptr(), a_s.data_ptr(), pack_w4a8_small(w, K, N).data_ptr(), z.data_ptr(),
+                                  sg.data_ptr(), out_t.data_ptr(), M, N, K, torch.cuda.current_stream().cuda_stream)
+    torch.cuda.synchronize()
+    assert torch.equal(out_t, ref)
+    if M >= 1 and N % 8 == 0:
+        w8 = wz.to(torch.int8).t().contiguous()
+        nbytes, n_ones = fvk.flashdrive_w4a8_gemm_sm100_sizes(M, N, K)
+        ws = torch.empty(max(int(nbytes), 1), dtype=torch.uint8, device="cuda")
+        ones = torch.ones(int(n_ones) + 1024, dtype=torch.int32, device="cuda")
+        out2 = torch.empty(M, N, device="cuda", dtype=torch.float16)
+        fvk.flashdrive_w4a8_gemm_sm100(xq[:M].contiguous().data_ptr(), w8.data_ptr(), sg.data_ptr(), ones.data_ptr(),
+                                       a_s.data_ptr(), out2.data_ptr(), M, N, K, ws.data_ptr(), ws.numel(),
+                                       torch.cuda.current_stream().cuda_stream)
+        torch.cuda.synchronize()
+        assert torch.equal(out2, out)
+        out3 = torch.empty(M, N, device="cuda", dtype=torch.float16)      # 256-deep K tile: the same integers
+        fvk.flashdrive_w4a8_gemm_sm100(xq[:M].contiguous().data_ptr(), w8.data_ptr(), sg.data_ptr(), ones.data_ptr(),
+                                       a_s.data_ptr(), out3.data_ptr(), M, N, K, ws.data_ptr(), ws.numel(),
+                                       torch.cuda.current_stream().cuda_stream, 256)
+        torch.cuda.synchronize()
+        assert torch.equal(out3, out)
+
+
+def test_pack_w4a8_small_layout():
+    """Lane fragments: lane 4g+t, byte 4(2 half + rh) + j = w[16T + 8rh + g, 64C + 32ks + 16half + 4t + j], ks in the nibble."""
+    from flash_rt.models.alpamayo15_flashdrive.pipeline_thor import pack_w4a8_small
+    K, N = 256, 32
+    w = torch.randint(0, 16, (K, N), dtype=torch.uint8)
+    p = pack_w4a8_small(w, K, N)
+    assert p.shape == (N // 16, K // 64, 32, 16)
+    for T, C, lane, byte in [(0, 0, 0, 0), (1, 3, 31, 15), (1, 2, 9, 6), (0, 1, 22, 11)]:
+        g, t = lane // 4, lane % 4
+        a, j = byte // 4, byte % 4
+        half, rh = a // 2, a % 2
+        n = 16 * T + 8 * rh + g
+        for ks in (0, 1):
+            k = 64 * C + 32 * ks + 16 * half + 4 * t + j
+            nib = (int(p[T, C, lane, byte]) >> (4 * ks)) & 0xF
+            assert nib == int(w[k, n])
+
+
+@pytest.mark.parametrize("M,N,K,act,tile,res", [(3072, 3456, 1152, 0, 0, False), (3072, 1152, 1152, 0, 0, True),
+                                                  (3072, 4304, 1152, 1, 0, False), (768, 4608, 4608, 2, 0, False),
+                                                  (3072, 1152, 1536, 0, 0, True), (64, 16512, 2048, 0, 1, False),
+                                                  (64, 2048, 8256, 0, 1, False), (37, 1032, 72, 1, 0, False)])
+def test_bf16_cutlass_gemm_matches_torch(M, N, K, act, tile, res):
+    """D = act(A @ W.T + bias) (+ C) on tcgen05 against the torch reference (FP32 math, one BF16 rounding)."""
+    fvk = _kernels()
+    from flash_rt.models.alpamayo15_flashdrive.pipeline_thor import _Gemm
+    torch.manual_seed(23)
+    A = (torch.randn(M, K, device="cuda") * 0.5).to(BF16)
+    W = (torch.randn(N, K, device="cuda") * 0.05).to(BF16)
+    bias = (torch.randn(N, device="cuda") * 0.1).to(BF16) if tile == 0 else None
+    C = torch.randn(M, N, device="cuda").to(BF16) if res else None
+    D = torch.empty(M, N, device="cuda", dtype=BF16)
+    _Gemm(fvk)(A, W, D, bias=bias, C=C, act=act, tile=tile)
+    torch.cuda.synchronize()
+    ref = A.float() @ W.float().t()
+    if bias is not None:
+        ref = ref + bias.float()
+    if act == 1:
+        ref = torch.nn.functional.gelu(ref, approximate="tanh")
+    elif act == 2:
+        ref = torch.nn.functional.gelu(ref)
+    if C is not None:
+        ref = ref + C.float()
+    err = (D.float() - ref).abs()
+    tol = ref.abs() * 2 ** -7 + 2 ** -7 * (K ** 0.5) * 0.05 * 0.5 * 0.1 + 2 ** -6
+    assert bool((err <= tol).all()), float((err / tol).max())
+    assert float((D.float() - ref).abs().mean()) < 2e-3 * max(1.0, float(ref.abs().mean()))
+
+
+@pytest.mark.parametrize("M,N,K", [(64, 3072, 2048), (64, 2048, 8256), (64, 16512, 2048), (9, 256, 64)])
+def test_fp8_gemm_and_row_quantization_match_reference(M, N, K):
+    """Per-row FP8 activation quantization equals the engine's quantize_fp8_rows; the W8A8 GEMM reproduces
+    bf16((q_a @ q_w.T) * a_s * w_s) (FP32 accumulation)."""
+    fvk = _kernels()
+    from flash_rt.models.alpamayo15.pipeline_thor import quantize_fp8_rows
+    from flash_rt.models.alpamayo15_flashdrive.pipeline_thor import _Gemm
+    torch.manual_seed(26)
+    x = (torch.randn(M, K + 8, device="cuda") * 2).to(BF16)[:, :K]
+    w = (torch.randn(N, K, device="cuda") * 0.05).to(BF16)
+    q8 = torch.empty(M, K, device="cuda", dtype=torch.uint8)
+    a_s = torch.empty(M, device="cuda", dtype=torch.float32)
+    fvk.flashdrive_quantize_fp8_rows_bf16(x.data_ptr(), x.stride(0), q8.data_ptr(), a_s.data_ptr(), M, K,
+                                          torch.cuda.current_stream().cuda_stream)
+    torch.cuda.synchronize()
+    q_ref, s_ref = quantize_fp8_rows(x.contiguous())
+    assert torch.equal(a_s, s_ref)
+    assert torch.equal(q8, q_ref)
+    w8, w_s = quantize_fp8_rows(w)
+    D = torch.empty(M, N, device="cuda", dtype=BF16)
+    _Gemm(fvk).fp8(q8, a_s, w8, w_s, D)
+    torch.cuda.synchronize()
+    ref = (q8.view(torch.float8_e4m3fn).float() @ w8.view(torch.float8_e4m3fn).float().t()) * a_s[:, None] * w_s[None, :]
+    err = (D.float() - ref).abs()
+    assert bool((err <= ref.abs() * 2 ** -7 + 2 ** -6 * float(ref.abs().mean())).all()), float(err.max())
+    deq = x.float() @ w.float().t()
+    assert float((D.float() - deq).abs().mean()) < 0.06 * float(deq.abs().mean())   # e4m3 on both operands
+
+
+def test_new_kernels_are_bitwise_repeatable():
+    """Every new kernel of the backend returns identical bits on a second call with identical inputs (fixed
+    reduction orders, no races)."""
+    fvk = _kernels()
+    from flash_rt.models.alpamayo15_flashdrive.pipeline_thor import _Gemm, bf16_fragment_layout, pack_w4a8_small
+    torch.manual_seed(27)
+    s_ = torch.cuda.current_stream().cuda_stream
+    runs = []
+    # W4A8 few-row kernels (both variants) on q / down shapes
+    for N, K in ((4096, 4096), (4096, 12288), (1024, 4096)):
+        G = K // 128
+        w = torch.randint(0, 16, (K, N), device="cuda", dtype=torch.uint8)
+        z = torch.randint(0, 16, (G, N), device="cuda", dtype=torch.uint8)
+        sg = torch.randint(0, 4097, (G, N), device="cuda", dtype=torch.int32)
+        wp = pack_w4a8_small(w, K, N)
+        xq = torch.randint(-128, 128, (8, K), device="cuda", dtype=torch.int8)
+        a_s = torch.rand(8, device="cuda") * 1e-4
+        for fn in (fvk.flashdrive_w4a8_gemm_small, fvk.flashdrive_w4a8_gemm_tile):
+            outs = []
+            for _ in range(2):
+                o = torch.full((8, N), 7.0, device="cuda", dtype=torch.float16)
+                fn(xq.data_ptr(), a_s.data_ptr(), wp.data_ptr(), z.data_ptr(), sg.data_ptr(), o.data_ptr(), 8, N, K, s_)
+                torch.cuda.synchronize(); outs.append(o)
+            runs.append(("w4a8", N, K, torch.equal(outs[0], outs[1])))
+    # BF16 few-row kernels
+    for N, K in ((4096, 4096), (12288, 4096), (155698, 4096)):
+        w = (torch.randn(N, K, device="cuda") * 0.05).to(BF16)
+        fr = bf16_fragment_layout(w)
+        x = (torch.randn(8, K, device="cuda")).to(BF16)
+        for name, fn in (("frag", lambda y: fvk.flashdrive_bf16_gemm_frag(x.data_ptr(), K, fr.data_ptr(), y.data_ptr(), N, 0, 8, N, K, s_)),
+                         ("small", lambda y: fvk.flashdrive_bf16_gemm_small(x.data_ptr(), K, w.data_ptr(), y.data_ptr(), N, 0, 8, N, K, s_))):
+            outs = []
+            for _ in range(2):
+                y = torch.full((8, N), 7.0, device="cuda", dtype=BF16)
+                fn(y); torch.cuda.synchronize(); outs.append(y)
+            runs.append((name, N, K, torch.equal(outs[0], outs[1])))
+    # CUTLASS BF16 GEMM with residual, LayerNorm
+    A = torch.randn(3072, 1152, device="cuda").to(BF16); W = (torch.randn(1152, 1152, device="cuda") * 0.05).to(BF16)
+    bias = torch.randn(1152, device="cuda").to(BF16); C = torch.randn(3072, 1152, device="cuda").to(BF16)
+    g = _Gemm(fvk)
+    outs = []
+    for _ in range(2):
+        D = torch.empty(3072, 1152, device="cuda", dtype=BF16); g(A, W, D, bias=bias, C=C); torch.cuda.synchronize(); outs.append(D)
+    runs.append(("cutlass_res", 1152, 1152, torch.equal(outs[0], outs[1])))
+    outs = []
+    for _ in range(2):
+        o = torch.empty_like(A)
+        fvk.flashdrive_layernorm_bf16(A.data_ptr(), bias.data_ptr(), bias.data_ptr(), o.data_ptr(), 3072, 1152, 1e-6, s_)
+        torch.cuda.synchronize(); outs.append(o)
+    runs.append(("layernorm", 3072, 1152, torch.equal(outs[0], outs[1])))
+    bad = [r for r in runs if not r[3]]
+    assert not bad, bad
+
+
+@pytest.mark.parametrize("rows,dim", [(3072, 1152), (768, 4608), (5, 8)])
+def test_layernorm_matches_torch(rows, dim):
+    fvk = _kernels()
+    torch.manual_seed(24)
+    x = (torch.randn(rows, dim, device="cuda") * 2 + 0.3).to(BF16)
+    w = (torch.rand(dim, device="cuda") + 0.5).to(BF16)
+    b = (torch.randn(dim, device="cuda") * 0.1).to(BF16)
+    out = torch.empty_like(x)
+    fvk.flashdrive_layernorm_bf16(x.data_ptr(), w.data_ptr(), b.data_ptr(), out.data_ptr(), rows, dim, 1e-6,
+                                  torch.cuda.current_stream().cuda_stream)
+    torch.cuda.synchronize()
+    ref = torch.nn.functional.layer_norm(x.float(), (dim,), w.float(), b.float(), 1e-6)
+    assert bool(((out.float() - ref).abs() <= ref.abs() * 2 ** -7 + 2 ** -6).all())
+    ref_bf = torch.nn.functional.layer_norm(x, (dim,), w, b, 1e-6)         # the autocast BF16 module path
+    assert float((out != ref_bf).float().mean()) < 0.05
+
+
+def test_silu_mul_split_matches_torch():
+    fvk = _kernels()
+    torch.manual_seed(25)
+    rows, F = 64, 8256
+    gu = (torch.randn(rows, 2 * F, device="cuda") * 2).to(BF16)
+    out = torch.empty(rows, F, device="cuda", dtype=BF16)
+    fvk.flashdrive_silu_mul_split_bf16(gu.data_ptr(), out.data_ptr(), rows, F, torch.cuda.current_stream().cuda_stream)
+    torch.cuda.synchronize()
+    with torch.autocast("cuda", dtype=BF16):
+        ref = torch.nn.functional.silu(gu[:, :F]) * gu[:, F:]
+    assert torch.equal(out, ref)
+
+
+@pytest.mark.parametrize("rows,K", [(802, 4096), (8, 4096), (1, 12288), (130, 12288)])
+def test_dense_rotation_matches_exact_rotation_and_paro_codes(rows, K):
+    """The dense rotation equals the exact (float64) 8-layer rotation of the scaled FP16 input within FP16 GEMM
+    error, and its INT8 codes agree with the layer-by-layer kernel on all but near-rounding elements."""
+    fvk = _kernels()
+    from flash_rt.models.alpamayo15_flashdrive.pipeline_thor import paro_rotation_matrices
+    torch.manual_seed(21)
+    x = (torch.randn(rows, K, device="cuda") * 3).to(BF16)
+    sets = []
+    for _ in range(2):
+        theta = (torch.randn(8, K // 2, device="cuda") * 2).to(torch.float16)
+        perm = torch.stack([torch.cat([torch.randperm(128) for _ in range(K // 128)]) for _ in range(8)])
+        pairs = perm.to(torch.int16).cuda()
+        scales = (torch.rand(1, K, device="cuda") + 0.5).to(torch.float16)
+        igs = torch.tensor(6.5e-6, device="cuda", dtype=torch.float32)
+        sets.append((theta, pairs, scales, igs, paro_rotation_matrices(theta, pairs, K)))
+    p = lambda ts: [t.data_ptr() for t in ts]
+    s_ = torch.cuda.current_stream().cuda_stream
+    Ma = (rows + 7) // 8 * 8
+    xr = [torch.empty(rows, K, device="cuda", dtype=torch.float16) for _ in sets]
+    part = [torch.empty(rows, K // 128, device="cuda", dtype=torch.float32) for _ in sets]
+    xq = [torch.zeros(Ma, K, device="cuda", dtype=torch.int8) for _ in sets]
+    a_s = [torch.empty(rows, device="cuda", dtype=torch.float32) for _ in sets]
+    fvk.flashdrive_w4a8_rotate_dense(x.data_ptr(), K, rows, K, p(s[4] for s in sets), p(s[2] for s in sets), p(xr), p(part), s_)
+    fvk.flashdrive_w4a8_quant(rows, K, p(xr), p(part), p(s[3] for s in sets), p(xq), p(a_s), s_)
+    xr2 = [torch.empty(rows, K, device="cuda", dtype=torch.float16) for _ in sets]
+    part2 = [torch.empty(rows, K // 128, device="cuda", dtype=torch.float32) for _ in sets]
+    xq2 = [torch.zeros(Ma, K, device="cuda", dtype=torch.int8) for _ in sets]
+    a_s2 = [torch.empty(rows, device="cuda", dtype=torch.float32) for _ in sets]
+    fvk.flashdrive_w4a8_act_prep(x.data_ptr(), K, rows, K, p(s[0] for s in sets), p(s[1] for s in sets),
+                                 p(s[2] for s in sets), p(s[3] for s in sets), p(xr2), p(part2), p(xq2), p(a_s2), s_)
+    torch.cuda.synchronize()
+    G = K // 128
+    for (theta, pairs, scales, igs, R), r, pt, q, a, q2, r2, a2 in zip(sets, xr, part, xq, a_s, xq2, xr2, a_s2):
+        xs = (x.to(torch.float16) * scales).double().view(rows, G, 128)
+        exact = torch.einsum("mgk,gck->mgc", xs, R.double()).reshape(rows, K)    # R itself is FP16-rounded
+        err = (r.double() - exact).abs()
+        assert bool((err <= exact.abs() * 2 ** -9 + 2 ** -9 * xs.abs().amax(-1).view(rows, G, 1).expand(-1, -1, 128).reshape(rows, K)).all())
+        assert torch.equal(pt, r.float().abs().view(rows, G, 128).amax(-1))
+        same = float((q[:rows] == q2[:rows]).float().mean())
+        assert same > 0.98, same
+        assert bool(((q[:rows].int() - q2[:rows].int()).abs() <= 2).all())
+        assert torch.allclose(a, a2, rtol=2e-2, atol=0)
+        rel = ((r.float() - r2.float()).abs() / r2.float().abs().clamp_min(1e-2)).mean()
+        assert float(rel) < 4e-3, float(rel)
+
+
+@pytest.mark.parametrize("M,N,K,f32", [(8, 4096, 4096, 0), (7, 155697, 4096, 0), (16, 1024, 20480, 1), (1, 12288, 4096, 0),
+                                        (13, 4096, 12288, 1), (3, 24, 512, 0)])
+def test_bf16_small_gemm_matches_float64(M, N, K, f32):
+    """The few-row BF16 GEMM: FP32 accumulation of exact BF16 products (float64 reference within FP32 rounding of
+    the dot products), partial last tile guarded, deterministic across runs."""
+    fvk = _kernels()
+    torch.manual_seed(18)
+    Ma = (M + 7) // 8 * 8
+    x = (torch.randn(Ma, K + 64, device="cuda") * 0.5).to(BF16)[:, :K]          # strided
+    w = (torch.randn(N, K, device="cuda") * 0.05).to(BF16)
+    y = torch.empty(M, N + 8, device="cuda", dtype=torch.float32 if f32 else BF16)[:, :N]
+    fvk.flashdrive_bf16_gemm_small(x.data_ptr(), x.stride(0), w.data_ptr(), y.data_ptr(), y.stride(0), f32, M, N, K,
+                                   torch.cuda.current_stream().cuda_stream)
+    torch.cuda.synchronize()
+    ref = x[:M].double() @ w.double().t()
+    out = y.double()
+    tol = ref.abs() * (2.0 ** -16 + (0 if f32 else 2.0 ** -8)) + 4e-4 * (K / 4096) ** 0.5   # FP32 sums in other orders
+    assert bool(((out - ref).abs() <= tol).all()), float((out - ref).abs().max())
+    y2 = torch.empty_like(y.contiguous())
+    fvk.flashdrive_bf16_gemm_small(x.data_ptr(), x.stride(0), w.data_ptr(), y2.data_ptr(), N, f32, M, N, K,
+                                   torch.cuda.current_stream().cuda_stream)
+    torch.cuda.synchronize()
+    assert torch.equal(y2, y.contiguous())
+    from flash_rt.models.alpamayo15_flashdrive.pipeline_thor import bf16_fragment_layout
+    frag = bf16_fragment_layout(w)
+    y3 = torch.empty_like(y2)
+    fvk.flashdrive_bf16_gemm_frag(x.data_ptr(), x.stride(0), frag.data_ptr(), y3.data_ptr(), N, f32, M, N, K,
+                                  torch.cuda.current_stream().cuda_stream)
+    torch.cuda.synchronize()
+    assert bool(((y3.double() - ref).abs() <= tol).all())
+    T = (N + 15) // 16
+    assert frag.numel() == T * 16 * K
+    v = frag.view(T, K // 16, 32, 4, 2)
+    for Ti, kc, lane, a in [(0, 0, 0, 0), (T - 1, K // 16 - 1, 31, 3), (0, 1, 13, 2)]:
+        g, c = lane // 4, lane % 4
+        half, rh = a // 2, a % 2
+        n, k = 16 * Ti + 8 * rh + g, 16 * kc + 8 * half + 2 * c
+        exp = w[n, k:k + 2] if n < N else torch.zeros(2, device="cuda", dtype=BF16)
+        assert torch.equal(v[Ti, kc, lane, a], exp)
+
+
+def test_draft_qkv_prep_matches_flashdrive_draft_attention():
+    """Head RMSNorm + BF16-rule RoPE of the draft's q (positions ctx..ctx+nq-1) and k (0..nk-1) and the copied v
+    equal FlashDrive's Qwen3DFlashAttention operand preparation under autocast(bfloat16)."""
+    fvk = _kernels()
+    from flashdrive.dflash import apply_rotary_pos_emb_tail
+    torch.manual_seed(19)
+    nq, ctx, Hq, Hk, D = 8, 8, 32, 8, 128
+    nk = nq + ctx
+    q = torch.randn(nq, Hq * D, device="cuda").to(BF16)
+    k = torch.randn(nk, Hk * D, device="cuda").to(BF16)
+    v = torch.randn(nk, Hk * D, device="cuda").to(BF16)
+    qw = (torch.rand(D, device="cuda") + 0.5).to(BF16)
+    kw = (torch.rand(D, device="cuda") + 0.5).to(BF16)
+    inv = 1.0 / (1e6 ** (torch.arange(0, D, 2, device="cuda").float() / D))
+    freqs = torch.arange(nk, device="cuda").float().unsqueeze(1) * inv.unsqueeze(0)
+    emb = torch.cat((freqs, freqs), dim=-1)
+    cos, sin = emb.cos().to(BF16), emb.sin().to(BF16)          # Qwen3RotaryEmbedding returns tables in the model dtype
+    eps = 1e-6
+
+    def rms(t, w):
+        tf = t.float()
+        n = (tf * torch.rsqrt(tf.pow(2).mean(-1, keepdim=True) + eps)).to(BF16)
+        return (w.to(BF16) * n)                                 # Qwen3RMSNorm: weight * hidden.to(input_dtype)
+    qn = rms(q.view(1, nq, Hq, D), qw).transpose(1, 2)
+    kn = rms(k.view(1, nk, Hk, D), kw).transpose(1, 2)
+    with torch.autocast("cuda", dtype=BF16):
+        q_ref, k_ref = apply_rotary_pos_emb_tail(qn, kn, cos.unsqueeze(0), sin.unsqueeze(0))
+    q_out = torch.empty(nq, Hq, D, device="cuda", dtype=BF16)
+    k_out = torch.empty(nk, Hk, D, device="cuda", dtype=BF16)
+    v_out = torch.empty(nk, Hk, D, device="cuda", dtype=BF16)
+    fvk.flashdrive_draft_qkv_prep_bf16(q.data_ptr(), k.data_ptr(), v.data_ptr(), Hq * D, Hk * D, Hk * D, qw.data_ptr(),
+                                       kw.data_ptr(), cos.data_ptr(), sin.data_ptr(), q_out.data_ptr(), k_out.data_ptr(),
+                                       v_out.data_ptr(), nq, ctx, Hq, Hk, eps, torch.cuda.current_stream().cuda_stream)
+    torch.cuda.synchronize()
+    assert torch.equal(q_out, q_ref[0].transpose(0, 1))
+    assert torch.equal(k_out, k_ref[0].transpose(0, 1))
+    assert torch.equal(v_out, v.view(nk, Hk, D))
+
+
+@pytest.mark.parametrize("backends", [
+    dict(expert="flashrt", vision="flashrt", prefill="flashrt", decode="flashrt", w4a8="fused", pdl=False),
+], ids=["all_flashrt_pdl_off"])
+def test_backend_primitives_are_repeatable(backends):
+    """Every FlashRT primitive, called twice on identical cache / RNG state, returns identical bits and writes identical
+    cache rows (run-to-run reproducibility of the stream)."""
+    _kernels()
+    from alpamayo1_5 import helper
+    from flashdrive.streaming import convert_to_streaming_window
+    from flash_rt.models.alpamayo15_flashdrive.pipeline_thor import load_flashdrive
+
+    torch.set_float32_matmul_precision("high")
+    root = _CKPT
+    model = load_flashdrive(f"{root}/Alpamayo-1.5-10B", f"{root}/Alpamayo-1.5-10B-PARO", f"{root}/Alpamayo-1.5-10B-DFlash")
+    names = ["_action", "_encode", "_dflash_prefill", "_shift_streaming_kv_cache", "_dflash_block_step", "_dflash_traj_forward"]
+    ref = {n: getattr(model, n) for n in names}
+    eng = FlashDriveThor(model, **backends)
+    frt = {n: getattr(model, n) for n in names if getattr(model, n) is not ref[n]}
+    gen = torch.cuda.default_generators[torch.cuda.current_device()]
+    mismatches = []
+
+    def snap():
+        pkv = model._past_key_values
+        return [(l.keys.clone(), l.values.clone()) for l in pkv.layers] if pkv is not None and pkv.layers[0].is_initialized else None
+
+    def restore(s_):
+        for l, (k, v) in zip(model._past_key_values.layers, s_):
+            l.keys.copy_(k); l.values.copy_(v)
+
+    def tensors(o):
+        if torch.is_tensor(o):
+            return [o.detach().clone()]
+        return [t for x in (o or []) for t in tensors(x)] if isinstance(o, (list, tuple)) else []
+
+    def wrap(n):
+        def f(*a, **k):
+            pre, rng = snap(), gen.get_state()
+            kvlm_pre = eng._st["kvlm"].clone() if eng._st is not None and "kvlm" in eng._st else None
+            out1 = frt[n](*a, **k)
+            t1, post1 = tensors(out1), snap()
+            kvlm1 = eng._st["kvlm"].clone() if kvlm_pre is not None else None
+            if pre is not None:
+                restore(pre)
+            if kvlm_pre is not None:
+                eng._st["kvlm"].copy_(kvlm_pre)
+            gen.set_state(rng)
+            out2 = frt[n](*a, **k)
+            t2, post2 = tensors(out2), snap()
+            same_out = all(torch.equal(x, y) for x, y in zip(t1, t2)) and len(t1) == len(t2)
+            same_cache = post1 is None or all(torch.equal(a1, a2) and torch.equal(b1, b2) for (a1, b1), (a2, b2) in zip(post1, post2))
+            same_kvlm = kvlm1 is None or torch.equal(kvlm1, eng._st["kvlm"])
+            if not (same_out and same_cache and same_kvlm):
+                mismatches.append((n, same_out, same_cache, same_kvlm))
+            return out2
+        return f
+    for n in frt:
+        setattr(model, n, wrap(n))
+    proc = helper.get_processor(model.tokenizer)
+    vs, ve = (proc.tokenizer.convert_tokens_to_ids(t) for t in ("<|vision_start|>", "<|vision_end|>"))
+    g = torch.Generator().manual_seed(0)
+    hist = (torch.zeros(1, 1, 16, 3), torch.eye(3).expand(1, 1, 16, 3, 3).contiguous())
+    frames = torch.randint(0, 256, (4, 7, 3, 1080, 1920), dtype=torch.uint8, generator=g)
+    torch.manual_seed(0)
+    for k in range(4):
+        msgs = helper.create_message(frames[:, k:k + 4].flatten(0, 1), camera_indices=torch.tensor([0, 1, 2, 6]))
+        t = proc.apply_chat_template(msgs, tokenize=True, add_generation_prompt=False, continue_final_message=True,
+                                     return_dict=True, return_tensors="pt")
+        w = {"tokenized_data": t, "ego_history_xyz": hist[0], "ego_history_rot": hist[1]}
+        if k:
+            w = convert_to_streaming_window(w, vs, ve)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            model.sample_trajectories_streaming(helper.to_device(w, "cuda"), num_traj_samples=1, diffusion_kwargs={
+                "inference_step": 8, "cache_steps": [3, 4, 5, 6], "int_method": "euler_with_cache"})
+    assert not mismatches, mismatches
+    del eng, model
+    gc.collect(); torch.cuda.empty_cache()
+
+
 @pytest.mark.parametrize("backends", [
     dict(expert="flashrt", vision="flashrt", prefill="flashrt", decode="flashrt", w4a8="fused"),
     dict(expert="flashrt", vision="flashrt", prefill="flashrt", decode="flashrt", w4a8="fused", w4a8_gemm="marlin"),

@@ -67,6 +67,11 @@ ALPAMAYO15_KERNEL_SYMBOLS = (
     "alpamayo15_vision_rope_qk_bf16",
     "alpamayo15_vlm_qk_prep_bf16",
     "alpamayo15_w8a16_gemm_bf16",
+    # tcgen05 GEMMs of the FlashDrive backend (csrc/gemm/alpamayo15_bf16_gemm_sm100.cu), same build gate
+    "alpamayo15_bf16_gemm_sm100",
+    "alpamayo15_bf16_gemm_sm100_workspace",
+    "alpamayo15_fp8_gemm_sm100",
+    "alpamayo15_fp8_gemm_sm100_workspace",
 )
 
 
