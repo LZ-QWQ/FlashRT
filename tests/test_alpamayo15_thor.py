@@ -20,6 +20,7 @@ from flash_rt.models.alpamayo15.pipeline_thor import (  # noqa: E402
     fp8_fragment_layout,
     merge_attention,
     quantize_fp8_rows,
+    quantize_int8_rows,
     require_alpamayo15_kernels,
     update_stop_state,
 )
@@ -342,19 +343,27 @@ def test_vlm_qk_prep_matches_bf16_rope_and_cache_write(rows, slot, batch_stride)
     assert not kc[~written].any() and not vc[~written].any()
 
 
+@pytest.mark.parametrize("fmt", ["fp8", "int8"])
 @pytest.mark.parametrize("M,N,K", [(1, 4096, 4096), (3, 40, 64), (8, 6144, 4096), (9, 1000, 12288), (16, 155, 4096),
                                    (1, 65537, 64), (12, 65553, 32)])   # last two: wide (2 tiles/warp) path, odd tile count
-def test_w8a16_gemm_matches_dequantized_reference(M, N, K):
+def test_w8a16_gemm_matches_dequantized_reference(M, N, K, fmt):
     fvk = _kernels()
     torch.manual_seed(M * 7 + N)
     w = (torch.randn(N, K, device="cuda") * 0.02).to(BF16)
     x = torch.randn(M, K, device="cuda").to(BF16)
-    codes, scale = quantize_fp8_rows(w)
+    if fmt == "int8":
+        codes, scale = quantize_int8_rows(w)
+        assert torch.equal(codes.view(torch.int8).abs().amax(dim=1), torch.full((N,), 127, device="cuda", dtype=torch.int8))
+        deq = codes.view(torch.int8).float() * scale[:, None]
+    else:
+        codes, scale = quantize_fp8_rows(w)
+        deq = codes.view(torch.float8_e4m3fn).float() * scale[:, None]
     frag, scale_p = fp8_fragment_layout(codes, scale)
     y = torch.full((M, N), float("nan"), device="cuda", dtype=BF16)
-    fvk.alpamayo15_w8a16_gemm_bf16(frag.data_ptr(), scale_p.data_ptr(), x.data_ptr(), y.data_ptr(), M, N, K, _stream())
+    fvk.alpamayo15_w8a16_gemm_bf16(frag.data_ptr(), scale_p.data_ptr(), x.data_ptr(), y.data_ptr(), M, N, K, _stream(),
+                                   fmt=1 if fmt == "int8" else 0)
     torch.cuda.synchronize()
-    ref = x.float() @ (codes.view(torch.float8_e4m3fn).float() * scale[:, None]).t()
+    ref = x.float() @ deq.t()
     err = (y.float() - ref).abs()
     # FP32 accumulation in a different order, then one BF16 rounding of the output.
     assert bool((err <= ref.abs() * 2.0 ** -8 + 1e-3 * ref.abs().max()).all()), float(err.max())

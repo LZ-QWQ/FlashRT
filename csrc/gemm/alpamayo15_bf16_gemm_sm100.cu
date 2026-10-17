@@ -99,6 +99,70 @@ struct Fp8GemmDef {
 using Tile64F8 = Shape<_64, _128, _128>;
 using F8G64 = Fp8GemmDef<Tile64F8>;
 
+// INT8 x INT8 -> FP16 with per-row activation scales and per-column weight scales (per-channel INT8 prefill tier):
+// D[m, n] = half(float(acc[m, n]) * a_s[m] * w_s[n]), int32 accumulation.
+using ElementI8 = int8_t;
+using ElementI32 = int32_t;
+using ElementH = cutlass::half_t;
+template <class Tile>
+using Int8ScaleTree = fe::Sm90EVT<fe::Sm90Compute<cutlass::multiplies, ElementH, ElementCompute, kRN>,
+    fe::Sm90EVT<fe::Sm90Compute<cutlass::multiplies, ElementCompute, ElementCompute, kRN>, fe::Sm90AccFetch, RowScaleNode<Tile>>,
+    ColScaleNode<Tile>>;
+
+template <class Tile>
+struct Int8GemmDef {
+  using Cluster = Shape<_1, _1, _1>;
+  using Fusion = Int8ScaleTree<Tile>;
+  using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+      cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp, Tile, Cluster,
+      cutlass::epilogue::collective::EpilogueTileAuto, ElementI32, ElementCompute, void,
+      cutlass::layout::RowMajor, kAlign, ElementH, cutlass::layout::RowMajor, kAlign,
+      cutlass::epilogue::collective::EpilogueScheduleAuto, Fusion>::CollectiveOp;
+  using Mainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+      cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp, ElementI8, cutlass::layout::RowMajor, 16, ElementI8,
+      cutlass::layout::ColumnMajor, 16, ElementI32, Tile, Cluster,
+      cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename Epilogue::SharedStorage))>,
+      cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+  using Kernel = cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, Mainloop, Epilogue, void>;
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
+};
+using I8G128 = Int8GemmDef<Shape<_128, _128, _128>>;
+using I8G64 = Int8GemmDef<Shape<_64, _128, _128>>;
+
+template <class G>
+typename G::Gemm::Arguments make_int8_args(const void* A, const void* B, const float* a_s, const float* w_s, void* D,
+                                           int M, int N, int K) {
+  using Gemm = typename G::Gemm;
+  auto sA = cutlass::make_cute_packed_stride(typename Gemm::GemmKernel::StrideA{}, make_shape(M, K, 1));
+  auto sB = cutlass::make_cute_packed_stride(typename Gemm::GemmKernel::StrideB{}, make_shape(N, K, 1));
+  auto sD = cutlass::make_cute_packed_stride(typename Gemm::GemmKernel::StrideD{}, make_shape(M, N, 1));
+  typename Gemm::Arguments args{cutlass::gemm::GemmUniversalMode::kGemm,
+                                {M, N, K, 1},
+                                {static_cast<const ElementI8*>(A), sA, static_cast<const ElementI8*>(B), sB},
+                                {{}, nullptr, sD, static_cast<ElementH*>(D), sD}};
+  auto& f = args.epilogue.thread;
+  f.op_0.op_1.ptr_col = a_s;
+  f.op_0.op_1.null_default = 1.0f;
+  f.op_0.op_1.dCol = {_1{}, _0{}, int64_t(0)};
+  f.op_1.ptr_row = w_s;
+  f.op_1.null_default = 1.0f;
+  f.op_1.dRow = {_0{}, _1{}, int64_t(0)};
+  return args;
+}
+
+template <class G>
+int run_int8(const void* A, const void* B, const float* a_s, const float* w_s, void* D, int M, int N, int K,
+             void* workspace, unsigned long long workspace_bytes, int pdl, cudaStream_t stream) {
+  using Gemm = typename G::Gemm;
+  auto args = make_int8_args<G>(A, B, a_s, w_s, D, M, N, K);
+  Gemm gemm;
+  if (Gemm::get_workspace_size(args) > workspace_bytes) return 3;
+  if (gemm.can_implement(args) != cutlass::Status::kSuccess) return 5;
+  if (gemm.initialize(args, workspace, stream) != cutlass::Status::kSuccess) return 6;
+  if (gemm.run(stream, nullptr, pdl != 0) != cutlass::Status::kSuccess) return 7;
+  return cudaPeekAtLastError() == cudaSuccess ? 0 : 4;
+}
+
 typename F8G64::Gemm::Arguments make_fp8_args(const void* A, const void* B, const float* a_s, const float* w_s, void* D,
                                               int M, int N, int K) {
   using Gemm = F8G64::Gemm;
@@ -215,6 +279,25 @@ int flashrt_a15_fp8_gemm_sm100(const void* A, const void* B, const float* a_s, c
   if (gemm.initialize(args, workspace, stream) != cutlass::Status::kSuccess) return 6;
   if (gemm.run(stream, nullptr, pdl != 0) != cutlass::Status::kSuccess) return 7;
   return cudaPeekAtLastError() == cudaSuccess ? 0 : 4;
+}
+
+// Per-channel INT8 GEMM (prefill tier): A [M, K] int8 row-major, B [N, K] int8 row-major, a_s [M] fp32, w_s [N] fp32,
+// D [M, N] fp16; tile 0 = 128 x 128 x 128, 1 = 64 x 128 x 128. K % 16 == 0, N % 8 == 0, 16-byte aligned operands.
+int flashrt_a15_int8_gemm_sm100_workspace(int M, int N, int K, int tile, unsigned long long* workspace_bytes) {
+  if (M <= 0 || N <= 0 || K <= 0 || (N % kAlign) || (K % 16) || tile < 0 || tile > 1) return 2;
+  *workspace_bytes = tile ? I8G64::Gemm::get_workspace_size(make_int8_args<I8G64>(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K))
+                          : I8G128::Gemm::get_workspace_size(make_int8_args<I8G128>(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K));
+  return 0;
+}
+
+int flashrt_a15_int8_gemm_sm100(const void* A, const void* B, const float* a_s, const float* w_s, void* D, int M, int N,
+                                int K, int tile, void* workspace, unsigned long long workspace_bytes, int pdl,
+                                cudaStream_t stream) {
+  if (!A || !B || !a_s || !w_s || !D || (workspace_bytes && !workspace)) return 1;
+  if (M <= 0 || N <= 0 || K <= 0 || (N % kAlign) || (K % 16) || tile < 0 || tile > 1) return 2;
+  if (!aligned16(A) || !aligned16(B) || !aligned16(D) || !aligned16(a_s) || !aligned16(w_s)) return 5;
+  return tile ? run_int8<I8G64>(A, B, a_s, w_s, D, M, N, K, workspace, workspace_bytes, pdl, stream)
+              : run_int8<I8G128>(A, B, a_s, w_s, D, M, N, K, workspace, workspace_bytes, pdl, stream);
 }
 
 int flashrt_a15_bf16_gemm_sm100(const void* A, const void* B, const void* bias, const void* C, void* D, int M, int N,

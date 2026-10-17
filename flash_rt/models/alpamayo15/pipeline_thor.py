@@ -72,6 +72,8 @@ ALPAMAYO15_KERNEL_SYMBOLS = (
     "alpamayo15_bf16_gemm_sm100_workspace",
     "alpamayo15_fp8_gemm_sm100",
     "alpamayo15_fp8_gemm_sm100_workspace",
+    "alpamayo15_int8_gemm_sm100",
+    "alpamayo15_int8_gemm_sm100_workspace",
 )
 
 
@@ -160,8 +162,26 @@ def quantize_fp8_rows(w: torch.Tensor, chunk_rows: int = 16384) -> tuple[torch.T
 
 
 @torch.no_grad()
+def quantize_int8_rows(w: torch.Tensor, chunk_rows: int = 16384) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-output-row symmetric INT8 quantization of a [N, K] weight: ``scale = absmax(row) / 127`` (1 for an all-zero
+    row), codes ``round_to_nearest_even(w / scale)`` in [-127, 127] as int8 viewed uint8 (the W8A16 kernel's byte
+    layout); returns (codes uint8 [N, K], scale fp32 [N])."""
+    N, K = w.shape
+    codes = torch.empty(N, K, device=w.device, dtype=torch.uint8)
+    scale = torch.empty(N, device=w.device, dtype=torch.float32)
+    for r0 in range(0, N, chunk_rows):
+        wf = w[r0:r0 + chunk_rows].float()
+        amax = wf.abs().amax(dim=1)
+        s = torch.where(amax > 0, amax / 127.0, torch.ones_like(amax))
+        q = torch.round(wf / s[:, None]).clamp_(-127.0, 127.0).to(torch.int8)
+        codes[r0:r0 + chunk_rows] = q.view(torch.uint8)
+        scale[r0:r0 + chunk_rows] = s
+    return codes, scale
+
+
+@torch.no_grad()
 def fp8_fragment_layout(codes: torch.Tensor, scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reorder [N, K] e4m3 codes into the ``alpamayo15_w8a16_gemm_bf16`` fragment order.
+    """Reorder [N, K] one-byte codes (e4m3 or int8) into the ``alpamayo15_w8a16_gemm_bf16`` fragment order.
 
     Rows are zero-padded to a multiple of 16 (scale 0); per 16-row tile and
     32-column chunk, lane ``4g + c`` holds the 16 bytes of its two

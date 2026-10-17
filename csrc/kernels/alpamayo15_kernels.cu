@@ -214,6 +214,14 @@ __device__ __forceinline__ uint32_t e4m3x2_to_bf16x2(uint32_t v) {
   return *reinterpret_cast<const uint32_t*>(&b);
 }
 
+// Two INT8 codes (low byte first) -> bf16x2; |code| <= 127 is exact in bf16.
+__device__ __forceinline__ uint32_t s8x2_to_bf16x2(uint32_t v) {
+  const float lo = static_cast<float>(static_cast<signed char>(v & 0xFFu));
+  const float hi = static_cast<float>(static_cast<signed char>((v >> 8) & 0xFFu));
+  const __nv_bfloat162 b = __floats2bfloat162_rn(lo, hi);
+  return *reinterpret_cast<const uint32_t*>(&b);
+}
+
 __device__ __forceinline__ void mma_bf16_16816(float* d, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
                                                uint32_t b0, uint32_t b1) {
   asm volatile(
@@ -230,7 +238,7 @@ __device__ __forceinline__ uint4 ld_stream16(const uint4* p) {
   return v;
 }
 
-template <int NT, int RT>
+template <int NT, int RT, bool kInt8>
 __global__ void __launch_bounds__(128) w8a16_gemm_kernel(const uint4* __restrict__ wfrag,
                                                          const float* __restrict__ scale,
                                                          const __nv_bfloat16* __restrict__ x,
@@ -277,10 +285,11 @@ __global__ void __launch_bounds__(128) w8a16_gemm_kernel(const uint4* __restrict
     }
 #pragma unroll
     for (int r = 0; r < RT; ++r) {
-      const uint32_t p0 = e4m3x2_to_bf16x2(a[r].x), p1 = e4m3x2_to_bf16x2(a[r].x >> 16);
-      const uint32_t p2 = e4m3x2_to_bf16x2(a[r].y), p3 = e4m3x2_to_bf16x2(a[r].y >> 16);
-      const uint32_t q0 = e4m3x2_to_bf16x2(a[r].z), q1 = e4m3x2_to_bf16x2(a[r].z >> 16);
-      const uint32_t q2 = e4m3x2_to_bf16x2(a[r].w), q3 = e4m3x2_to_bf16x2(a[r].w >> 16);
+      auto cvt = [](uint32_t v) { return kInt8 ? s8x2_to_bf16x2(v) : e4m3x2_to_bf16x2(v); };
+      const uint32_t p0 = cvt(a[r].x), p1 = cvt(a[r].x >> 16);
+      const uint32_t p2 = cvt(a[r].y), p3 = cvt(a[r].y >> 16);
+      const uint32_t q0 = cvt(a[r].z), q1 = cvt(a[r].z >> 16);
+      const uint32_t q2 = cvt(a[r].w), q3 = cvt(a[r].w >> 16);
 #pragma unroll
       for (int n = 0; n < NT; ++n) {
         mma_bf16_16816(acc[r][n], p0, p1, p2, p3, b[n][0], b[n][1]);
@@ -310,14 +319,19 @@ __global__ void __launch_bounds__(128) w8a16_gemm_kernel(const uint4* __restrict
 }
 
 template <int NT, int RT>
-void launch_w8a16(const void* wfrag, const float* scale, const void* x, void* y, int M, int N, int K,
+void launch_w8a16(const void* wfrag, const float* scale, const void* x, void* y, int M, int N, int K, int fmt,
                   cudaStream_t stream) {
   constexpr int kWarps = 4;
   const int T = (N + 15) / 16;
   const int blocks = (T + kWarps * RT - 1) / (kWarps * RT);
-  w8a16_gemm_kernel<NT, RT><<<blocks, kWarps * 32, 0, stream>>>(
-      reinterpret_cast<const uint4*>(wfrag), scale, reinterpret_cast<const __nv_bfloat16*>(x),
-      reinterpret_cast<__nv_bfloat16*>(y), M, N, K, T);
+  if (fmt == 1)
+    w8a16_gemm_kernel<NT, RT, true><<<blocks, kWarps * 32, 0, stream>>>(
+        reinterpret_cast<const uint4*>(wfrag), scale, reinterpret_cast<const __nv_bfloat16*>(x),
+        reinterpret_cast<__nv_bfloat16*>(y), M, N, K, T);
+  else
+    w8a16_gemm_kernel<NT, RT, false><<<blocks, kWarps * 32, 0, stream>>>(
+        reinterpret_cast<const uint4*>(wfrag), scale, reinterpret_cast<const __nv_bfloat16*>(x),
+        reinterpret_cast<__nv_bfloat16*>(y), M, N, K, T);
 }
 
 }  // namespace
@@ -399,18 +413,18 @@ int alpamayo15_expert_qk_prep_bf16(const void* qkv, const void* q_norm_w, const 
 
 
 int alpamayo15_w8a16_gemm_bf16(const void* w_frag, const float* scale, const void* x, void* y,
-                               int M, int N, int K, cudaStream_t stream) {
+                               int M, int N, int K, int fmt, cudaStream_t stream) {
   if (!w_frag || !scale || !x || !y) return 1;
-  if (M <= 0 || M > 16 || N <= 0 || K <= 0 || (K % 32) != 0) return 2;
+  if (M <= 0 || M > 16 || N <= 0 || K <= 0 || (K % 32) != 0 || fmt < 0 || fmt > 1) return 2;
   if (!aligned16(w_frag) || (reinterpret_cast<uintptr_t>(x) & 3u) != 0) return 5;
   // Large-N projections (lm_head) amortize the activation loads over two tiles per warp.
   const bool wide = N >= 65536;
   if (M <= 8) {
-    if (wide) launch_w8a16<1, 2>(w_frag, scale, x, y, M, N, K, stream);
-    else launch_w8a16<1, 1>(w_frag, scale, x, y, M, N, K, stream);
+    if (wide) launch_w8a16<1, 2>(w_frag, scale, x, y, M, N, K, fmt, stream);
+    else launch_w8a16<1, 1>(w_frag, scale, x, y, M, N, K, fmt, stream);
   } else {
-    if (wide) launch_w8a16<2, 2>(w_frag, scale, x, y, M, N, K, stream);
-    else launch_w8a16<2, 1>(w_frag, scale, x, y, M, N, K, stream);
+    if (wide) launch_w8a16<2, 2>(w_frag, scale, x, y, M, N, K, fmt, stream);
+    else launch_w8a16<2, 1>(w_frag, scale, x, y, M, N, K, fmt, stream);
   }
   return cudaPeekAtLastError() == cudaSuccess ? 0 : 4;
 }

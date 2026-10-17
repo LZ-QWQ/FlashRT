@@ -76,12 +76,14 @@ FLASHDRIVE_KERNEL_SYMBOLS = ("flashdrive_qk_prep_bf16", "flashdrive_rope_rows", 
                              "flashdrive_bf16_gemm_frag", "flashdrive_w4a8_act_prep_tile")
 TILE_MIN_N = 2048           # few-row W4A8 GEMMs with at least this many output channels stream one warp per 16-row tile
 ENGINE_GEMMS = ("cutlass", "torch")    # BF16 GEMMs of the vision tower and the action expert
-DECODE_WEIGHTS = ("bf16", "fp8")       # LM head and DFlash draft linears of the decode graphs
+DECODE_WEIGHTS = ("bf16", "int8", "fp8")   # LM head and DFlash draft linears of the decode graphs
+PREFILL_WEIGHTS = ("w4a8", "int8")         # streaming-window GEMM operands: Marlin's group-scaled integers, or per-channel INT8
 EXPERT_WEIGHTS = ("bf16", "fp8")       # action expert projections (FP8 = W8A8 with per-row activation scales)
 W4A8_BACKENDS = ("flashdrive", "fused")
 W4A8_GEMMS = ("tcgen05", "marlin")
 ACT_ROTS = ("paro", "dense")
 TCGEN05_MIN_ROWS = 256      # W4A8 GEMMs with at least this many rows (streaming-window prefill) run on tcgen05
+INT8_PREFILL_TILE = 0       # per-channel INT8 prefill GEMM tile: 0 = 128 x 128 x 128, 1 = 64 x 128 x 128
 SMALL_MAX_ROWS = 16         # ... and with at most this many (verification, trajectory start) on the few-row mma kernel
 
 
@@ -224,6 +226,48 @@ def marlin_w4a8_to_int8(qweight: torch.Tensor, scales: torch.Tensor, qzeros: tor
     return w8, s
 
 
+def w4a8_to_int8_channel(w8: torch.Tensor, s: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-channel INT8 requantization of Marlin's group-scaled integers: ``w8 [N, K]`` int8 (w - z) and ``s [K/128, N]``
+    int32 group scales give the exact integer weight ``w8 * s[group]``; its per-channel symmetric INT8 codes
+    (``round(v / c)``, ``c = absmax / 127``) and the fp32 channel scale ``c`` (1 for an all-zero channel) are returned
+    for the per-channel INT8 prefill GEMM (``D = half(acc * a_scale[m] * c[n])``). A precision tier: the codes carry the
+    group-scale ratios of a channel with at most half a step of error."""
+    N, K = w8.shape
+    v = w8.to(torch.int32) * s.t().repeat_interleave(128, 1)           # [N, K] exact integers (|w8| <= 15, s <= 4096)
+    amax = v.abs().amax(dim=1).to(torch.float32)
+    c = torch.where(amax > 0, amax / 127.0, torch.ones_like(amax))
+    codes = torch.round(v.to(torch.float32) / c[:, None]).clamp_(-127.0, 127.0).to(torch.int8).contiguous()
+    return codes, c.contiguous()
+
+
+def paro_pair_bank_order(theta: torch.Tensor, pairs: torch.Tensor, K: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reorder the 64 pairs of every (layer, channel group) of a ParoQuant rotation so that the eight pairs a
+    quarter-warp of the tile kernel handles together touch eight distinct shared-memory bank groups with their first
+    channel (bank group = 16-byte chunk index ``c + c // 8`` mod 8 of the 8-row tile layout). The pairs of a layer are
+    disjoint, so their order does not change the rotation; returns (theta, pairs) in the new order."""
+    G = K // 128
+    pr = pairs.view(8, G, 64, 2).to(torch.int64)
+    th = theta.view(8, G, 64)
+    i = pr[..., 0]
+    res = (i + (i >> 3)) & 7
+    ar = torch.arange(64, device=pairs.device)
+    order = torch.argsort(res * 64 + ar, dim=-1)                       # pairs sorted by bank residue (stable)
+    res_s = torch.gather(res, -1, order)
+    counts = torch.nn.functional.one_hot(res, 8).sum(-2)                # [8, G, 8]
+    starts = counts.cumsum(-1) - counts
+    rank = ar - torch.gather(starts, -1, res_s)                         # rank within the residue class
+    main = rank < 8
+    pos = torch.where(main, rank * 8 + res_s, torch.zeros_like(rank))   # bucket = rank, lane-in-bucket = residue
+    taken = torch.zeros_like(rank).scatter_add(-1, pos, main.long()) > 0
+    free_order = torch.argsort(taken.long() * 64 + ar, dim=-1)           # free positions first, ascending
+    ovf = (~main).long().cumsum(-1) - 1
+    pos = torch.where(main, pos, torch.gather(free_order, -1, ovf.clamp(min=0)))
+    new_pr = torch.empty_like(pr).scatter_(-2, pos.unsqueeze(-1).expand(-1, -1, -1, 2),
+                                           torch.gather(pr, -2, order.unsqueeze(-1).expand(-1, -1, -1, 2)))
+    new_th = torch.empty_like(th).scatter_(-1, pos, torch.gather(th, -1, order))
+    return new_th.reshape(8, K // 2).contiguous(), new_pr.reshape(8, K).to(pairs.dtype).contiguous()
+
+
 def paro_rotation_matrices(theta: torch.Tensor, pairs: torch.Tensor, K: int) -> torch.Tensor:
     """The 128 x 128 matrix of every channel group of a ParoQuant rotation: ``R[g][c][k]`` such that
     ``y[g*128 + c] = sum_k R[g][c][k] x[g*128 + k]`` equals the 8 Givens layers applied in order (FP32 products of
@@ -265,7 +309,7 @@ class _W4A8Group:
     BF16 is applied by the consumer kernels on load."""
 
     def __init__(self, fvk, wrappers, scratch: dict, gemm: str = "marlin", maps: dict | None = None,
-                 act_rot: str = "paro", ktile: int = 128) -> None:
+                 act_rot: str = "paro", ktile: int = 256, prefill_weights: str = "w4a8") -> None:
         from flashdrive.quantization import BF16RotateLinearWrapper
         from vllm.scalar_type import scalar_types
         mods = []
@@ -290,14 +334,23 @@ class _W4A8Group:
         self.act_rot = act_rot
         self.ktile = ktile
         self.rot = [paro_rotation_matrices(m.rotation.theta, m.rotation.pairs, self.K) for m in mods] if act_rot == "dense" else None
+        tabs = [paro_pair_bank_order(m.rotation.theta, m.rotation.pairs, self.K) for m in mods]   # bank-ordered pair tables
+        self.theta, self.pairs = [t for t, _ in tabs], [p for _, p in tabs]
         self.int8 = None
+        self.int8pc = None
         self.small = None
         if gemm == "tcgen05":       # FlashRT GEMMs: tcgen05 INT8 ((w - z) int8 [N, K]) for prefill-size groups,
             self.int8, self.small = [], []   # mma.sync on packed nibbles + zero points for a few rows
+            if prefill_weights == "int8":    # ... or per-channel INT8 codes on the plain INT8 GEMM (precision tier)
+                self.int8pc = []
             for m, N in zip(mods, self.N):
                 w, z, sg = marlin_w4a8_unpack(m.qlinear.qweight, m.qlinear.scales, m.qlinear.qzeros, self.K, N, maps)
-                self.int8.append(((w.to(torch.int16) - z.to(torch.int16).repeat_interleave(128, 0))
-                                  .to(torch.int8).t().contiguous(), sg))
+                w8 = (w.to(torch.int16) - z.to(torch.int16).repeat_interleave(128, 0)).to(torch.int8).t().contiguous()
+                if self.int8pc is not None:
+                    self.int8pc.append(w4a8_to_int8_channel(w8, sg))
+                    del w8
+                else:
+                    self.int8.append((w8, sg))
                 self.small.append((pack_w4a8_small(w, self.K, N), z.contiguous(), sg))
                 del w, z
 
@@ -324,7 +377,7 @@ class _W4A8Group:
             mode, src.data_ptr() if src is not None else 0, src2.data_ptr() if src2 is not None else 0,
             (src if src is not None else residual).stride(0), residual.data_ptr() if residual is not None else 0,
             residual.stride(0) if residual is not None else 0, norm_w.data_ptr() if norm_w is not None else 0, eps, M,
-            self.K, ptrs(m.rotation.theta for m in self.mods), ptrs(m.rotation.pairs for m in self.mods),
+            self.K, ptrs(self.theta), ptrs(self.pairs),
             ptrs(m.rotation.channel_scales for m in self.mods), ptrs(m.qlinear.input_global_scale for m in self.mods),
             ptrs(b["xq"]), ptrs(b["as"]), 0, 0, torch.cuda.current_stream().cuda_stream)
 
@@ -334,6 +387,10 @@ class _W4A8Group:
         from vllm.model_executor.layers.quantization.utils.marlin_utils import should_use_atomic_add_reduce
         b = self._buffers(M)
         outs = []
+        if self.int8pc is not None and M >= TCGEN05_MIN_ROWS:
+            for (codes, c), xq, a_s, N in zip(self.int8pc, b["xq"], b["as"], self.N):
+                outs.append(self._gemm_int8pc(fvk, xq, codes, c, a_s, M, N))
+            return outs
         if self.int8 is not None and M >= TCGEN05_MIN_ROWS:
             for (w8, sg), xq, a_s, N in zip(self.int8, b["xq"], b["as"], self.N):
                 outs.append(self._gemm_int8(fvk, xq, w8, sg, a_s, M, N))
@@ -371,8 +428,8 @@ class _W4A8Group:
             self.prep(fvk, 0, x, M)
         else:                             # a few rows: the two-pass kernels spread the groups over the SMs
             fvk.flashdrive_w4a8_act_prep(
-                x.data_ptr(), x.stride(0), M, self.K, ptrs(m.rotation.theta for m in self.mods),
-                ptrs(m.rotation.pairs for m in self.mods), ptrs(m.rotation.channel_scales for m in self.mods),
+                x.data_ptr(), x.stride(0), M, self.K, ptrs(self.theta), ptrs(self.pairs),
+                ptrs(m.rotation.channel_scales for m in self.mods),
                 ptrs(m.qlinear.input_global_scale for m in self.mods), ptrs(b["xr"]), ptrs(b["part"]), ptrs(b["xq"]),
                 ptrs(b["as"]), stream)
         return self.gemm(fvk, M)
@@ -389,6 +446,19 @@ class _W4A8Group:
         fvk.flashdrive_w4a8_gemm_sm100(xq.data_ptr(), w8.data_ptr(), sg.data_ptr(), ws[1].data_ptr(), a_s.data_ptr(),
                                        out.data_ptr(), M, N, self.K, ws[0].data_ptr(), ws[0].numel(),
                                        torch.cuda.current_stream().cuda_stream, self.ktile)
+        return out
+
+    def _gemm_int8pc(self, fvk, xq, codes, c, a_s, M, N) -> torch.Tensor:
+        key = ("int8pc", M, self.K, N)
+        ws = self._scratch.get(key)
+        if ws is None:
+            nbytes = fvk.alpamayo15_int8_gemm_sm100_workspace(M, N, self.K, INT8_PREFILL_TILE)
+            ws = torch.empty(max(int(nbytes), 16), dtype=torch.uint8, device=DEV)
+            self._scratch[key] = ws
+        out = torch.empty(M, N, dtype=torch.float16, device=DEV)
+        fvk.alpamayo15_int8_gemm_sm100(xq.data_ptr(), codes.data_ptr(), a_s.data_ptr(), c.data_ptr(), out.data_ptr(), M, N,
+                                       self.K, INT8_PREFILL_TILE, ws.data_ptr(), ws.numel(),
+                                       torch.cuda.current_stream().cuda_stream)
         return out
 
     def check_against_marlin(self, fvk, rows: int = TCGEN05_MIN_ROWS) -> float:
@@ -488,14 +558,16 @@ class _Bf16Frag:
 
 
 class _Fp8Weight:
-    """Per-row FP8 E4M3 copy of a [N, K] linear weight in the ``alpamayo15_w8a16_gemm_bf16`` fragment order."""
+    """Per-row one-byte copy of a [N, K] linear weight (``fmt`` "fp8": E4M3 codes, "int8": symmetric INT8 codes; both
+    with per-row FP32 scales) in the ``alpamayo15_w8a16_gemm_bf16`` fragment order."""
 
-    def __init__(self, w: torch.Tensor) -> None:
-        from flash_rt.models.alpamayo15.pipeline_thor import fp8_fragment_layout, quantize_fp8_rows
+    def __init__(self, w: torch.Tensor, fmt: str = "fp8") -> None:
+        from flash_rt.models.alpamayo15.pipeline_thor import fp8_fragment_layout, quantize_fp8_rows, quantize_int8_rows
         with torch.no_grad():
-            codes, scale = quantize_fp8_rows(w.detach())
+            codes, scale = (quantize_int8_rows if fmt == "int8" else quantize_fp8_rows)(w.detach())
             self.frag, self.scale = fp8_fragment_layout(codes, scale)
         self.shape = tuple(w.shape)
+        self.fmt = 1 if fmt == "int8" else 0
 
 
 def _gemm_small(fvk, x: torch.Tensor, w, y: torch.Tensor) -> torch.Tensor:
@@ -507,7 +579,7 @@ def _gemm_small(fvk, x: torch.Tensor, w, y: torch.Tensor) -> torch.Tensor:
         if y.dtype != BF16 or y.stride(0) != N or x.stride(0) != K:
             raise ValueError("the W8A16 path needs contiguous bf16 operands")
         fvk.alpamayo15_w8a16_gemm_bf16(w.frag.data_ptr(), w.scale.data_ptr(), x.data_ptr(), y.data_ptr(), x.shape[0], N, K,
-                                       torch.cuda.current_stream().cuda_stream)
+                                       torch.cuda.current_stream().cuda_stream, w.fmt)
         return y
     if isinstance(w, _Bf16Frag):
         N, K = w.shape
@@ -562,14 +634,19 @@ class FlashDriveThor:
             GEMMs with fused bias / GELU / residual epilogues) or ``"torch"``
             (cuBLAS through torch) for the vision tower and the action expert.
         decode_weights: ``"bf16"`` (default; fragment-ordered BF16 copies of the LM
-            head and the DFlash draft linears for the streaming few-row GEMM) or
-            ``"fp8"`` (per-row FP8 E4M3 copies on the W8A16 kernel: a precision
-            tier, validate on your scenarios).
+            head and the DFlash draft linears for the streaming few-row GEMM),
+            ``"int8"`` (per-row symmetric INT8 copies on the W8A16 kernel) or
+            ``"fp8"`` (per-row FP8 E4M3 copies): precision tiers, validate on your
+            scenarios.
         expert_weights: ``"bf16"`` (default) or ``"fp8"``: the expert's projections
             as per-row FP8 E4M3 weights with per-row FP8 activations (W8A8 on the
             FP8 tcgen05 GEMM, scales applied in the epilogue); a precision tier.
-        w4a8_ktile: K tile of the tcgen05 prefill GEMM (128, or 256: two groups
-            per mainloop step; identical integer results).
+        w4a8_ktile: K tile of the blockwise tcgen05 prefill GEMM: 256 (default;
+            two groups per mainloop step) or 128; identical integer results.
+        prefill_weights: ``"w4a8"`` (default; Marlin's group-scaled integers on the
+            blockwise tcgen05 GEMM, bit-identical to Marlin) or ``"int8"``
+            (per-channel INT8 requantization of the same integers on the plain
+            INT8 tcgen05 GEMM; a precision tier).
         pdl: launch the backend's kernels and GEMMs with programmatic dependent
             launch (off by default: measured neutral on this bandwidth-bound
             pipeline). Process-wide switch.
@@ -588,10 +665,12 @@ class FlashDriveThor:
     def __init__(self, model, *, expert: str = "flashrt", vision: str = "flashrt", prefill: str = "flashrt",
                  decode: str = "flashrt", w4a8: str | None = None, w4a8_gemm: str | None = None,
                  act_rot: str = "paro", vision_gemm: str = "cutlass", expert_gemm: str = "cutlass",
-                 decode_weights: str = "bf16", expert_weights: str = "bf16", pdl: bool = False, w4a8_ktile: int = 128,
-                 expert_splits: int = 1) -> None:
+                 decode_weights: str = "bf16", expert_weights: str = "bf16", pdl: bool = False, w4a8_ktile: int = 256,
+                 expert_splits: int = 1, prefill_weights: str = "w4a8") -> None:
         if w4a8_ktile not in (128, 256):
             raise ValueError("w4a8_ktile must be 128 or 256")
+        if prefill_weights not in PREFILL_WEIGHTS:
+            raise ValueError(f"unknown prefill_weights {prefill_weights!r}; choose from {PREFILL_WEIGHTS}")
         backends = {"expert": expert, "vision": vision, "prefill": prefill, "decode": decode}
         if act_rot not in ACT_ROTS:
             raise ValueError(f"unknown act_rot {act_rot!r}; choose from {ACT_ROTS}")
@@ -675,8 +754,9 @@ class FlashDriveThor:
             backends["expert_weights"] = expert_weights
         if w4a8 == "fused":
             self._w4, scratch, maps = [], {}, {}
-            grp = lambda mods: _W4A8Group(fvk, mods, scratch, w4a8_gemm, maps, act_rot, w4a8_ktile)
+            grp = lambda mods: _W4A8Group(fvk, mods, scratch, w4a8_gemm, maps, act_rot, w4a8_ktile, prefill_weights)
             backends["w4a8_ktile"] = w4a8_ktile
+            backends["prefill_weights"] = prefill_weights
             for layer in model.vlm.model.language_model.layers:
                 a, mlp = layer.self_attn, layer.mlp
                 self._w4.append({"qkv": grp([a.q_proj, a.k_proj, a.v_proj]), "o": grp([a.o_proj]),
@@ -1359,7 +1439,8 @@ class FlashDriveThor:
                 lin[(li, name)] = getattr(layer.self_attn, name).weight
             for name in ("gate_proj", "up_proj", "down_proj"):
                 lin[(li, name)] = getattr(layer.mlp, name).weight
-        lin = {k: (_Fp8Weight(w) if decode_weights == "fp8" else _Bf16Frag(w)) for k, w in lin.items()}
+        lin = {k: (_Fp8Weight(w, decode_weights) if decode_weights in ("fp8", "int8") else _Bf16Frag(w))
+               for k, w in lin.items()}
         torch.cuda.empty_cache()
         return lin
 

@@ -497,13 +497,23 @@ FlashDrive's execution (eager or `torch.compile`). Calls must run under
 | `expert_gemm="cutlass"` (default) | expert projections | tcgen05 BF16 GEMMs (64-row tiles) and a fused SiLU-mul over the gate|up output; `"torch"` keeps cuBLAS |
 | `_shift_streaming_kv_cache` | frame-block shift | one kernel moves every layer's frame blocks (keys, values) and rotates the moved keys into the VLM view |
 
-Every kernel and GEMM of the backend is launched with programmatic dependent launch (`pdl=True`, process-wide), so a
-kernel's prologue overlaps its predecessor's tail inside the CUDA graphs. Precision tiers (off by default, numerics
-changes to validate on your scenarios): `act_rot="dense"` (the ParoQuant rotation as one 128 x 128 FP16 matrix per
-channel group on tensor cores, one FP16 rounding instead of eight), `decode_weights="fp8"` (per-row FP8 E4M3 copies of
-the LM head and draft linears on the W8A16 kernel), `expert_weights="fp8"` (W8A8: per-row FP8 activations and weights on
-the FP8 tcgen05 GEMM, scales applied in the epilogue). `w4a8_ktile=256` runs the prefill GEMM with two groups per
-mainloop step (identical integers).
+Over the streaming window (hundreds of rows) the producer of each W4A8 input -- residual update + RMSNorm, SiLU-mul of
+the gate|up output, or the attention output -- and its ParoQuant preparation (channel scale, eight rotation layers, row
+absmax, INT8 quantization) run as one kernel over row tiles (`flashdrive_w4a8_act_prep_tile`: 16-byte column chunks of 8
+rows in shared memory, a thread-block cluster per tile for the widest input), bit-exact with the separate kernels, which
+remain in use for the few-row verification and trajectory-start passes. The backend can launch every kernel and GEMM
+with programmatic dependent launch (`pdl=True`, process-wide), so a kernel's prologue overlaps its predecessor's tail
+inside the CUDA graphs (off by default: measured neutral on Thor). Precision tiers (off by default, numerics changes to
+validate on your scenarios): `act_rot="dense"` (the ParoQuant rotation as one 128 x 128 FP16 matrix per channel group on
+tensor cores, one FP16 rounding instead of eight), `decode_weights="int8"` / `"fp8"` (per-row symmetric INT8 or FP8 E4M3
+copies of the LM head and draft linears on the W8A16 kernel; INT8 keeps ~4x more weight precision for the same bytes and
+is the validated fast tier: on 9 clips x 3 seeds its ADE is +0.008 vs the BF16 default, 95% CI [-0.031, +0.063], -0.023 vs
+the FlashDrive author stack),
+`expert_weights="fp8"` (W8A8: per-row FP8 activations and weights on the FP8 tcgen05 GEMM, scales applied in the
+epilogue), `prefill_weights="int8"` (the streaming-window GEMMs on per-channel INT8 requantizations of Marlin's
+group-scaled integers, plain INT8 tcgen05 GEMM with the token and channel scales in the epilogue instead of the
+blockwise mainloop). The blockwise prefill GEMM runs two 128-channel groups per mainloop step by default (`w4a8_ktile=256`; 128 is
+the single-group form, identical integers).
 
 ### Cache contract
 

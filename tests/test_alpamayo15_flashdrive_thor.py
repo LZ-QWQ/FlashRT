@@ -474,6 +474,43 @@ def test_act_prep_tile_matches_separate_kernels(mode, rows, K, tile, cluster):
             assert torch.equal(q, q2)
 
 
+@pytest.mark.parametrize("K", [3584, 18944])
+def test_bank_ordered_pair_tables_keep_the_rotation(K):
+    """paro_pair_bank_order permutes the pairs of every (layer, group) only; the preparation on the reordered tables is
+    bitwise that on the original ones, and each quarter-warp's eight first channels hit eight distinct bank groups
+    whenever a residue class has at most eight members."""
+    from flash_rt.models.alpamayo15_flashdrive.pipeline_thor import paro_pair_bank_order
+    fvk = _kernels()
+    torch.manual_seed(31)
+    theta = (torch.randn(8, K // 2, device="cuda") * 2).to(torch.float16)
+    perm = torch.stack([torch.cat([torch.randperm(128) for _ in range(K // 128)]) for _ in range(8)])
+    pairs = perm.to(torch.int16).cuda()
+    th2, pr2 = paro_pair_bank_order(theta, pairs, K)
+    assert th2.shape == theta.shape and pr2.shape == pairs.shape and pr2.dtype == pairs.dtype
+    a = torch.cat([pairs.view(8, -1, 64, 2).long(), theta.view(8, -1, 64, 1).view(torch.int16).long()], -1)
+    b = torch.cat([pr2.view(8, -1, 64, 2).long(), th2.view(8, -1, 64, 1).view(torch.int16).long()], -1)
+    key = lambda x: (x[..., 0] * 256 + x[..., 1]) * 65536 + (x[..., 2] & 0xFFFF)
+    assert torch.equal(key(a).sort(-1).values, key(b).sort(-1).values)        # same (i, j, theta) multiset per layer/group
+    i = pr2.view(8, -1, 64, 2)[..., 0].long()
+    res = ((i + (i >> 3)) & 7).view(8, -1, 8, 8)                              # [layer, group, bucket, lane]
+    distinct = (torch.nn.functional.one_hot(res, 8).sum(-2) <= 1).all(-1)    # bucket conflict-free
+    assert distinct.float().mean() > 0.6                                      # overflow pairs only where a class exceeds 8
+    rows = 40
+    x = torch.randn(rows, K, device="cuda").to(BF16)
+    scales = (torch.rand(1, K, device="cuda") + 0.5).to(torch.float16)
+    igs = torch.tensor(6.5e-6, device="cuda", dtype=torch.float32)
+    outs = []
+    for th, pr in ((theta, pairs), (th2, pr2)):
+        xq = torch.zeros(64, K, device="cuda", dtype=torch.int8)
+        a_s = torch.zeros(64, device="cuda", dtype=torch.float32)
+        fvk.flashdrive_w4a8_act_prep_tile(0, x.data_ptr(), 0, K, 0, K, 0, 0.0, rows, K, [th.data_ptr()], [pr.data_ptr()],
+                                          [scales.data_ptr()], [igs.data_ptr()], [xq.data_ptr()], [a_s.data_ptr()], 0, 0,
+                                          torch.cuda.current_stream().cuda_stream)
+        torch.cuda.synchronize()
+        outs.append((xq, a_s))
+    assert torch.equal(outs[0][0], outs[1][0]) and torch.equal(outs[0][1], outs[1][1])
+
+
 def test_shift_cache_matches_flashdrive_shift_and_rotation():
     """One launch moves every layer's frame blocks f+1 -> f (FlashDrive's gather + scatter) and rotates the
     moved keys into the VLM view (BF16 rule at the destination rows)."""
@@ -772,6 +809,34 @@ def test_fp8_gemm_and_row_quantization_match_reference(M, N, K):
     assert bool((err <= ref.abs() * 2 ** -7 + 2 ** -6 * float(ref.abs().mean())).all()), float(err.max())
     deq = x.float() @ w.float().t()
     assert float((D.float() - deq).abs().mean()) < 0.06 * float(deq.abs().mean())   # e4m3 on both operands
+
+
+@pytest.mark.parametrize("M,N,K,tile", [(802, 3584, 3584, 0), (802, 512, 3584, 0), (300, 18944, 3584, 1), (802, 3584, 18944, 0)])
+def test_int8_channel_gemm_and_requantization_match_reference(M, N, K, tile):
+    """The per-channel INT8 prefill GEMM reproduces half(float(xq @ codes.T) * a_s[m] * c[n]) (int32 accumulation);
+    w4a8_to_int8_channel keeps every channel's absmax at 127 and the integer weights within half a step."""
+    fvk = _kernels()
+    from flash_rt.models.alpamayo15_flashdrive.pipeline_thor import w4a8_to_int8_channel
+    torch.manual_seed(37)
+    w8 = torch.randint(-15, 16, (N, K), device="cuda", dtype=torch.int8)
+    s = torch.randint(1, 4097, (K // 128, N), device="cuda", dtype=torch.int32)
+    codes, c = w4a8_to_int8_channel(w8, s)
+    v = w8.int() * s.t().repeat_interleave(128, 1)
+    assert torch.equal(codes.int().abs().amax(dim=1), torch.full((N,), 127, device="cuda", dtype=torch.int32))
+    assert bool(((codes.float() * c[:, None] - v.float()).abs() <= 0.5 * c[:, None] + 1e-3).all())
+    xq = torch.randint(-127, 128, ((M + 31) // 32 * 32, K), device="cuda", dtype=torch.int8)
+    a_s = (torch.rand(M, device="cuda") * 2e-5 + 2e-6).to(torch.float32)      # outputs within the FP16 range
+    D = torch.empty(M, N, device="cuda", dtype=torch.float16)
+    nbytes = fvk.alpamayo15_int8_gemm_sm100_workspace(M, N, K, tile)
+    ws = torch.empty(max(int(nbytes), 16), dtype=torch.uint8, device="cuda")
+    fvk.alpamayo15_int8_gemm_sm100(xq.data_ptr(), codes.data_ptr(), a_s.data_ptr(), c.data_ptr(), D.data_ptr(), M, N, K, tile,
+                                   ws.data_ptr(), ws.numel(), torch.cuda.current_stream().cuda_stream)
+    torch.cuda.synchronize()
+    acc = (xq[:M].float() @ codes.float().t())                 # exact: |acc| < 2^24 for these magnitudes? use float64
+    acc = (xq[:M].double() @ codes.double().t())
+    ref = (acc * a_s.double()[:, None] * c.double()[None, :]).to(torch.float16)
+    err = (D.float() - ref.float()).abs()
+    assert bool((err <= ref.float().abs() * 2 ** -9 + 1e-6).all()), float(err.max())   # two FP32 products, one FP16 rounding
 
 
 def test_new_kernels_are_bitwise_repeatable():

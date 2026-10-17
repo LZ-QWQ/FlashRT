@@ -94,8 +94,9 @@ int alpamayo15_vlm_qk_prep_bf16(const void* qkv, const void* q_norm_w, const voi
 // scale  : [N] fp32 per output row (fp8_fragment_layout pads it to T * 16 with zeros)
 // x      : [M, K] bf16 row-major (4-byte aligned); y : [M, N] bf16 row-major
 // K must be a multiple of 32.
+// fmt: 0 = FP8 E4M3 codes, 1 = INT8 codes (both per-output-row scales, same fragment order).
 int alpamayo15_w8a16_gemm_bf16(const void* w_frag, const float* scale, const void* x, void* y,
-                               int M, int N, int K, cudaStream_t stream);
+                               int M, int N, int K, int fmt, cudaStream_t stream);
 
 }  // namespace kernels
 }  // namespace flash_rt
