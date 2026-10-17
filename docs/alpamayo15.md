@@ -698,7 +698,7 @@ group to the previous):
 | + every streaming primitive on FlashRT kernels (few-row W4A8 / BF16 GEMMs, CUTLASS vision and expert GEMMs, single-kernel shift) | 482 | 449 | 178 | 36.2 | 87 | 40 |
 | + tile activation preparation, bank-ordered rotation tables, 256-deep K tile (default) | 454 | 420 | 144 | 37.1 | 88 | 40 |
 | `decode_weights="int8"` (tier) | 447 | 437 | 153 | 30.6 | 88 | 40 |
-| `prefill_weights="int8"` (tier) | 445 | 396 | 120 | 37.3 | 88 | 40 |
+| `prefill_weights="int8"` (tier) | 436 | 387 | 112 | 37.3 | 88 | 40 |
 
 Stage columns are CUDA-event means per window (ms; the DFlash column per
 round). Groups left on FlashDrive run compiled. Window latency depends on the
