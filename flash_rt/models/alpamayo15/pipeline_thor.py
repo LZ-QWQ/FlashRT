@@ -107,7 +107,7 @@ ALPAMAYO15_KERNEL_SYMBOLS = (
 )
 GEMM_BACKENDS = ("cutlass", "torch")         # BF16 GEMMs of the action expert
 VISION_GEMM_BACKENDS = ("cutlass", "cublaslt", "torch")   # BF16 GEMMs of the vision tower (cublaslt: the blocks' fc1 on cuBLASLt)
-VISION_TILE = 2                              # tcgen05 tile of the vision GEMMs: 256 x 128 on a 2-SM UMMA
+VISION_TILE = 3                              # tcgen05 tile of the vision GEMMs: 256 x 256 on a 2-SM UMMA (2 = 256 x 128)
 DECODE_WEIGHTS = ("bf16", "fp8", "int8", "w4a8")
 EXPERT_WEIGHTS = ("bf16", "fp8")
 PREFILL_WEIGHTS = ("bf16", "fp8", "nvfp4")

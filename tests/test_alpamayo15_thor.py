@@ -390,6 +390,8 @@ def test_w8a16_gemm_rejects_unsupported_shapes():
                                                   (64, 2048, 8256, 0, 1, False), (37, 1032, 72, 1, 0, False),
                                                   (3086, 6144, 4096, 0, 2, False), (300, 4096, 12288, 0, 2, False),
                                                   (2880, 4304, 1152, 1, 2, False), (2880, 1152, 4304, 0, 2, True),
+                                                  (2880, 4608, 1152, 1, 3, False), (2880, 1152, 4608, 0, 3, True),
+                                                  (11520, 3456, 1152, 0, 3, False),
                                                   (720, 4608, 4608, 2, 2, False)])
 def test_bf16_cutlass_gemm_matches_torch(M, N, K, act, tile, res):
     """D = act(A @ W.T + bias) (+ C) on tcgen05 against the torch reference (FP32 math, one BF16 rounding)."""

@@ -421,6 +421,8 @@ steady windows of the same clip (the same windows for every row):
 | balanced + INT4 LM head | 849 / 773 (24 w.) | 141 | 294 | 20.8 | 126 | 34.8 |
 | balanced + INT4 LM head + NVFP4 prefill with per-tensor activation scales | 811 / 717 (24 w.) | 142 | 233 | 21.1 | 126 | 32.0 |
 | `preset="fast"` (the row above with per-row activation scales written by the fused NVFP4 producers) | 741 / 669 (24 w.) | 141 | 185 | 20.9 | 126 | 32.0 |
+| this engine, defaults (BF16), vision tile 256 x 256 (current default) | 1848 / 1555 (24 w.) | 122 | 547 | 66.5 | 211 | 22.3 |
+| `preset="fast"`, vision tile 256 x 256 (current default) | 726 / 651 (24 w.) | 121 | 186 | 21.2 | 126 | 32.0 |
 | `preset="balanced"`, `vision_gemm="cublaslt"` | 880 / 786 (24 w.) | 138 | 290 | 22.3 | 126 | 35.0 |
 | `preset="fast"`, `vision_gemm="cublaslt"` | 861 / 771 (24 w.) | 138 | 290 | 21.0 | 126 | 34.8 |
 
@@ -609,11 +611,21 @@ form.
 The SiLU-mul -> FP8 producer of the prefill tier keeps four gate / up vectors
 in flight per thread (same codes; 817 -> 807 us per layer, within noise).
 
+The vision tower's BF16 GEMMs run on a 2-SM 256 x 256 x 64 tcgen05 tile
+(`VISION_TILE = 3`; 2 selects the earlier 256 x 128): at S = 11520 rows qkv
+736 -> 551 us (166 TFLOPS), fc1 972 -> 708 (173), fc2 969 -> 816 (150), proj
+331 -> 337 (N = 1152 is 4.5 tiles wide); the outputs are identical to the
+256 x 128 tile's on every GEMM (the N tiling does not change the K reduction
+order), so the tokens and trajectories are unchanged. The tower drops from
+141 to 122 ms per request (the default engine 1869 -> 1848 ms on the author
+clip, `"fast"` 744 -> 726).
+
 `vision_gemm="cublaslt"` runs the vision blocks' fc1 on cuBLASLt: bias and
 GELU (tanh) fused into the cuBLASLt epilogue (one BF16 rounding), the
 row-major operands presented in the column-major formulation PyTorch uses;
-796 against 955 us per block in the pipeline (147 against 125 TFLOPS), about
-3 ms per request. It is not the default: the values differ from the tcgen05
+796 against 955 us per block in the pipeline (147 against 125 TFLOPS on the
+256 x 128 tile; the 256 x 256 tile's fc1 is faster, 708 us), about 3 ms per
+request at the time. It is not the default: the values differ from the tcgen05
 epilogue's in the last bit of a few elements, which resamples some windows
 (nine clips: 71 of 573 windows, ADE +0.047 [-0.007, +0.153] against the
 default backend, latency within noise), and the other three block GEMMs are

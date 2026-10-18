@@ -5,9 +5,9 @@
 // bias [N] (optional), C [M, N] row-major residual (optional, added after the activation; identity only),
 // D [M, N] row-major.
 //   act: 0 identity, 1 GELU (tanh approximation, gelu_pytorch_tanh), 2 GELU (erf)
-//   tile: 0 = 128 x 128 x 64 per SM, 2 = 256 x 128 x 64 on a 2-SM UMMA (2 x 1 cluster; the vision tower: every
-//         activation / residual form), 1 = 64 x 128 x 64 (few-row operands such as the action expert; identity, no
-//         residual)
+//   tile: 0 = 128 x 128 x 64 per SM, 2 = 256 x 128 x 64 and 3 = 256 x 256 x 64 on a 2-SM UMMA (2 x 1 cluster; the
+//         vision tower: every activation / residual form), 1 = 64 x 128 x 64 (few-row operands such as the action
+//         expert; identity, no residual)
 // The residual is added to the activated value, so proj / fc2 (x + linear(..)) and the patch embedding (+ position
 // embedding) are one launch each. 16-byte alignment on every operand; K % 8 == 0, N % 8 == 0.
 
@@ -226,6 +226,7 @@ template <class T> using GeluErfAct = cutlass::epilogue::thread::GELU<T>;
 using Tile128 = Shape<_128, _128, _64>;
 using Tile64 = Shape<_64, _128, _64>;
 using Tile256 = Shape<_256, _128, _64>;
+using Tile256W = Shape<_256, _256, _64>;
 
 using G128Id = GemmDef<Tile128, NoResTree<Tile128, IdentityAct>>;
 using G128Tanh = GemmDef<Tile128, NoResTree<Tile128, GeluTanhAct>>;
@@ -236,6 +237,10 @@ using G256Id = GemmDef<Tile256, NoResTree<Tile256, IdentityAct>, true>;      // 
 using G256Tanh = GemmDef<Tile256, NoResTree<Tile256, GeluTanhAct>, true>;
 using G256Erf = GemmDef<Tile256, NoResTree<Tile256, GeluErfAct>, true>;
 using G256Res = GemmDef<Tile256, ResTree<Tile256>, true>;
+using G256WId = GemmDef<Tile256W, NoResTree<Tile256W, IdentityAct>, true>;   // tile 3: 2-SM UMMA, 256 x 256
+using G256WTanh = GemmDef<Tile256W, NoResTree<Tile256W, GeluTanhAct>, true>;
+using G256WErf = GemmDef<Tile256W, NoResTree<Tile256W, GeluErfAct>, true>;
+using G256WRes = GemmDef<Tile256W, ResTree<Tile256W>, true>;
 
 template <class Def, bool kRes>
 typename Def::Gemm::Arguments make_args(const void* A, const void* B, const void* bias, const void* C, void* D, int M,
@@ -330,7 +335,7 @@ int run_fp8(const void* A, const void* B, const float* a_s, const float* w_s, vo
 bool aligned16(const void* p) { return (reinterpret_cast<uintptr_t>(p) & 15u) == 0; }
 
 int check(int M, int N, int K, int act, int tile, bool res) {
-  if (M <= 0 || N <= 0 || K <= 0 || (N % kAlign) || (K % kAlign) || act < 0 || act > 2 || tile < 0 || tile > 2) return 2;
+  if (M <= 0 || N <= 0 || K <= 0 || (N % kAlign) || (K % kAlign) || act < 0 || act > 2 || tile < 0 || tile > 3) return 2;
   if (res && act != 0) return 2;
   if (tile == 1 && (act != 0 || res)) return 2;
   return 0;
@@ -343,6 +348,13 @@ extern "C" {
 int flashrt_a15_bf16_gemm_sm100_workspace(int M, int N, int K, int act, int tile, int residual,
                                           unsigned long long* workspace_bytes) {
   if (int rc = check(M, N, K, act, tile, residual != 0)) return rc;
+  if (tile == 3) {
+    if (residual) *workspace_bytes = ws_size<G256WRes, true>(M, N, K);
+    else if (act == 0) *workspace_bytes = ws_size<G256WId, false>(M, N, K);
+    else if (act == 1) *workspace_bytes = ws_size<G256WTanh, false>(M, N, K);
+    else *workspace_bytes = ws_size<G256WErf, false>(M, N, K);
+    return 0;
+  }
   if (tile == 2) {
     if (residual) *workspace_bytes = ws_size<G256Res, true>(M, N, K);
     else if (act == 0) *workspace_bytes = ws_size<G256Id, false>(M, N, K);
@@ -430,6 +442,12 @@ int flashrt_a15_bf16_gemm_sm100(const void* A, const void* B, const void* bias, 
   if (!A || !B || !D || (workspace_bytes && !workspace)) return 1;
   if (int rc = check(M, N, K, act, tile, C != nullptr)) return rc;
   if (!aligned16(A) || !aligned16(B) || !aligned16(D) || (bias && !aligned16(bias)) || (C && !aligned16(C))) return 5;
+  if (tile == 3) {
+    if (C) return run<G256WRes, true>(A, B, bias, C, D, M, N, K, workspace, workspace_bytes, pdl, stream);
+    if (act == 0) return run<G256WId, false>(A, B, bias, nullptr, D, M, N, K, workspace, workspace_bytes, pdl, stream);
+    if (act == 1) return run<G256WTanh, false>(A, B, bias, nullptr, D, M, N, K, workspace, workspace_bytes, pdl, stream);
+    return run<G256WErf, false>(A, B, bias, nullptr, D, M, N, K, workspace, workspace_bytes, pdl, stream);
+  }
   if (tile == 2) {
     if (C) return run<G256Res, true>(A, B, bias, C, D, M, N, K, workspace, workspace_bytes, pdl, stream);
     if (act == 0) return run<G256Id, false>(A, B, bias, nullptr, D, M, N, K, workspace, workspace_bytes, pdl, stream);
