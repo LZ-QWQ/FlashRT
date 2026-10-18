@@ -410,7 +410,7 @@ steady windows of the same clip (the same windows for every row):
 | Configuration | request ms (mean / median) | vision | prefill LM | decode ms/token | diffusion | peak GB |
 |---|---|---|---|---|---|---|
 | previous engine (cuBLAS vision / expert, BF16) | 1947 / 1894 | 181 | 520 | 68.2 | 230 | 22.1 |
-| this engine, defaults (BF16) | 1920 / 1917 | 146 | 545 | 67.6 | 212 | 22.3 |
+| this engine, defaults (BF16) | 1903 / 1904 | 142 | 548 | 66.8 | 212 | 22.3 |
 | `decode_weights="int8"` | 1459 (24 w.) | 150 | 545 | 38.0 | 215 | 29.3 |
 | `decode_weights="w4a8"` (ParoQuant) | 1304 (24 w.) | 151 | 552 | 27.2 | 214 | 26.4 |
 | `expert_weights="fp8"` | 1818 (24 w.) | 148 | 543 | 68.5 | 130 | 24.4 |
@@ -438,8 +438,8 @@ intervals over clips, paired differences are per (clip, window):
 | all three tiers | 1290 [1167, 1460] | 1195 | 1509 | 2780 | 38.0 | 2.848 | -869 [-992, -776] | -0.033 [-0.093, +0.006] | -0.019 [-0.036, -0.006] |
 | `decode_weights="w4a8"` (ParoQuant) | 1393 [1306, 1509] | 1330 | 1538 | 2524 | 26.4 | 2.884 | -767 [-947, -640] | +0.003 [-0.043, +0.046] | +0.017 [-0.017, +0.063] |
 | W4A8 decode + FP8 expert + FP8 prefill | 1071 [981, 1209] | 998 | 1216 | 2310 | 35.1 | 2.825 | -1088 [-1251, -964] | -0.056 [-0.123, -0.007] | -0.042 [-0.083, -0.007] |
-| `preset="balanced"` (the row above with the grouped GEMM, one KV split, warp LayerNorm, vectorized FP8 producer) | 1027 [951, 1131] | 972 | 1176 | 2051 | 35.0 | 2.824 | -1133 [-1325, -997] | -0.057 [-0.118, -0.015] | -0.043 [-0.097, +0.002] |
-| `preset="fast"` (balanced + INT4 LM head) | 1006 [930, 1119] | 949 | 1142 | 2145 | 34.8 | 2.861 | -1153 [-1338, -1015] | -0.020 [-0.104, +0.038] | -0.006 [-0.057, +0.033] |
+| `preset="balanced"` (the row above with the grouped GEMM, fused quantization and table prefetch, one KV split, warp LayerNorm, vectorized FP8 producer) | 966 [900, 1056] | 920 | 1096 | 1849 | 35.0 | 2.824 | -1194 [-1401, -1047] | -0.057 [-0.118, -0.015] | -0.043 [-0.097, +0.002] |
+| `preset="fast"` (balanced + INT4 LM head) | 952 [885, 1050] | 902 | 1071 | 1961 | 34.8 | 2.861 | -1208 [-1407, -1060] | -0.020 [-0.104, +0.038] | -0.006 [-0.057, +0.031] |
 
 The default engine generates the same tokens as the previous engine on 549 of
 573 requests; the INT8 decode tier on 532, the FP8 prefill tier on 531 and all
@@ -460,9 +460,11 @@ of the attention and GELU outputs costs 28 ms), so it is not recommended;
 on, so it stays off.
 
 The same 112 of 117 windows produce identical reasoning tokens on the previous
-and the current default engine (the five others flip at near ties, as every
-tcgen05 vision/expert form does), and on identical tokens the current engine
-is 36 ms faster per request. The prefill column grew by 25 ms although its
+and the engine of the first tcgen05 commits (the five others flip at near ties,
+as every tcgen05 vision/expert form does), and on identical tokens that engine
+is 36 ms faster per request; the current default (one KV split, warp LayerNorm:
+two reduction-order changes) keeps 109 of 117 windows and is another 13 ms
+faster on them. The prefill column grew by 25 ms although its
 kernels did not change: cuBLAS's 2-CTA gate/up kernel runs 15% slower in this
 pipeline than before (2.08 -> 2.39 ms), while the same GEMM measures 1.66 ms
 in isolation inside the same process; the board's over-current throttle
