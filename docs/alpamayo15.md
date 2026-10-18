@@ -407,11 +407,13 @@ steady windows of the same clip (the same windows for every row):
 | Configuration | request ms (mean / median) | vision | prefill LM | decode ms/token | diffusion | peak GB |
 |---|---|---|---|---|---|---|
 | previous engine (cuBLAS vision / expert, BF16) | 1947 / 1894 | 181 | 520 | 68.2 | 230 | 22.1 |
-| this engine, defaults (BF16) | 1937 / 1932 | 150 | 545 | 68.3 | 214 | 22.3 |
+| this engine, defaults (BF16) | 1920 / 1917 | 146 | 545 | 67.6 | 212 | 22.3 |
 | `decode_weights="int8"` | 1459 (24 w.) | 150 | 545 | 38.0 | 215 | 29.3 |
+| `decode_weights="w4a8"` (ParoQuant) | 1304 (24 w.) | 151 | 552 | 27.2 | 214 | 26.4 |
 | `expert_weights="fp8"` | 1818 (24 w.) | 148 | 543 | 68.5 | 130 | 24.4 |
-| `prefill_weights="fp8"` | 1727 (24 w.) | 151 | 307 | 68.3 | 214 | 28.8 |
-| all three tiers | 1136 (24 w.) | 149 | 308 | 37.6 | 129 | 38.0 |
+| `prefill_weights="fp8"` | 1695 (24 w.) | 146 | 297 | 67.4 | 212 | 28.8 |
+| INT8 decode + FP8 expert + FP8 prefill | 1136 (24 w.) | 149 | 308 | 37.6 | 129 | 38.0 |
+| W4A8 decode + FP8 expert + FP8 prefill | 941 (24 w.) | 146 | 300 | 26.6 | 126 | 35.1 |
 
 Nine clips of `nvidia/PhysicalAI-Autonomous-Vehicles` (the FlashDrive default
 clip with 120 windows and eight more with 60; windows from t0 = 1.7 s, 0.1 s
@@ -429,26 +431,40 @@ intervals over clips, paired differences are per (clip, window):
 | `expert_weights="fp8"` | 2083 [1869, 2391] | 1919 | 2468 | 4823 | 24.4 | 2.879 | -76 [-78, -74] | -0.002 [-0.005, -0.000] | +0.012 [-0.018, +0.060] |
 | `prefill_weights="fp8"` | 1911 [1718, 2161] | 1768 | 2317 | 4294 | 28.8 | 2.836 | -248 [-296, -224] | -0.045 [-0.114, +0.005] | -0.031 [-0.089, +0.004] |
 | all three tiers | 1290 [1167, 1460] | 1195 | 1509 | 2780 | 38.0 | 2.848 | -869 [-992, -776] | -0.033 [-0.093, +0.006] | -0.019 [-0.036, -0.006] |
+| `decode_weights="w4a8"` (ParoQuant) | 1393 [1306, 1509] | 1330 | 1538 | 2524 | 26.4 | 2.884 | -767 [-947, -640] | +0.003 [-0.043, +0.046] | +0.017 [-0.017, +0.063] |
+| W4A8 decode + FP8 expert + FP8 prefill | 1071 [981, 1209] | 998 | 1216 | 2310 | 35.1 | 2.825 | -1088 [-1251, -964] | -0.056 [-0.123, -0.007] | -0.042 [-0.083, -0.007] |
 
 The default engine generates the same tokens as the previous engine on 549 of
 573 requests; the INT8 decode tier on 532, the FP8 prefill tier on 531 and all
-three tiers on 527 (the FP8 expert tier leaves the tokens unchanged, so its
-latency interval is tight). FDE moves with ADE on every row (all three tiers:
--0.132 m [-0.352, +0.002] against the default). Reasoning is sampled
+three tiers on 527, the W4A8 decode tier on 479 and the W4A8 + FP8 expert +
+FP8 prefill configuration on 475 (the FP8 expert tier leaves the tokens
+unchanged, so its latency interval is tight). FDE moves with ADE on every row
+(all three INT8/FP8 tiers: -0.132 m [-0.352, +0.002] against the default; the
+W4A8 configuration -0.197 m [-0.480, -0.008]). Reasoning is sampled
 (temperature 0.6), so these are distribution-level comparisons; the official
 model and the engines agree on at most one request's token stream. Against the
-official model, all three tiers are 2.57x faster on the mean and 2.65x on the
-median at an ADE 0.019 m lower.
+official model, the three INT8/FP8 tiers are 2.57x faster on the mean and 2.65x
+on the median at an ADE 0.019 m lower; the W4A8 decode + FP8 expert + FP8
+prefill configuration is 3.10x / 3.17x faster at an ADE 0.042 m lower.
+The vision FP8 tier measured 8 ms slower than the BF16 vision tower on this
+hardware (its GEMMs take 68 instead of 98 ms, but the per-row quantization
+of the attention and GELU outputs costs 28 ms), so it is not recommended;
+`pdl=True` measured -3.5 ms on the default engine and +11 ms with every tier
+on, so it stays off.
 
 The same 112 of 117 windows produce identical reasoning tokens on the previous
 and the current default engine (the five others flip at near ties, as every
 tcgen05 vision/expert form does), and on identical tokens the current engine
-is 20 ms faster per request. The prefill column grew by 25 ms although its
+is 36 ms faster per request. The prefill column grew by 25 ms although its
 kernels did not change: cuBLAS's 2-CTA gate/up kernel runs 15% slower in this
 pipeline than before (2.08 -> 2.39 ms), while the same GEMM measures 1.66 ms
 in isolation inside the same process; the board's over-current throttle
 (sysfs `oc3_event_cnt`, 20-90 events per window) is the suspected cause and is
-not a property of the code.
+not a property of the code. In the W4A8 decode step (27 ms) the few-row
+kernels take 19 ms (the GEMMs stream the INT4 weights at the DRAM rate, the
+rotation and quantization passes about 6 ms over 288 launches), FA4 3.1 ms
+and the INT8 LM head 2.6 ms; four KV splits measured best (2: +4 ms, 8: +11 ms
+per request).
 
 ## Precision tiers
 
