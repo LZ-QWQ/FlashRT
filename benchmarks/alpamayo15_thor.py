@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import time
 from pathlib import Path
 
@@ -21,6 +22,35 @@ def summarize(values):
     return {"n": len(values), **{k: float(v) for k, v in zip(
         ("mean", "p50", "p90", "p99"),
         (np.mean(values), *np.percentile(values, (50, 90, 99))))}} if values else {"n": 0}
+
+
+def parse_options(text):
+    """``k=v,k=v`` -> dict; values ``True`` / ``False`` / ``None`` and numbers are converted, the rest stay strings."""
+    out = {}
+    for item in filter(None, (text or "").split(",")):
+        key, _, value = item.partition("=")
+        if not key or not _:
+            raise ValueError(f"option {item!r} is not key=value")
+        literal = {"True": True, "False": False, "None": None}
+        if value in literal:
+            out[key] = literal[value]
+        else:
+            try:
+                out[key] = int(value)
+            except ValueError:
+                try:
+                    out[key] = float(value)
+                except ValueError:
+                    out[key] = value
+    return out
+
+
+def local_dir(repo_or_dir, revision=None):
+    """A local directory as is; a Hugging Face repo ID through the (offline-capable) cache."""
+    if os.path.isdir(repo_or_dir):
+        return repo_or_dir
+    from huggingface_hub import snapshot_download
+    return snapshot_download(repo_id=repo_or_dir, revision=revision)
 
 
 def prepare(args):
@@ -63,7 +93,11 @@ def run(args):
                 model.enable_diffusion_expert_cuda_graph(max_batch_size=1, max_graphs=4)
         else:
             from flash_rt.frontends.torch.alpamayo15_thor import Alpamayo15TorchFrontendThor
-            frontend = Alpamayo15TorchFrontendThor(args.checkpoint, max_new_tokens=args.max_new_tokens)
+            engine = parse_options(args.engine_kw)
+            engine.setdefault("preset", args.preset)
+            if engine["preset"] != "bf16" or engine.get("decode_weights") == "w4a8":
+                engine.setdefault("paro_checkpoint", local_dir(args.paro))      # the ParoQuant W4A8 language model
+            frontend = Alpamayo15TorchFrontendThor(args.checkpoint, max_new_tokens=args.max_new_tokens, engine_kwargs=engine)
             model, processor = frontend.model, frontend.processor
     elif args.arm == "flashdrive":
         import flashdrive
@@ -78,7 +112,7 @@ def run(args):
             Alpamayo15FlashDriveTorchFrontendThor, FlashDriveCheckpoints, FlashDriveRollout)
         frontend = Alpamayo15FlashDriveTorchFrontendThor(
             FlashDriveCheckpoints(args.base, args.paro, args.dflash),
-            rollout=FlashDriveRollout(max_new_tokens=args.max_new_tokens))
+            rollout=FlashDriveRollout(max_new_tokens=args.max_new_tokens), backends=parse_options(args.engine_kw) or None)
     load_s = time.perf_counter() - start
     rows = []
     torch.manual_seed(args.seed)
@@ -165,6 +199,10 @@ def main():
     parser.add_argument("--paro", default="z-lab/Alpamayo-1.5-10B-PARO")
     parser.add_argument("--dflash", default="z-lab/Alpamayo-1.5-10B-DFlash")
     parser.add_argument("--official-expert-graph", action="store_true")
+    parser.add_argument("--preset", choices=("bf16", "balanced", "fast"), default="balanced",
+                        help="flashrt_full: the engine's precision preset (balanced and fast load the ParoQuant checkpoint of --paro)")
+    parser.add_argument("--engine-kw", default="",
+                        help="k=v,... options of the FlashRT engine (flashrt_full) or backend (fd_flashrt), e.g. decode_weights=int8")
     args = parser.parse_args()
     if args.prepare:
         prepare(args)
