@@ -117,9 +117,10 @@ VISION_WEIGHTS = ("bf16", "fp8")
 LM_HEAD_WEIGHTS = ("decode", "int4")        # "decode" = the decode tier's format (INT8 with W4A8), "int4" = own INT4 linear
 PREFILL_FP8_TILE = 2        # FP8 prefill GEMMs: 256 x 128 x 128 tiles on a 2-SM UMMA
 PREFILL_DOWN_SPLIT = 4      # the K=12288 down projection as 4 column blocks (weight blocks that fit the L2: 1.47 vs 3.9 ms)
-# Named option sets. "bf16" is the bit-faithful default; "balanced" is the validated reduced-precision configuration
-# (needs paro_checkpoint); "fast" adds the 4-bit options measured on top of it (INT4 LM head, NVFP4 W4A4 prefill, which
-# needs the flash_rt_fp4 module). Explicit weight options override the preset's.
+# Named option sets. "balanced" (the default) is the validated reduced-precision configuration (needs paro_checkpoint;
+# neutral against the official model over three seeds of the nine-clip evaluation); "bf16" keeps the official weights
+# everywhere (the bit-faithful reference); "fast" adds the 4-bit options measured on top of "balanced" (INT4 LM head,
+# NVFP4 W4A4 prefill, which needs the flash_rt_fp4 module). Explicit weight options override the preset's.
 PRESETS = {
     "bf16": {},
     "balanced": {"decode_weights": "w4a8", "expert_weights": "fp8", "prefill_weights": "fp8"},
@@ -406,19 +407,21 @@ class Alpamayo15Thor:
             than the tcgen05 BF16 GEMM at those shapes on Thor.
         expert_gemm: ``"cutlass"`` (default; tcgen05 GEMMs with fused epilogues) or
             ``"torch"``.
-        preset: ``"bf16"`` (default: the official numerics up to kernel rounding),
-            ``"balanced"`` (``decode_weights="w4a8"``, ``expert_weights="fp8"``,
-            ``prefill_weights="fp8"``; needs ``paro_checkpoint``) or ``"fast"``
-            (``"balanced"`` with ``prefill_weights="nvfp4"`` and
-            ``lm_head_weights="int4"``). The weight options below default to the
-            preset's and override it when given.
+        preset: ``"balanced"`` (default: ``decode_weights="w4a8"``,
+            ``expert_weights="fp8"``, ``prefill_weights="fp8"``; needs
+            ``paro_checkpoint``), ``"bf16"`` (the official numerics up to kernel
+            rounding, no extra weights) or ``"fast"`` (``"balanced"`` with
+            ``prefill_weights="nvfp4"`` and ``lm_head_weights="int4"``). The
+            weight options below default to the preset's and override it when
+            given.
         decode_weights: ``"bf16"`` (official weights), ``"fp8"`` or ``"int8"``
             (opt-in per-row copies for the reasoning-decode projections and the
             LM head; about +7.6 GB, changes decode numerics - see module notes),
             or ``"w4a8"`` (the ParoQuant W4A8 linears of ``paro_checkpoint`` for
             the projections, INT8 for the LM head; about +4.9 GB).
         paro_checkpoint: directory of the ``z-lab/Alpamayo-1.5-10B-PARO``
-            safetensors (``decode_weights="w4a8"`` only).
+            safetensors; required by ``decode_weights="w4a8"`` (the
+            ``"balanced"`` and ``"fast"`` presets) and refused otherwise.
         pdl: launch the engine's kernels and GEMMs with programmatic dependent
             launch (a kernel's prologue overlaps its predecessor's tail inside
             the CUDA graphs). Process-wide switch shared with the FlashDrive
@@ -457,7 +460,7 @@ class Alpamayo15Thor:
         expert_splits: int = 1,
         vision_attention: str = "fa4",
         prefill: str = "native",
-        preset: str = "bf16",
+        preset: str = "balanced",
         decode_weights: str | None = None,
         vision_gemm: str = "cutlass",
         expert_gemm: str = "cutlass",
@@ -478,9 +481,6 @@ class Alpamayo15Thor:
             raise ValueError(f"unknown decode_weights {decode_weights!r}; choose from {DECODE_WEIGHTS}")
         if decode_weights != "bf16" and max_samples > 16:
             raise ValueError(f"decode_weights={decode_weights!r} supports max_samples <= 16 (the few-row kernels serve up to 16 rows)")
-        if (decode_weights == "w4a8") != (paro_checkpoint is not None):
-            raise ValueError("decode_weights='w4a8' (also preset='balanced') takes the ParoQuant checkpoint directory as "
-                             "paro_checkpoint, and only then")
         if expert_weights not in EXPERT_WEIGHTS:
             raise ValueError(f"unknown expert_weights {expert_weights!r}; choose from {EXPERT_WEIGHTS}")
         if prefill_weights not in PREFILL_WEIGHTS:
@@ -499,6 +499,9 @@ class Alpamayo15Thor:
             raise ValueError(f"unknown expert_gemm {expert_gemm!r}; choose from {GEMM_BACKENDS}")
         if expert_weights == "fp8" and expert_gemm != "cutlass":
             raise ValueError("expert_weights='fp8' runs on the FlashRT GEMMs (expert_gemm='cutlass')")
+        if (decode_weights == "w4a8") != (paro_checkpoint is not None):
+            raise ValueError("decode_weights='w4a8' (the presets 'balanced' and 'fast') takes the ParoQuant checkpoint directory "
+                             "as paro_checkpoint, and only then; preset='bf16' runs on the official weights alone")
         if vision_attention not in ("fa4", "cudnn", "sdpa"):
             raise ValueError(f"unknown vision_attention {vision_attention!r}")
         if max_samples < 1:

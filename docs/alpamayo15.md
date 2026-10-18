@@ -316,8 +316,9 @@ out = fe.infer(image_frames,      # (n_cameras, n_frames, 3, H, W) uint8
 out["pred_xyz"], out["pred_rot"], out["cot"][0]
 # several trajectory samples: construct with max_samples=16, then
 # fe.infer(..., num_traj_samples=16) -> pred_xyz (1, 1, 16, 64, 3)
-# presets (see "Precision tiers"): the default preset="bf16" keeps the official numerics;
-#                         engine_kwargs={"preset": "balanced", "paro_checkpoint": "<Alpamayo-1.5-10B-PARO dir>"}
+# presets (see "Precision tiers"): the default preset="balanced" needs the ParoQuant checkpoint directory,
+#                         engine_kwargs={"paro_checkpoint": "<Alpamayo-1.5-10B-PARO dir>"}
+#                         engine_kwargs={"preset": "bf16"}   # the official numerics, no extra weights
 #                         engine_kwargs={"preset": "fast", "paro_checkpoint": "<Alpamayo-1.5-10B-PARO dir>"}
 # single tiers (override a preset's choices): engine_kwargs={"decode_weights": "int8"}   # or "fp8"
 #                         engine_kwargs={"decode_weights": "w4a8", "paro_checkpoint": "<Alpamayo-1.5-10B-PARO dir>"}
@@ -423,6 +424,7 @@ steady windows of the same clip (the same windows for every row):
 | `preset="fast"` (the row above with per-row activation scales written by the fused NVFP4 producers) | 741 / 669 (24 w.) | 141 | 185 | 20.9 | 126 | 32.0 |
 | this engine, defaults (BF16), vision tile 256 x 256 (current default; 117/117 tokens = the row above) | 1873 / 1872 (120 w.) | 121 | 541 | 66.6 | 212 | 22.3 |
 | `preset="fast"`, vision tile 256 x 256 (current default) | 725 / 653 (24 w.) | 121 | 189 | 20.9 | 126 | 32.0 |
+| **`preset="balanced"` = the engine default**, vision tile 256 x 256 (24 w.: 875 / 766, 24/24 tokens = the balanced row above) | 867 / 870 (120 w.) | 121 | 290 | 22.2 | 126 | 35.0 |
 | `preset="balanced"`, `vision_gemm="cublaslt"` | 880 / 786 (24 w.) | 138 | 290 | 22.3 | 126 | 35.0 |
 | `preset="fast"`, `vision_gemm="cublaslt"` | 861 / 771 (24 w.) | 138 | 290 | 21.0 | 126 | 34.8 |
 
@@ -510,15 +512,19 @@ GEMM prologue, the table prefetch and one KV split (below) brought the step to
 ## Precision tiers
 
 Three presets name the validated configurations (`preset=` on the engine or
-in `engine_kwargs`): `"bf16"` (default) runs the official numerics up to
-kernel rounding; `"balanced"` is `decode_weights="w4a8"` +
-`expert_weights="fp8"` + `prefill_weights="fp8"` (needs `paro_checkpoint`);
-`"fast"` is `"balanced"` with `prefill_weights="nvfp4"` and
-`lm_head_weights="int4"` (needs the `flash_rt_fp4` module, built with the
-`flash_rt_fp4` target). The single-tier options below default to the
-preset's choice and override it when given.
+in `engine_kwargs`): `"balanced"` (default) is `decode_weights="w4a8"` +
+`expert_weights="fp8"` + `prefill_weights="fp8"` and needs the ParoQuant
+checkpoint directory as `paro_checkpoint` (the engine refuses to start
+without it; it is neutral against the official model over three seeds of the
+nine-clip evaluation, 3.4x faster); `"bf16"` runs the official numerics up
+to kernel rounding on the official weights alone; `"fast"` is `"balanced"`
+with `prefill_weights="nvfp4"` and `lm_head_weights="int4"` (needs the
+`flash_rt_fp4` module, built with the `flash_rt_fp4` target). The single-tier
+options below default to the preset's choice and override it when given.
+The tables above name the configurations by their tiers; "defaults (BF16)"
+there is today's `preset="bf16"`.
 
-The default engine keeps the official BF16 weights everywhere. Three opt-in
+The `"bf16"` engine keeps the official BF16 weights everywhere. Three
 tiers trade numerics for weight bytes; each is a numerics change, not a
 reproduction of the official model, and should be validated on your own
 scenarios.
