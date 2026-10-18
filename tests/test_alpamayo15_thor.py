@@ -519,8 +519,9 @@ def test_presets_resolve_with_explicit_overrides():
                                       "vision_weights": "bf16", "lm_head_weights": "decode"}
     assert resolve_preset("balanced") == {"decode_weights": "w4a8", "expert_weights": "fp8", "prefill_weights": "fp8",
                                           "vision_weights": "bf16", "lm_head_weights": "decode"}
-    assert resolve_preset("fast") == {"decode_weights": "w4a8", "expert_weights": "fp8", "prefill_weights": "fp8",
+    assert resolve_preset("fast") == {"decode_weights": "w4a8", "expert_weights": "fp8", "prefill_weights": "nvfp4",
                                       "vision_weights": "bf16", "lm_head_weights": "int4"}
+    assert resolve_preset("fast", prefill_weights="fp8")["prefill_weights"] == "fp8"
     assert resolve_preset("balanced", decode_weights="int8", vision_weights=None)["decode_weights"] == "int8"
     assert resolve_preset("bf16", prefill_weights="fp8")["prefill_weights"] == "fp8"
     assert resolve_preset("fast", lm_head_weights="decode")["lm_head_weights"] == "decode"
@@ -758,6 +759,104 @@ def test_cublaslt_gemm_fused_epilogue_matches_reference(M, N, K, act, res):
     assert bool(((D.float() - ref2.float()).abs() <= ref2.float().abs() * 2 ** -7 + 2 ** -6).all())
     with pytest.raises(Exception, match="alpamayo15_cublaslt_gemm_bf16"):          # odd leading dimension
         fvk.alpamayo15_cublaslt_gemm_bf16(A.data_ptr(), W.data_ptr(), 0, 0, D.data_ptr(), M, N, K, 0, N + 1, 0, _stream())
+
+
+def _fp4_module():
+    _kernels()
+    try:
+        import flash_rt.flash_rt_fp4 as f4
+    except Exception as exc:  # pragma: no cover - build dependent
+        pytest.skip(f"flash_rt_fp4 is unavailable: {exc}")
+    if not hasattr(f4, "alpamayo15_nvfp4_gemm_bf16"):
+        pytest.skip("flash_rt_fp4 built without the Alpamayo 1.5 NVFP4 forms")
+    return f4
+
+
+def _nvfp4_emulate(x: torch.Tensor):
+    """The quantizer's arithmetic in torch: per-tensor gs = amax / 2688, block-16 scales e4m3(block_amax / 6 / gs)
+    (round to nearest even), e2m1 codes with ties to even; returns the dequantized tensor (fp32) and gs."""
+    x = x.float()
+    amax = float(x.abs().max())
+    gs = amax / 2688.0 if amax > 0 else 1.0
+    blocks = x.view(x.shape[0], -1, 16)
+    bs = (blocks.abs().amax(dim=2) / (6.0 * gs)).clamp(max=448.0).to(torch.float8_e4m3fn).float()      # [rows, nb]
+    scaled = blocks / (bs * gs).unsqueeze(2).clamp_min(1e-30)
+    grid = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=x.device)
+    mag = scaled.abs().clamp(max=6.0)
+    dist = (mag.unsqueeze(-1) - grid).abs()
+    idx = dist.argmin(-1)                                                       # nearest; the lower code on a tie
+    up = (idx + 1).clamp(max=7)
+    tie = (dist.gather(-1, up.unsqueeze(-1)).squeeze(-1) == dist.gather(-1, idx.unsqueeze(-1)).squeeze(-1)) & (up != idx)
+    idx = torch.where(tie & (idx % 2 == 1), up, idx)                           # ties to the even code
+    q = grid[idx] * torch.sign(scaled)
+    deq = (q * (bs * gs).unsqueeze(2)).view_as(x)
+    deq[(bs == 0).unsqueeze(2).expand_as(blocks).reshape(x.shape)] = 0.0
+    return deq, gs
+
+
+@pytest.mark.parametrize("M,N,K,tile,ldd_extra", [(3086, 6144, 4096, 2, 0), (300, 4096, 12288, 2, 8), (257, 1024, 1024, 1, 0),
+                                                  (64, 2048, 4096, 0, 16)])
+def test_nvfp4_quantize_and_gemm_match_emulation(M, N, K, tile, ldd_extra):
+    """Activations and weights through the NVFP4 quantizer (per-tensor + block-16 scales) and the 2-SM / 1-SM GEMM
+    forms equal the torch emulation of the same quantization within BF16 output rounding; the W4A4 error against the
+    exact product stays at the 4-bit level."""
+    f4 = _fp4_module()
+    torch.manual_seed(M + N)
+    s = _stream()
+    x = (torch.randn(M, K, device="cuda") * 1.5).to(BF16)
+    w = (torch.randn(N, K, device="cuda") * 0.02).to(BF16)
+    part = torch.empty(1024, device="cuda"); gs_dev = torch.empty(1, device="cuda")
+    xp = torch.empty(M, K // 2, device="cuda", dtype=torch.uint8); xsf = torch.zeros(int(f4.alpamayo15_nvfp4_sf_bytes(M, K)), device="cuda", dtype=torch.uint8)
+    wp = torch.empty(N, K // 2, device="cuda", dtype=torch.uint8); wsf = torch.zeros(int(f4.alpamayo15_nvfp4_sf_bytes(N, K)), device="cuda", dtype=torch.uint8)
+    n = f4.alpamayo15_nvfp4_absmax_bf16(w.data_ptr(), K, N, K, part.data_ptr(), 1024, s)
+    assert n > 0
+    assert f4.alpamayo15_nvfp4_quantize_rows_bf16(w.data_ptr(), K, N, K, part.data_ptr(), n, wp.data_ptr(), wsf.data_ptr(), 1, gs_dev.data_ptr(), 0, 0, 0, s) == 0
+    torch.cuda.synchronize()
+    gsw = gs_dev.clone()
+    alpha = torch.zeros(2, device="cuda"); gsw2 = torch.stack([gsw[0], gsw[0] * 3])
+    n = f4.alpamayo15_nvfp4_absmax_bf16(x.data_ptr(), K, M, K, part.data_ptr(), 1024, s)
+    assert f4.alpamayo15_nvfp4_quantize_rows_bf16(x.data_ptr(), K, M, K, part.data_ptr(), n, xp.data_ptr(), xsf.data_ptr(), 0, gs_dev.data_ptr(),
+                                                   gsw2.data_ptr(), 2, alpha.data_ptr(), s) == 0
+    torch.cuda.synchronize()
+    xd, gx = _nvfp4_emulate(x); wd, gw = _nvfp4_emulate(w)
+    assert abs(float(gs_dev) - gx) <= 1e-6 * gx and abs(float(gsw) - gw) <= 1e-6 * gw
+    assert torch.allclose(alpha, torch.tensor([gx * gw, gx * gw * 3], device="cuda"), rtol=1e-5)
+    ws = torch.empty(max(int(f4.alpamayo15_nvfp4_gemm_workspace(M, N, K, tile)), 16), device="cuda", dtype=torch.uint8)
+    out = torch.full((M, N + ldd_extra), 7.0, device="cuda", dtype=BF16)
+    assert f4.alpamayo15_nvfp4_gemm_bf16(xp.data_ptr(), xsf.data_ptr(), wp.data_ptr(), wsf.data_ptr(), out.data_ptr(), M, N, K, tile,
+                                         ws.data_ptr(), ws.numel(), s, N + ldd_extra, alpha.data_ptr()) == 0
+    torch.cuda.synchronize()
+    ref = xd.double() @ wd.double().t()                                          # the emulated dequantized product
+    err = (out[:, :N].double() - ref).abs()
+    # the kernel scales by a rounded reciprocal, so exact midpoints (about 0.1% of the elements) can round the other
+    # way than the emulation's division: a few per-mille of RMS, not the tens of per cent of a layout or scale error
+    assert float(err.pow(2).mean().sqrt() / ref.pow(2).mean().sqrt()) < 3e-2, "GEMM / layout / scale mismatch"
+    if ldd_extra:
+        assert torch.equal(out[:, N:], torch.full((M, ldd_extra), 7.0, device="cuda", dtype=BF16))
+    exact = x.float() @ w.float().t()
+    rel = float((out[:, :N].float() - exact).pow(2).mean().sqrt() / exact.pow(2).mean().sqrt())
+    assert 0.05 < rel < 0.25, rel                                                # the 4-bit level (FP8 W8A8: ~0.04)
+    # exactly representable operands (e2m1 grid values times block scales that are powers of two): the GEMM equals
+    # the exact product up to the BF16 output rounding, which pins the scale-to-block mapping of both layouts
+    grid = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device="cuda")
+    def representable(rows, cols):
+        g = grid[torch.randint(0, 8, (rows, cols), device="cuda")] * torch.where(torch.rand(rows, cols, device="cuda") < 0.5, -1.0, 1.0) * 0.125
+        g = g.view(rows, -1, 16)
+        g[:, :, 0] = 0.75
+        return (g * (2.0 ** (torch.arange(g.shape[1], device="cuda") % 5)).view(1, -1, 1)).view(rows, cols).to(BF16)
+    xg, wg = representable(M, K), representable(N, K)
+    for src, pk, sfb_, flag in ((xg, xp, xsf, 0), (wg, wp, wsf, 1)):
+        n = f4.alpamayo15_nvfp4_absmax_bf16(src.data_ptr(), K, src.shape[0], K, part.data_ptr(), 1024, s)
+        assert f4.alpamayo15_nvfp4_quantize_rows_bf16(src.data_ptr(), K, src.shape[0], K, part.data_ptr(), n, pk.data_ptr(), sfb_.data_ptr(), flag,
+                                                       gs_dev.data_ptr(), 0, 0, 0, s) == 0
+        torch.cuda.synchronize()
+        alpha[flag] = gs_dev[0]
+    alpha[0] = alpha[0] * alpha[1]
+    assert f4.alpamayo15_nvfp4_gemm_bf16(xp.data_ptr(), xsf.data_ptr(), wp.data_ptr(), wsf.data_ptr(), out.data_ptr(), M, N, K, tile,
+                                         ws.data_ptr(), ws.numel(), s, N + ldd_extra, alpha.data_ptr()) == 0
+    torch.cuda.synchronize()
+    exact = xg.float() @ wg.float().t()
+    assert float((out[:, :N] != exact.to(BF16)).float().mean()) < 0.02 and bool(((out[:, :N].float() - exact).abs() <= exact.abs() * 2 ** -7 + 2 ** -4).all())
 
 
 def test_w4a8_grouped_gemm_rejects_unsupported_arguments():

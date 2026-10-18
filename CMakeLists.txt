@@ -2229,6 +2229,8 @@ if(ENABLE_SM100_CUTLASS)
     csrc/fused_fp4/silu_mul_two_fp4_to_fp4.cu
     csrc/gemm/fp4/cutlass_fp4_gemm_fp4out.cu
     csrc/gemm/fp4/cutlass_fp4_gemm_bias_bf16_sm100.cu
+    csrc/gemm/fp4/alpamayo15_nvfp4_gemm_sm100.cu
+    csrc/quantize/alpamayo15_nvfp4_rows.cu
     csrc/quantize/quantize_fp4_sfa_bf16.cu
     csrc/fused_fp4/dit_norm_fp4_sfa.cu
     csrc/fused_fp4/silu_mul_fp4_sfa_bf16.cu

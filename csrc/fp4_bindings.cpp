@@ -29,6 +29,8 @@
 #include "quantize/quantize_fp4_sfa.cuh"
 #include "quantize/quantize_e0m3_sfa.cuh"
 #include "gemm/fp4/cutlass_fp4_gemm_e0m3w_sm100.cuh"
+#include "gemm/fp4/alpamayo15_nvfp4_gemm_sm100.cuh"
+#include "quantize/alpamayo15_nvfp4_rows.cuh"
 #include "fused_fp4/pi05_e0m3_act.cuh"
 #include "fused_fp4/siglip_ln_vec.cuh"
 #include "quantize/reshape_scales_sfa.cuh"
@@ -1136,6 +1138,50 @@ same contract as cutlass_fp4_gemm_geglu_il_hw.
         py::arg("N"), py::arg("D"), py::arg("is_sfb"), py::arg("stream") = 0,
         "Fused: bf16 [N, D] -> NVFP4 packed [N, D/2] + tile-interleaved "
         "SFA/SFB (vectorized).");
+
+  m.def("alpamayo15_nvfp4_gemm_workspace",
+        [](int M, int N, int K, int tile) -> size_t { return flash_rt::fp4::alpamayo15_nvfp4_gemm_workspace(M, N, K, tile); },
+        py::arg("M"), py::arg("N"), py::arg("K"), py::arg("tile"));
+
+  m.def("alpamayo15_nvfp4_gemm_bf16",
+        [](uintptr_t A, uintptr_t SFA, uintptr_t B, uintptr_t SFB, uintptr_t D, int M, int N, int K, int tile,
+           uintptr_t workspace, size_t workspace_bytes, uintptr_t stream, int ldd, uintptr_t alpha_ptr) -> int {
+          return flash_rt::fp4::alpamayo15_nvfp4_gemm_bf16(
+              reinterpret_cast<void const*>(A), reinterpret_cast<void const*>(SFA), reinterpret_cast<void const*>(B),
+              reinterpret_cast<void const*>(SFB), reinterpret_cast<void*>(D), M, N, K, tile,
+              reinterpret_cast<void*>(workspace), workspace_bytes, reinterpret_cast<cudaStream_t>(stream), ldd,
+              reinterpret_cast<const float*>(alpha_ptr));
+        },
+        py::arg("A"), py::arg("SFA"), py::arg("B"), py::arg("SFB"), py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("tile"), py::arg("workspace"), py::arg("workspace_bytes"), py::arg("stream") = 0, py::arg("ldd") = 0,
+        py::arg("alpha_ptr") = 0,
+        "NVFP4 GEMM tile forms (0: 1-SM 128x128, 1: 2-SM 256x128, 2: 2-SM 256x256), bf16 out, alpha from a device float.");
+
+  m.def("alpamayo15_nvfp4_sf_bytes", [](int rows, int K) -> size_t { return flash_rt::fp4::alpamayo15_nvfp4_sf_bytes(rows, K); },
+        py::arg("rows"), py::arg("K"));
+
+  m.def("alpamayo15_nvfp4_absmax_bf16",
+        [](uintptr_t x, int ld, int rows, int K, uintptr_t partials, int max_partials, uintptr_t stream) -> int {
+          return flash_rt::fp4::alpamayo15_nvfp4_absmax_bf16(reinterpret_cast<const void*>(x), ld, rows, K,
+                                                            reinterpret_cast<float*>(partials), max_partials,
+                                                            reinterpret_cast<cudaStream_t>(stream));
+        },
+        py::arg("x"), py::arg("ld"), py::arg("rows"), py::arg("K"), py::arg("partials"), py::arg("max_partials"), py::arg("stream") = 0,
+        "Per-block absolute maxima of a bf16 [rows, K] tensor; returns the number of partials.");
+
+  m.def("alpamayo15_nvfp4_quantize_rows_bf16",
+        [](uintptr_t x, int ld, int rows, int K, uintptr_t partials, int n_partials, uintptr_t packed, uintptr_t sf, int is_sfb,
+           uintptr_t gs_dev, uintptr_t gs_other, int n_alpha, uintptr_t alpha_dev, uintptr_t stream) -> int {
+          return flash_rt::fp4::alpamayo15_nvfp4_quantize_rows_bf16(
+              reinterpret_cast<const void*>(x), ld, rows, K, reinterpret_cast<const float*>(partials), n_partials,
+              reinterpret_cast<void*>(packed), reinterpret_cast<void*>(sf), is_sfb, reinterpret_cast<float*>(gs_dev),
+              reinterpret_cast<const float*>(gs_other), n_alpha, reinterpret_cast<float*>(alpha_dev),
+              reinterpret_cast<cudaStream_t>(stream));
+        },
+        py::arg("x"), py::arg("ld"), py::arg("rows"), py::arg("K"), py::arg("partials"), py::arg("n_partials"), py::arg("packed"),
+        py::arg("sf"), py::arg("is_sfb"), py::arg("gs_dev") = 0, py::arg("gs_other") = 0, py::arg("n_alpha") = 0,
+        py::arg("alpha_dev") = 0, py::arg("stream") = 0,
+        "bf16 rows -> NVFP4 (e2m1 + UE4M3 block-16 scales, per-tensor scale from the partial maxima).");
 
   m.def("cutlass_fp4_gemm_bias_bf16",
         [](uintptr_t A, uintptr_t SFA, uintptr_t B, uintptr_t SFB,

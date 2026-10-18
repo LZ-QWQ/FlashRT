@@ -418,7 +418,8 @@ steady windows of the same clip (the same windows for every row):
 | INT8 decode + FP8 expert + FP8 prefill | 1136 (24 w.) | 149 | 308 | 37.6 | 129 | 38.0 |
 | W4A8 decode + FP8 expert + FP8 prefill | 941 (24 w.) | 146 | 300 | 26.6 | 126 | 35.1 |
 | `preset="balanced"` (the row above after the grouped W4A8 GEMM with fused quantization and table prefetch, one KV split, warp LayerNorm, vectorized FP8 producer) | 895 / 788 (24 w.) | 142 | 290 | 22.1 | 126 | 35.0 |
-| `preset="fast"` (balanced + INT4 LM head) | 849 / 773 (24 w.) | 141 | 294 | 20.8 | 126 | 34.8 |
+| balanced + INT4 LM head | 849 / 773 (24 w.) | 141 | 294 | 20.8 | 126 | 34.8 |
+| `preset="fast"` (balanced + INT4 LM head + NVFP4 prefill) | 811 / 717 (24 w.) | 142 | 233 | 21.1 | 126 | 32.0 |
 | `preset="balanced"`, `vision_gemm="cublaslt"` | 880 / 786 (24 w.) | 138 | 290 | 22.3 | 126 | 35.0 |
 | `preset="fast"`, `vision_gemm="cublaslt"` | 861 / 771 (24 w.) | 138 | 290 | 21.0 | 126 | 34.8 |
 
@@ -441,7 +442,8 @@ intervals over clips, paired differences are per (clip, window):
 | `decode_weights="w4a8"` (ParoQuant) | 1393 [1306, 1509] | 1330 | 1538 | 2524 | 26.4 | 2.884 | -767 [-947, -640] | +0.003 [-0.043, +0.046] | +0.017 [-0.017, +0.063] |
 | W4A8 decode + FP8 expert + FP8 prefill | 1071 [981, 1209] | 998 | 1216 | 2310 | 35.1 | 2.825 | -1088 [-1251, -964] | -0.056 [-0.123, -0.007] | -0.042 [-0.083, -0.007] |
 | `preset="balanced"` (the row above with the grouped GEMM, fused quantization and table prefetch, one KV split, warp LayerNorm, vectorized FP8 producer) | 966 [900, 1056] | 920 | 1096 | 1849 | 35.0 | 2.824 | -1194 [-1401, -1047] | -0.057 [-0.118, -0.015] | -0.043 [-0.097, +0.002] |
-| `preset="fast"` (balanced + INT4 LM head) | 952 [885, 1050] | 902 | 1071 | 1961 | 34.8 | 2.861 | -1208 [-1407, -1060] | -0.020 [-0.104, +0.038] | -0.006 [-0.057, +0.031] |
+| balanced + INT4 LM head | 952 [885, 1050] | 902 | 1071 | 1961 | 34.8 | 2.861 | -1208 [-1407, -1060] | -0.020 [-0.104, +0.038] | -0.006 [-0.057, +0.031] |
+| `preset="fast"` (balanced + INT4 LM head + NVFP4 prefill) | 884 [819, 974] | 836 | 1007 | 1762 | 32.0 | 2.859 | -1275 [-1485, -1128] | -0.022 [-0.090, +0.026] | -0.008 [-0.076, +0.054] |
 
 The default engine generates the same tokens as the previous engine on 549 of
 573 requests; the INT8 decode tier on 532, the FP8 prefill tier on 531 and all
@@ -484,8 +486,10 @@ Three presets name the validated configurations (`preset=` on the engine or
 in `engine_kwargs`): `"bf16"` (default) runs the official numerics up to
 kernel rounding; `"balanced"` is `decode_weights="w4a8"` +
 `expert_weights="fp8"` + `prefill_weights="fp8"` (needs `paro_checkpoint`);
-`"fast"` is `"balanced"` plus `lm_head_weights="int4"`. The single-tier
-options below default to the preset's choice and override it when given.
+`"fast"` is `"balanced"` with `prefill_weights="nvfp4"` and
+`lm_head_weights="int4"` (needs the `flash_rt_fp4` module, built with the
+`flash_rt_fp4` target). The single-tier options below default to the
+preset's choice and override it when given.
 
 The default engine keeps the official BF16 weights everywhere. Three opt-in
 tiers trade numerics for weight bytes; each is a numerics change, not a
@@ -539,6 +543,19 @@ directly (the RMSNorm producer reads and writes 8-byte vectors and sums its
 squares over them, so its scale can differ from the separate kernel's in the
 last bit). Prefill drops from about 545 to 293 ms; +7.6 GB. This tier changes
 the prompt K/V and therefore every later token.
+
+`prefill_weights="nvfp4"` (the `"fast"` preset) runs the 36 prefill layers as
+W4A4: e2m1 weights and activations with UE4M3 block-16 scales and a
+per-tensor scale (`amax / (6 * 448)`, which keeps the block scales in the
+E4M3 normal range; the GEMM's alpha carries the two per-tensor scales) on a
+2-SM 256 x 256 x 256 NVFP4 tcgen05 tile: 500-575 TOPS on Thor against the
+FP8 tile's 250, the GEMM time 187 -> 87 ms per request. Each GEMM input is
+quantized once per consumer group (q|k|v, o, gate|up, down) in two passes
+(per-block maxima, then codes + scales), 36 ms per request that the FP8
+producers' fusion does not yet cover; the prefill drops from 290 to 233 ms.
+Weights +3.5 GB (the FP8 copies are not kept). On the nine clips the tier is
+neutral: ADE -0.022 vs the default [-0.090, +0.026], -0.008 vs official
+[-0.076, +0.054], -0.002 vs the FP8 prefill [-0.067, +0.083].
 
 `lm_head_weights="int4"` (the `"fast"` preset) replaces the LM head by an own
 INT4 linear: asymmetric round-to-nearest codes per output channel and

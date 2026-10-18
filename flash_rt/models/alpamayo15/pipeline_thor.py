@@ -110,17 +110,20 @@ VISION_GEMM_BACKENDS = ("cutlass", "cublaslt", "torch")   # BF16 GEMMs of the vi
 VISION_TILE = 2                              # tcgen05 tile of the vision GEMMs: 256 x 128 on a 2-SM UMMA
 DECODE_WEIGHTS = ("bf16", "fp8", "int8", "w4a8")
 EXPERT_WEIGHTS = ("bf16", "fp8")
-PREFILL_WEIGHTS = ("bf16", "fp8")
+PREFILL_WEIGHTS = ("bf16", "fp8", "nvfp4")
+NVFP4_TILE = 2              # NVFP4 prefill GEMMs: 256 x 256 x 256 tiles on a 2-SM UMMA (500-575 TOPS on Thor)
+NVFP4_PARTIALS = 1024       # per-block maxima of one activation tensor (its per-tensor scale)
 VISION_WEIGHTS = ("bf16", "fp8")
 LM_HEAD_WEIGHTS = ("decode", "int4")        # "decode" = the decode tier's format (INT8 with W4A8), "int4" = own INT4 linear
 PREFILL_FP8_TILE = 2        # FP8 prefill GEMMs: 256 x 128 x 128 tiles on a 2-SM UMMA
 PREFILL_DOWN_SPLIT = 4      # the K=12288 down projection as 4 column blocks (weight blocks that fit the L2: 1.47 vs 3.9 ms)
 # Named option sets. "bf16" is the bit-faithful default; "balanced" is the validated reduced-precision configuration
-# (needs paro_checkpoint); "fast" adds the options measured on top of it. Explicit weight options override the preset's.
+# (needs paro_checkpoint); "fast" adds the 4-bit options measured on top of it (INT4 LM head, NVFP4 W4A4 prefill, which
+# needs the flash_rt_fp4 module). Explicit weight options override the preset's.
 PRESETS = {
     "bf16": {},
     "balanced": {"decode_weights": "w4a8", "expert_weights": "fp8", "prefill_weights": "fp8"},
-    "fast": {"decode_weights": "w4a8", "expert_weights": "fp8", "prefill_weights": "fp8", "lm_head_weights": "int4"},
+    "fast": {"decode_weights": "w4a8", "expert_weights": "fp8", "prefill_weights": "nvfp4", "lm_head_weights": "int4"},
 }
 TIER_OPTIONS = ("decode_weights", "expert_weights", "prefill_weights", "vision_weights", "lm_head_weights")
 # Grouped W4A8 GEMM launch forms "ksplit:prefetch:warps" (warps per tile, weight groups in flight per warp, warps per
@@ -406,8 +409,9 @@ class Alpamayo15Thor:
         preset: ``"bf16"`` (default: the official numerics up to kernel rounding),
             ``"balanced"`` (``decode_weights="w4a8"``, ``expert_weights="fp8"``,
             ``prefill_weights="fp8"``; needs ``paro_checkpoint``) or ``"fast"``
-            (``"balanced"`` plus ``lm_head_weights="int4"``). The weight options
-            below default to the preset's and override it when given.
+            (``"balanced"`` with ``prefill_weights="nvfp4"`` and
+            ``lm_head_weights="int4"``). The weight options below default to the
+            preset's and override it when given.
         decode_weights: ``"bf16"`` (official weights), ``"fp8"`` or ``"int8"``
             (opt-in per-row copies for the reasoning-decode projections and the
             LM head; about +7.6 GB, changes decode numerics - see module notes),
@@ -421,9 +425,12 @@ class Alpamayo15Thor:
             backend; off by default.
         expert_weights: ``"bf16"`` (official weights) or ``"fp8"`` (opt-in W8A8
             expert projections; about +4.6 GB, changes expert numerics).
-        prefill_weights: ``"bf16"`` (official weights on cuBLAS) or ``"fp8"``
+        prefill_weights: ``"bf16"`` (official weights on cuBLAS), ``"fp8"``
             (opt-in W8A8 prefill projections on the FP8 tcgen05 GEMM; about
-            +7.6 GB, changes the prompt K/V and therefore every later token).
+            +7.6 GB, changes the prompt K/V and therefore every later token) or
+            ``"nvfp4"`` (W4A4: e2m1 weights and activations with UE4M3 block-16
+            scales and per-tensor scales on the 2-SM NVFP4 tcgen05 GEMM, about
+            twice the FP8 rate; needs the ``flash_rt_fp4`` module; about +3.8 GB).
         vision_weights: ``"bf16"`` or ``"fp8"`` (opt-in W8A8 vision blocks: qkv,
             proj, fc1 and fc2 with per-row FP8 activations, bias / GELU /
             residual in the epilogue; patch embedding and mergers stay BF16;
@@ -600,6 +607,7 @@ class Alpamayo15Thor:
         self._lm4 = self._load_w4_lm_head() if lm_head_weights == "int4" else None
         self._e8 = self._quantize_expert_weights() if expert_weights == "fp8" else None
         self._p8 = self._quantize_prefill_weights() if prefill_weights == "fp8" else None
+        self._p4 = self._quantize_prefill_weights_nvfp4() if prefill_weights == "nvfp4" else None
         self._v8 = self._quantize_vision_weights() if vision_weights == "fp8" else None
         self._pf = None
         self._db = None
@@ -719,6 +727,46 @@ class Alpamayo15Thor:
             p8.append(q)
         torch.cuda.empty_cache()
         return p8
+
+    @torch.no_grad()
+    def _quantize_prefill_weights_nvfp4(self) -> dict:
+        """NVFP4 copies (e2m1 nibbles, UE4M3 block-16 scales in the GEMM's tile-interleaved layout, a per-tensor scale)
+        of the prefill projections: q|k|v, o, gate, up and down of every layer, plus the module and the workspaces."""
+        try:
+            import flash_rt.flash_rt_fp4 as f4
+        except Exception as exc:
+            raise RuntimeError(f"prefill_weights='nvfp4' needs the flash_rt_fp4 module (ENABLE_SM100_CUTLASS build): {exc}")
+        for name in ("alpamayo15_nvfp4_gemm_bf16", "alpamayo15_nvfp4_quantize_rows_bf16", "alpamayo15_nvfp4_absmax_bf16"):
+            if not hasattr(f4, name):
+                raise RuntimeError(f"flash_rt_fp4 was built without {name}")
+        s = torch.cuda.current_stream().cuda_stream
+        partials = torch.empty(NVFP4_PARTIALS, device=DEV, dtype=torch.float32)
+        gs_dev = torch.empty(1, device=DEV, dtype=torch.float32)
+        layers = []
+        F_ = self.ffn
+        for li, layer in enumerate(self.lm.layers):
+            q = {}
+            for name, w in (("qkv", self.w_qkv[li]), ("o", layer.self_attn.o_proj.weight), ("gate", self.w_gu[li][:F_]),
+                            ("up", self.w_gu[li][F_:]), ("down", layer.mlp.down_proj.weight)):
+                w = w.contiguous()
+                N, K = w.shape
+                packed = torch.empty(N, K // 2, device=DEV, dtype=torch.uint8)
+                sf = torch.zeros(int(f4.alpamayo15_nvfp4_sf_bytes(N, K)), device=DEV, dtype=torch.uint8)
+                n = f4.alpamayo15_nvfp4_absmax_bf16(w.data_ptr(), K, N, K, partials.data_ptr(), NVFP4_PARTIALS, s)
+                if n <= 0:
+                    raise RuntimeError(f"NVFP4 weight maxima failed (rc={n})")
+                rc = f4.alpamayo15_nvfp4_quantize_rows_bf16(w.data_ptr(), K, N, K, partials.data_ptr(), n, packed.data_ptr(), sf.data_ptr(),
+                                                            1, gs_dev.data_ptr(), 0, 0, 0, s)
+                if rc != 0:
+                    raise RuntimeError(f"NVFP4 weight quantization failed (rc={rc})")
+                torch.cuda.synchronize()
+                q[name] = (packed, sf, float(gs_dev.item()))
+            # the weights' per-tensor scales per input group (device, for the activation quantizer's alpha products)
+            for group in (("qkv",), ("o",), ("gate", "up"), ("down",)):
+                q["gsw_" + group[0]] = torch.tensor([q[g][2] for g in group], device=DEV, dtype=torch.float32)
+            layers.append(q)
+        torch.cuda.empty_cache()
+        return {"module": f4, "layers": layers, "ws": {}}
 
     @torch.no_grad()
     def _quantize_vision_weights(self) -> list:
@@ -985,6 +1033,13 @@ class Alpamayo15Thor:
                 for name, width in (("h", H), ("attn", Hq), ("g", F_)):
                     self._pf[name + "8"] = torch.empty(n, width, device=DEV, dtype=torch.uint8)
                     self._pf[name + "_s"] = torch.empty(n, device=DEV, dtype=torch.float32)
+            if self._p4 is not None:       # W4A4 tier: NVFP4 rows, scale layout, per-block maxima and the GEMM alphas
+                f4 = self._p4["module"]
+                for name, width in (("h", H), ("attn", Hq), ("g", F_)):
+                    self._pf[name + "4"] = torch.empty(n, width // 2, device=DEV, dtype=torch.uint8)
+                    self._pf[name + "_sf"] = torch.zeros(int(f4.alpamayo15_nvfp4_sf_bytes(n, width)), device=DEV, dtype=torch.uint8)
+                    self._pf[name + "_amax"] = torch.empty(NVFP4_PARTIALS, device=DEV, dtype=torch.float32)
+                    self._pf[name + "_alpha"] = torch.empty(4, device=DEV, dtype=torch.float32)
         return self._pf
 
     def _prefill_official(self, input_ids, tokenized):
@@ -1023,7 +1078,7 @@ class Alpamayo15Thor:
         cos, sin = lm.rotary_emb(x[:1].unsqueeze(0), position_ids)       # [1, P, D] bf16
         cos_f, sin_f = cos[0].contiguous(), sin[0].contiguous()
         layers = lm.layers
-        p8 = self._p8
+        p8, p4 = self._p8, self._p4
 
         def norm(delta, w):
             """``h = RMSNorm(x += delta) * w``; in the W8A8 tier the producer writes the FP8 rows of h directly."""
@@ -1038,6 +1093,9 @@ class Alpamayo15Thor:
             """``out = src @ w.T``: cuBLAS on the BF16 weight ``w``, or (W8A8 tier) per-row FP8 rows of ``src``
             (buffers ``akey``, written by the producer when ``quantized``) times rows ``col0:`` of the FP8 copy
             ``wname`` of layer ``li``."""
+            if p4 is not None:
+                nvfp4_lin(src, akey, wname, li, out, col0)
+                return
             if p8 is None:
                 torch.mm(src, w.t(), out=out)
                 return
@@ -1054,6 +1112,34 @@ class Alpamayo15Thor:
                                    tile=PREFILL_FP8_TILE)
             else:
                 self._gemm.fp8(q8, q_s, w8[col0:col0 + N], w_s[col0:col0 + N], out, tile=PREFILL_FP8_TILE)
+        # NVFP4 (W4A4) tier: the consumers of one input share its quantization (the GEMM alphas carry the weights'
+        # per-tensor scales); gate and up are the two consumers of h after the second norm, q|k|v the one after the first
+        NVFP4_CONSUMERS = {"qkv": ("qkv",), "o": ("o",), "gate": ("gate", "up"), "down": ("down",)}
+
+        def nvfp4_lin(src, akey, wname, li, out, col0):
+            f4 = p4["module"]
+            wq = p4["layers"][li]
+            wname = "gate" if wname == "gu" and col0 == 0 else ("up" if wname == "gu" else wname)
+            group = NVFP4_CONSUMERS["gate" if wname in ("gate", "up") else wname]
+            packed, sf, amax, alpha = (b[akey + k][:P] if k == "4" else b[akey + k] for k in ("4", "_sf", "_amax", "_alpha"))
+            K = src.shape[1]
+            if wname == group[0]:                                   # first consumer: quantize the input once
+                gsw = wq["gsw_" + group[0]]
+                n = f4.alpamayo15_nvfp4_absmax_bf16(src.data_ptr(), src.stride(0), P, K, amax.data_ptr(), NVFP4_PARTIALS, s)
+                f4.alpamayo15_nvfp4_quantize_rows_bf16(src.data_ptr(), src.stride(0), P, K, amax.data_ptr(), n, packed.data_ptr(),
+                                                       sf.data_ptr(), 0, 0, gsw.data_ptr(), len(group), alpha.data_ptr(), s)
+            wp, wsf, _ = wq[wname]
+            N = out.shape[1]
+            key = (P, N, K, NVFP4_TILE)
+            ws = p4["ws"].get(key)
+            if ws is None:
+                ws = torch.empty(max(int(f4.alpamayo15_nvfp4_gemm_workspace(P, N, K, NVFP4_TILE)), 16), device=DEV, dtype=torch.uint8)
+                p4["ws"][key] = ws
+            rc = f4.alpamayo15_nvfp4_gemm_bf16(packed.data_ptr(), sf.data_ptr(), wp.data_ptr(), wsf.data_ptr(), out.data_ptr(), P, N, K,
+                                               NVFP4_TILE, ws.data_ptr(), ws.numel(), s, out.stride(0),
+                                               alpha[group.index(wname):].data_ptr())
+            if rc != 0:
+                raise RuntimeError(f"NVFP4 GEMM failed (rc={rc}, layer {li}, {wname})")
         norm(None, layers[0].input_layernorm.weight)
         for li, layer in enumerate(layers):
             a = layer.self_attn
@@ -1283,6 +1369,34 @@ class Alpamayo15Thor:
             else:
                 torch.mm(src, w.t(), out=out)
         res.copy_(m.action_in_proj(x, t).view(rows, E))                 # fp32 residual stream
+        # NVFP4 (W4A4) tier: the consumers of one input share its quantization (the GEMM alphas carry the weights'
+        # per-tensor scales); gate and up are the two consumers of h after the second norm, q|k|v the one after the first
+        NVFP4_CONSUMERS = {"qkv": ("qkv",), "o": ("o",), "gate": ("gate", "up"), "down": ("down",)}
+
+        def nvfp4_lin(src, akey, wname, li, out, col0):
+            f4 = p4["module"]
+            wq = p4["layers"][li]
+            wname = "gate" if wname == "gu" and col0 == 0 else ("up" if wname == "gu" else wname)
+            group = NVFP4_CONSUMERS["gate" if wname in ("gate", "up") else wname]
+            packed, sf, amax, alpha = (b[akey + k][:P] if k == "4" else b[akey + k] for k in ("4", "_sf", "_amax", "_alpha"))
+            K = src.shape[1]
+            if wname == group[0]:                                   # first consumer: quantize the input once
+                gsw = wq["gsw_" + group[0]]
+                n = f4.alpamayo15_nvfp4_absmax_bf16(src.data_ptr(), src.stride(0), P, K, amax.data_ptr(), NVFP4_PARTIALS, s)
+                f4.alpamayo15_nvfp4_quantize_rows_bf16(src.data_ptr(), src.stride(0), P, K, amax.data_ptr(), n, packed.data_ptr(),
+                                                       sf.data_ptr(), 0, 0, gsw.data_ptr(), len(group), alpha.data_ptr(), s)
+            wp, wsf, _ = wq[wname]
+            N = out.shape[1]
+            key = (P, N, K, NVFP4_TILE)
+            ws = p4["ws"].get(key)
+            if ws is None:
+                ws = torch.empty(max(int(f4.alpamayo15_nvfp4_gemm_workspace(P, N, K, NVFP4_TILE)), 16), device=DEV, dtype=torch.uint8)
+                p4["ws"][key] = ws
+            rc = f4.alpamayo15_nvfp4_gemm_bf16(packed.data_ptr(), sf.data_ptr(), wp.data_ptr(), wsf.data_ptr(), out.data_ptr(), P, N, K,
+                                               NVFP4_TILE, ws.data_ptr(), ws.numel(), s, out.stride(0),
+                                               alpha[group.index(wname):].data_ptr())
+            if rc != 0:
+                raise RuntimeError(f"NVFP4 GEMM failed (rc={rc}, layer {li}, {wname})")
         norm(None, layers[0].input_layernorm.weight)
         for li, layer in enumerate(layers):
             a = layer.self_attn
