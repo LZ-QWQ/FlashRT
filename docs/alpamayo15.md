@@ -316,10 +316,13 @@ out = fe.infer(image_frames,      # (n_cameras, n_frames, 3, H, W) uint8
 out["pred_xyz"], out["pred_rot"], out["cot"][0]
 # several trajectory samples: construct with max_samples=16, then
 # fe.infer(..., num_traj_samples=16) -> pred_xyz (1, 1, 16, 64, 3)
-# opt-in precision tiers: engine_kwargs={"decode_weights": "int8"}   # or "fp8"
+# presets (see "Precision tiers"): the default preset="bf16" keeps the official numerics;
+#                         engine_kwargs={"preset": "balanced", "paro_checkpoint": "<Alpamayo-1.5-10B-PARO dir>"}
+#                         engine_kwargs={"preset": "fast", "paro_checkpoint": "<Alpamayo-1.5-10B-PARO dir>"}
+# single tiers (override a preset's choices): engine_kwargs={"decode_weights": "int8"}   # or "fp8"
 #                         engine_kwargs={"decode_weights": "w4a8", "paro_checkpoint": "<Alpamayo-1.5-10B-PARO dir>"}
 #                         engine_kwargs={"expert_weights": "fp8"}, {"prefill_weights": "fp8"}, {"vision_weights": "fp8"}
-#                         engine_kwargs={"pdl": True}
+#                         engine_kwargs={"lm_head_weights": "int4"}, {"pdl": True}
 # cuBLAS / torch elementwise instead of the tcgen05 paths:
 #                         engine_kwargs={"vision_gemm": "torch", "expert_gemm": "torch"}
 ```
@@ -414,6 +417,8 @@ steady windows of the same clip (the same windows for every row):
 | `prefill_weights="fp8"` | 1695 (24 w.) | 146 | 297 | 67.4 | 212 | 28.8 |
 | INT8 decode + FP8 expert + FP8 prefill | 1136 (24 w.) | 149 | 308 | 37.6 | 129 | 38.0 |
 | W4A8 decode + FP8 expert + FP8 prefill | 941 (24 w.) | 146 | 300 | 26.6 | 126 | 35.1 |
+| `preset="balanced"` (the row above after the grouped W4A8 GEMM with fused quantization and table prefetch, one KV split, warp LayerNorm, vectorized FP8 producer) | 895 / 788 (24 w.) | 142 | 290 | 22.1 | 126 | 35.0 |
+| `preset="fast"` (balanced + INT4 LM head) | 849 / 773 (24 w.) | 141 | 294 | 20.8 | 126 | 34.8 |
 
 Nine clips of `nvidia/PhysicalAI-Autonomous-Vehicles` (the FlashDrive default
 clip with 120 windows and eight more with 60; windows from t0 = 1.7 s, 0.1 s
@@ -433,6 +438,8 @@ intervals over clips, paired differences are per (clip, window):
 | all three tiers | 1290 [1167, 1460] | 1195 | 1509 | 2780 | 38.0 | 2.848 | -869 [-992, -776] | -0.033 [-0.093, +0.006] | -0.019 [-0.036, -0.006] |
 | `decode_weights="w4a8"` (ParoQuant) | 1393 [1306, 1509] | 1330 | 1538 | 2524 | 26.4 | 2.884 | -767 [-947, -640] | +0.003 [-0.043, +0.046] | +0.017 [-0.017, +0.063] |
 | W4A8 decode + FP8 expert + FP8 prefill | 1071 [981, 1209] | 998 | 1216 | 2310 | 35.1 | 2.825 | -1088 [-1251, -964] | -0.056 [-0.123, -0.007] | -0.042 [-0.083, -0.007] |
+| `preset="balanced"` (the row above with the grouped GEMM, one KV split, warp LayerNorm, vectorized FP8 producer) | 1027 [951, 1131] | 972 | 1176 | 2051 | 35.0 | 2.824 | -1133 [-1325, -997] | -0.057 [-0.118, -0.015] | -0.043 [-0.097, +0.002] |
+| `preset="fast"` (balanced + INT4 LM head) | 1006 [930, 1119] | 949 | 1142 | 2145 | 34.8 | 2.861 | -1153 [-1338, -1015] | -0.020 [-0.104, +0.038] | -0.006 [-0.057, +0.033] |
 
 The default engine generates the same tokens as the previous engine on 549 of
 573 requests; the INT8 decode tier on 532, the FP8 prefill tier on 531 and all
@@ -460,13 +467,21 @@ kernels did not change: cuBLAS's 2-CTA gate/up kernel runs 15% slower in this
 pipeline than before (2.08 -> 2.39 ms), while the same GEMM measures 1.66 ms
 in isolation inside the same process; the board's over-current throttle
 (sysfs `oc3_event_cnt`, 20-90 events per window) is the suspected cause and is
-not a property of the code. In the W4A8 decode step (27 ms) the few-row
-kernels take 19 ms (the GEMMs stream the INT4 weights at the DRAM rate, the
-rotation and quantization passes about 6 ms over 288 launches), FA4 3.1 ms
-and the INT8 LM head 2.6 ms; four KV splits measured best (2: +4 ms, 8: +11 ms
-per request).
+not a property of the code. In the W4A8 decode step (27 ms at that commit)
+the few-row GEMMs took 19 ms, FA4 3.1 ms with four KV splits, the INT8 LM
+head 2.6 ms and the rotation / quantization passes 1.1 ms over 288 launches.
+The grouped GEMM launch, the fused weight layout, the quantization in the
+GEMM prologue, the table prefetch and one KV split (below) brought the step to
+22.1 ms, 20.8 with the INT4 LM head.
 
 ## Precision tiers
+
+Three presets name the validated configurations (`preset=` on the engine or
+in `engine_kwargs`): `"bf16"` (default) runs the official numerics up to
+kernel rounding; `"balanced"` is `decode_weights="w4a8"` +
+`expert_weights="fp8"` + `prefill_weights="fp8"` (needs `paro_checkpoint`);
+`"fast"` is `"balanced"` plus `lm_head_weights="int4"`. The single-tier
+options below default to the preset's choice and override it when given.
 
 The default engine keeps the official BF16 weights everywhere. Three opt-in
 tiers trade numerics for weight bytes; each is a numerics change, not a
@@ -516,8 +531,48 @@ activations (h, attention output, SiLU-mul output) and per-row FP8 weights on
 150-185 for cuBLAS BF16); the K=12288 down projection runs as four column
 blocks so that each weight block stays in the L2 (1.5 instead of 3.9 ms per
 layer); the RMSNorm and SiLU-mul producers write the FP8 rows and scales
-directly. Prefill drops from about 545 to 307 ms; +7.6 GB. This tier changes
+directly (the RMSNorm producer reads and writes 8-byte vectors and sums its
+squares over them, so its scale can differ from the separate kernel's in the
+last bit). Prefill drops from about 545 to 293 ms; +7.6 GB. This tier changes
 the prompt K/V and therefore every later token.
+
+`lm_head_weights="int4"` (the `"fast"` preset) replaces the LM head by an own
+INT4 linear: asymmetric round-to-nearest codes per output channel and
+128-wide input group with zero points, the group scales normalized per channel
+to integers in [0, 4096] (rounded up, so no code clips beyond half a step) and
+a per-channel factor applied in the epilogue, per-token INT8 activations
+(absmax / 127, round to nearest even). The vocabulary is padded to 16-channel
+tiles and only its channels are written. The logits weight stream halves
+(2.6 -> 1.3 ms per token); the sampled tokens change, so the preset is gated
+by the nine-clip evaluation below. It serves `max_samples` up to 16.
+
+The W4A8 decode projections run as one grouped few-row GEMM launch per shared
+input (q|k|v, o, gate|up, down: four launches per layer instead of seven) on a
+weight layout that carries each tile's zero points (u8) and integer group
+scales (i16) in front of its 1 KB of nibbles for every 128-wide group, so the
+scales stream with the weights instead of being gathered from `[K/128, N]`
+tables (12 MB of scattered sector reads per layer). Up to four rows the
+per-token INT8 quantization of the rotated activations runs in the GEMM's
+prologue (the rotation pass and the GEMM are the group's only launches); the
+arithmetic is Marlin's in every form, bit for bit. Each GEMM also prefetches
+the next group's rotation tables (100-312 KB, one arena per group) into the
+L2 while it streams its weights: on Thor a cold read of a few hundred KB right
+before a streaming kernel slows that kernel by about 30% (measured inside the
+engine: 88 / 51 / 230 / 145 us for the q|k|v / o / gate|up / down launches
+against 61 / 38 / 214 / 108 when the tables are hot), and the prefetch removes
+the effect (65 / 41 / 224 / 117 in the pipeline). `W4A8_GEMM_NARROW` /
+`W4A8_GEMM_WIDE` (module constants, "warps per tile : weight groups in flight
+per warp : warps per CTA") select the launch form for groups under and from
+1024 weight tiles.
+
+Decode attention uses one FA4 KV split by default (`decode_splits=1`): at the
+prompt length one split streams the cache at 235 GB/s (54 us per layer)
+against 85 us with four. The combine step disappears; the reduction order
+changes, so a near-tie token can resample (one of 24 author-clip windows did).
+The vision LayerNorm runs one warp per row for the tower's width (statistics
+reduced over 32 lanes instead of a 256-thread block): 17 -> 11 ms per
+request; the LayerNorm -> FP8 producer of the vision FP8 tier uses the same
+form.
 
 ## Limitations
 

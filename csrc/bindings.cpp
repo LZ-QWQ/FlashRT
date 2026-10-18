@@ -5500,6 +5500,84 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("w_frag"), py::arg("scale"), py::arg("x"), py::arg("y"), py::arg("M"), py::arg("N"),
         py::arg("K"), py::arg("stream") = 0, py::arg("fmt") = 0);
 
+    m.def("alpamayo15_w4a8_gemm_grouped",
+        [](const std::vector<uintptr_t>& xq, const std::vector<uintptr_t>& a_scale, uintptr_t w_pack,
+           const std::vector<uintptr_t>& out, int M, const std::vector<int>& N, int K, int ld_out, int prefetch, int warps,
+           uintptr_t stream, int ksplit, const std::vector<uintptr_t>& col_scale, const std::vector<int>& n_valid,
+           uintptr_t pf_ptr, size_t pf_bytes) {
+            const int n = static_cast<int>(xq.size());
+            const auto shape = kernel_shape({{"M", M}, {"K", K}, {"n_problems", n}, {"ld_out", ld_out},
+                                             {"prefetch", prefetch}, {"warps", warps}, {"ksplit", ksplit}});
+            require_kernel(n >= 1 && n <= 3 && a_scale.size() == xq.size() && out.size() == xq.size() && N.size() == xq.size() &&
+                           (col_scale.empty() || col_scale.size() == xq.size()) &&
+                           (n_valid.empty() || n_valid.size() == xq.size()),
+                           "alpamayo15_w4a8_gemm_grouped", "1-3 problems with matching argument lists", shape);
+            require_kernel_ptrs("alpamayo15_w4a8_gemm_grouped", {{"w_pack", w_pack}}, shape);
+            std::vector<const void*> q(n);
+            std::vector<const float*> as(n), cs(n, nullptr);
+            std::vector<void*> o(n);
+            for (int i = 0; i < n; ++i) {
+                q[i] = reinterpret_cast<const void*>(xq[i]); as[i] = reinterpret_cast<const float*>(a_scale[i]);
+                o[i] = reinterpret_cast<void*>(out[i]);
+                if (!col_scale.empty()) cs[i] = reinterpret_cast<const float*>(col_scale[i]);
+            }
+            const int rc = flash_rt::kernels::alpamayo15_w4a8_gemm_grouped(
+                n, q.data(), as.data(), reinterpret_cast<const void*>(w_pack), o.data(), M, N.data(), K, ld_out, prefetch, warps,
+                ksplit, to_stream(stream), cs.data(), n_valid.empty() ? nullptr : n_valid.data(),
+                reinterpret_cast<const void*>(pf_ptr), pf_bytes);
+            require_kernel(rc == 0, "alpamayo15_w4a8_gemm_grouped",
+                           "invalid shape/alignment or launch failure (rc=" + std::to_string(rc) + ")", shape);
+        },
+        py::arg("xq"), py::arg("a_scale"), py::arg("w_pack"), py::arg("out"), py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("ld_out"), py::arg("prefetch") = 2, py::arg("warps") = 4, py::arg("stream") = 0, py::arg("ksplit") = 0,
+        py::arg("col_scale") = std::vector<uintptr_t>{}, py::arg("n_valid") = std::vector<int>{}, py::arg("pf_ptr") = 0,
+        py::arg("pf_bytes") = 0);
+
+    m.def("alpamayo15_w4a8_gemm_grouped_q",
+        [](const std::vector<uintptr_t>& xr, const std::vector<uintptr_t>& part, const std::vector<uintptr_t>& igs, uintptr_t w_pack,
+           const std::vector<uintptr_t>& out, int M, const std::vector<int>& N, int K, int ld_out, int prefetch, int warps,
+           uintptr_t stream, int ksplit, const std::vector<uintptr_t>& col_scale, const std::vector<int>& n_valid,
+           uintptr_t pf_ptr, size_t pf_bytes) {
+            const int n = static_cast<int>(xr.size());
+            const auto shape = kernel_shape({{"M", M}, {"K", K}, {"n_problems", n}, {"ld_out", ld_out},
+                                             {"prefetch", prefetch}, {"warps", warps}, {"ksplit", ksplit}});
+            require_kernel(n >= 1 && n <= 3 && part.size() == xr.size() && igs.size() == xr.size() && out.size() == xr.size() &&
+                           N.size() == xr.size() && (col_scale.empty() || col_scale.size() == xr.size()) &&
+                           (n_valid.empty() || n_valid.size() == xr.size()),
+                           "alpamayo15_w4a8_gemm_grouped_q", "1-3 problems with matching argument lists", shape);
+            require_kernel_ptrs("alpamayo15_w4a8_gemm_grouped_q", {{"w_pack", w_pack}}, shape);
+            std::vector<const void*> x(n);
+            std::vector<const float*> pt(n), gs(n), cs(n, nullptr);
+            std::vector<void*> o(n);
+            for (int i = 0; i < n; ++i) {
+                x[i] = reinterpret_cast<const void*>(xr[i]); pt[i] = reinterpret_cast<const float*>(part[i]);
+                gs[i] = reinterpret_cast<const float*>(igs[i]); o[i] = reinterpret_cast<void*>(out[i]);
+                if (!col_scale.empty()) cs[i] = reinterpret_cast<const float*>(col_scale[i]);
+            }
+            const int rc = flash_rt::kernels::alpamayo15_w4a8_gemm_grouped_q(
+                n, x.data(), pt.data(), gs.data(), reinterpret_cast<const void*>(w_pack), o.data(), M, N.data(), K, ld_out, prefetch,
+                warps, ksplit, to_stream(stream), cs.data(), n_valid.empty() ? nullptr : n_valid.data(),
+                reinterpret_cast<const void*>(pf_ptr), pf_bytes);
+            require_kernel(rc == 0, "alpamayo15_w4a8_gemm_grouped_q",
+                           "invalid shape/alignment or launch failure (rc=" + std::to_string(rc) + ")", shape);
+        },
+        py::arg("xr"), py::arg("part"), py::arg("igs"), py::arg("w_pack"), py::arg("out"), py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("ld_out"), py::arg("prefetch") = 2, py::arg("warps") = 4, py::arg("stream") = 0, py::arg("ksplit") = 0,
+        py::arg("col_scale") = std::vector<uintptr_t>{}, py::arg("n_valid") = std::vector<int>{}, py::arg("pf_ptr") = 0,
+        py::arg("pf_bytes") = 0);
+
+    m.def("alpamayo15_quantize_int8_rows_bf16",
+        [](uintptr_t x, int ld_x, uintptr_t q, uintptr_t scale, int rows, int K, uintptr_t stream) {
+            const auto shape = kernel_shape({{"rows", rows}, {"K", K}, {"ld_x", ld_x}});
+            require_kernel_ptrs("alpamayo15_quantize_int8_rows_bf16", {{"x", x}, {"q", q}, {"scale", scale}}, shape);
+            const int rc = flash_rt::kernels::alpamayo15_quantize_int8_rows_bf16(
+                reinterpret_cast<const void*>(x), ld_x, reinterpret_cast<void*>(q), reinterpret_cast<float*>(scale), rows, K,
+                to_stream(stream));
+            require_kernel(rc == 0, "alpamayo15_quantize_int8_rows_bf16",
+                           "invalid shape/alignment or launch failure (rc=" + std::to_string(rc) + ")", shape);
+        },
+        py::arg("x"), py::arg("ld_x"), py::arg("q"), py::arg("scale"), py::arg("rows"), py::arg("K"), py::arg("stream") = 0);
+
     // FlashDrive (Alpamayo 1.5) backend: un-rotated cache maintenance (alpamayo15_flashdrive_kernels.cuh).
     m.def("flashdrive_qk_prep_bf16",
         [](uintptr_t q, uintptr_t k, uintptr_t v, int q_ld, int k_ld, int v_ld, uintptr_t q_norm_w,
@@ -5636,6 +5714,31 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("x"), py::arg("ld_x"), py::arg("rows"), py::arg("K"), py::arg("theta"), py::arg("pairs"),
         py::arg("scales"), py::arg("igs"), py::arg("xr"), py::arg("part"), py::arg("xq"), py::arg("a_scale"),
         py::arg("stream") = 0);
+
+    m.def("flashdrive_w4a8_rotate",
+        [](uintptr_t x, int ld_x, int rows, int K, const std::vector<uintptr_t>& theta, const std::vector<uintptr_t>& pairs,
+           const std::vector<uintptr_t>& scales, const std::vector<uintptr_t>& xr, const std::vector<uintptr_t>& part, uintptr_t stream) {
+            const int n = static_cast<int>(theta.size());
+            const auto shape = kernel_shape({{"rows", rows}, {"K", K}, {"ld_x", ld_x}, {"n_sets", n}});
+            require_kernel(n >= 1 && n <= 3 && pairs.size() == theta.size() && scales.size() == theta.size() &&
+                           xr.size() == theta.size() && part.size() == theta.size(),
+                           "flashdrive_w4a8_rotate", "1-3 rotation sets with matching argument lists", shape);
+            require_kernel_ptrs("flashdrive_w4a8_rotate", {{"x", x}}, shape);
+            std::vector<const void*> th(n), pr(n), sc(n);
+            std::vector<void*> r(n);
+            std::vector<float*> pt(n);
+            for (int i = 0; i < n; ++i) {
+                th[i] = reinterpret_cast<const void*>(theta[i]); pr[i] = reinterpret_cast<const void*>(pairs[i]);
+                sc[i] = reinterpret_cast<const void*>(scales[i]); r[i] = reinterpret_cast<void*>(xr[i]);
+                pt[i] = reinterpret_cast<float*>(part[i]);
+            }
+            const int rc = flash_rt::kernels::flashdrive_w4a8_rotate(
+                reinterpret_cast<const void*>(x), ld_x, rows, K, n, th.data(), pr.data(), sc.data(), r.data(), pt.data(), to_stream(stream));
+            require_kernel(rc == 0, "flashdrive_w4a8_rotate",
+                           "invalid shape/alignment or launch failure (rc=" + std::to_string(rc) + ")", shape);
+        },
+        py::arg("x"), py::arg("ld_x"), py::arg("rows"), py::arg("K"), py::arg("theta"), py::arg("pairs"), py::arg("scales"),
+        py::arg("xr"), py::arg("part"), py::arg("stream") = 0);
 
     m.def("flashdrive_shift_cache",
         [](uintptr_t k_ptrs, uintptr_t v_ptrs, long long kv_rs, long long kv_hs, uintptr_t kvlm, uintptr_t cos,

@@ -930,6 +930,52 @@ __global__ void __launch_bounds__(256) fd_layernorm_kernel(const __nv_bfloat16* 
 }
 
 
+// LayerNorm, one warp per row for the vision tower's width (dim = 128 * NV; NV Bf4 vectors per lane): the same
+// per-element arithmetic as fd_layernorm_kernel, the FP32 statistics reduced over 32 lanes instead of a 256-thread
+// block (eight independent rows per CTA, no block barriers: 2x the throughput of the one-CTA-per-row form on Thor).
+template <int NV>
+__global__ void __launch_bounds__(256) fd_layernorm_warp_kernel(const __nv_bfloat16* __restrict__ x,
+                                                                const __nv_bfloat16* __restrict__ w,
+                                                                const __nv_bfloat16* __restrict__ b,
+                                                                __nv_bfloat16* __restrict__ out, int rows, float eps) {
+  fd_pdl();
+  constexpr int dim = 128 * NV;
+  const int lane = threadIdx.x & 31, row = blockIdx.x * 8 + (threadIdx.x >> 5);
+  if (row >= rows) return;
+  const Bf4* xr = reinterpret_cast<const Bf4*>(x + (size_t)row * dim);
+  float v[NV][4];
+  float sum = 0.0f;
+#pragma unroll
+  for (int k = 0; k < NV; ++k) {
+    const Bf4 t = xr[lane + 32 * k];
+#pragma unroll
+    for (int e = 0; e < 4; ++e) { v[k][e] = bf(t.v[e]); sum += v[k][e]; }
+  }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+  const float mean = sum / (float)dim;
+  float sq = 0.0f;
+#pragma unroll
+  for (int k = 0; k < NV; ++k)
+#pragma unroll
+    for (int e = 0; e < 4; ++e) { const float d = v[k][e] - mean; sq += d * d; }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffffu, sq, o);
+  const float rstd = rsqrtf(sq / (float)dim + eps);
+  const Bf4* wr = reinterpret_cast<const Bf4*>(w);
+  const Bf4* br = reinterpret_cast<const Bf4*>(b);
+  Bf4* o = reinterpret_cast<Bf4*>(out + (size_t)row * dim);
+#pragma unroll
+  for (int k = 0; k < NV; ++k) {
+    const Bf4 ww = wr[lane + 32 * k], bb = br[lane + 32 * k];
+    Bf4 r;
+#pragma unroll
+    for (int e = 0; e < 4; ++e) r.v[e] = to_bf((v[k][e] - mean) * rstd * bf(ww.v[e]) + bf(bb.v[e]));
+    o[lane + 32 * k] = r;
+  }
+}
+
+
 // fd_layernorm_kernel whose BF16 row goes to FP8 codes + a row scale (the W8A8 vision tier): identical codes to the
 // LayerNorm followed by alpamayo15_quantize_fp8_rows_bf16. dim <= 16384.
 __global__ void __launch_bounds__(256) fd_layernorm_fp8_rows_kernel(const __nv_bfloat16* __restrict__ x,
@@ -971,6 +1017,66 @@ __global__ void __launch_bounds__(256) fd_layernorm_fp8_rows_kernel(const __nv_b
   __syncthreads();
   fp8rows::quantize_row_fp8(srow, q, scale, row, dim, smem);
   fd_pdl_trigger();
+}
+
+// fd_layernorm_warp_kernel whose BF16 row goes to FP8 codes + a row scale (same statistics as the warp LayerNorm,
+// same codes as that output followed by alpamayo15_quantize_fp8_rows_bf16). dim = 128 * NV.
+template <int NV>
+__global__ void __launch_bounds__(256) fd_layernorm_fp8_rows_warp_kernel(const __nv_bfloat16* __restrict__ x,
+                                                                         const __nv_bfloat16* __restrict__ w,
+                                                                         const __nv_bfloat16* __restrict__ b,
+                                                                         uint8_t* __restrict__ q, float* __restrict__ scale,
+                                                                         int rows, float eps) {
+  fd_pdl();
+  constexpr int dim = 128 * NV;
+  const int lane = threadIdx.x & 31, row = blockIdx.x * 8 + (threadIdx.x >> 5);
+  if (row >= rows) return;
+  const Bf4* xr = reinterpret_cast<const Bf4*>(x + (size_t)row * dim);
+  float v[NV][4];
+  float sum = 0.0f;
+#pragma unroll
+  for (int k = 0; k < NV; ++k) {
+    const Bf4 t = xr[lane + 32 * k];
+#pragma unroll
+    for (int e = 0; e < 4; ++e) { v[k][e] = bf(t.v[e]); sum += v[k][e]; }
+  }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+  const float mean = sum / (float)dim;
+  float sq = 0.0f;
+#pragma unroll
+  for (int k = 0; k < NV; ++k)
+#pragma unroll
+    for (int e = 0; e < 4; ++e) { const float d = v[k][e] - mean; sq += d * d; }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffffu, sq, o);
+  const float rstd = rsqrtf(sq / (float)dim + eps);
+  const Bf4* wr = reinterpret_cast<const Bf4*>(w);
+  const Bf4* br = reinterpret_cast<const Bf4*>(b);
+  float mx = 0.0f;
+#pragma unroll
+  for (int k = 0; k < NV; ++k) {
+    const Bf4 ww = wr[lane + 32 * k], bb = br[lane + 32 * k];
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+      v[k][e] = bf(to_bf((v[k][e] - mean) * rstd * bf(ww.v[e]) + bf(bb.v[e])));   // the BF16 LayerNorm output
+      mx = fmaxf(mx, fabsf(v[k][e]));
+    }
+  }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+  const float sc = mx > 0.0f ? mx / 448.0f : 1.0f;
+  if (lane == 0) scale[row] = sc;
+  uint32_t* qr = reinterpret_cast<uint32_t*>(q + (size_t)row * dim);
+#pragma unroll
+  for (int k = 0; k < NV; ++k) {
+    float f[4];
+#pragma unroll
+    for (int e = 0; e < 4; ++e) f[e] = fminf(fmaxf(__fdiv_rn(v[k][e], sc), -448.0f), 448.0f);
+    const __nv_fp8x2_storage_t lo = __nv_cvt_float2_to_fp8x2(make_float2(f[0], f[1]), __NV_SATFINITE, __NV_E4M3);
+    const __nv_fp8x2_storage_t hi = __nv_cvt_float2_to_fp8x2(make_float2(f[2], f[3]), __NV_SATFINITE, __NV_E4M3);
+    qr[lane + 32 * k] = (uint32_t)lo | ((uint32_t)hi << 16);
+  }
 }
 
 // out[r, f] = bf16(silu(gate[r, f])) * up[r, f] over rows of leading dimension ld (the gate | up halves of one GEMM
@@ -1729,6 +1835,33 @@ int flashdrive_w4a8_act_prep(const void* x, int ld_x, int rows, int K, int n_set
   return cudaPeekAtLastError() == cudaSuccess ? 0 : 4;
 }
 
+int flashdrive_w4a8_rotate(const void* x, int ld_x, int rows, int K, int n_sets,
+                           const void* const* theta, const void* const* pairs, const void* const* scales,
+                           void* const* xr, float* const* part, cudaStream_t stream) {
+  if (!x || rows <= 0 || K <= 0 || n_sets < 1 || n_sets > 3) return 2;
+  if ((K % kRotGroup) != 0 || ld_x < K || (ld_x % 2) != 0) return 2;
+  if ((reinterpret_cast<uintptr_t>(x) & 3u) != 0) return 5;
+  ActPrepSets sets{};
+  for (int i = 0; i < n_sets; ++i) {
+    if (!theta[i] || !pairs[i] || !scales[i] || !xr[i] || !part[i]) return 1;
+    if ((reinterpret_cast<uintptr_t>(pairs[i]) & 3u) != 0 || (reinterpret_cast<uintptr_t>(scales[i]) & 3u) != 0 ||
+        (reinterpret_cast<uintptr_t>(xr[i]) & 3u) != 0)
+      return 5;
+    sets.s[i] = ActPrepSet{static_cast<const __half*>(theta[i]), static_cast<const int16_t*>(pairs[i]),
+                           static_cast<const __half*>(scales[i]), nullptr, static_cast<__half*>(xr[i]), part[i], nullptr, nullptr};
+  }
+  const auto* xb = static_cast<const __nv_bfloat16*>(x);
+  if (rows <= 2) {
+    fd_launch(fd_w4a8_rotate_kernel<2>, dim3(dim3((rows + 1) / 2, K / kRotGroup, n_sets)), dim3(64), (size_t)(0), stream, xb, ld_x, sets, rows, K);
+  } else if (rows <= 8) {
+    fd_launch(fd_w4a8_rotate_kernel<4>, dim3(dim3((rows + 3) / 4, K / kRotGroup, n_sets)), dim3(64), (size_t)(0), stream, xb, ld_x, sets, rows, K);
+  } else {
+    fd_launch(fd_w4a8_rotate_kernel<kRotRows>, dim3(dim3((rows + kRotRows - 1) / kRotRows, K / kRotGroup, n_sets)), dim3(64), (size_t)(0), stream, 
+        xb, ld_x, sets, rows, K);
+  }
+  return cudaPeekAtLastError() == cudaSuccess ? 0 : 4;
+}
+
 int flashdrive_shift_cache(const void* const* k_ptrs, const void* const* v_ptrs, long long kv_rs, long long kv_hs,
                            void* kvlm, const void* cos, const void* sin, const int* ranges, int n_views, int F,
                            int L, int S, int Hk, cudaStream_t stream) {
@@ -1859,9 +1992,17 @@ int alpamayo15_layernorm_bf16(const void* x, const void* w, const void* b, void*
   if (!x || !w || !b || !out) return 1;
   if (rows <= 0 || dim <= 0 || (dim % 8) != 0 || dim > 16384) return 2;
   if (!aligned8(x) || !aligned8(w) || !aligned8(b) || !aligned8(out)) return 5;
-  fd_launch(fd_layernorm_kernel, dim3(rows), dim3(256), (size_t)(0), stream, static_cast<const __nv_bfloat16*>(x), static_cast<const __nv_bfloat16*>(w),
-                                                static_cast<const __nv_bfloat16*>(b), static_cast<__nv_bfloat16*>(out),
-                                                dim, eps);
+  const auto* xb = static_cast<const __nv_bfloat16*>(x);
+  const auto* wb = static_cast<const __nv_bfloat16*>(w);
+  const auto* bb = static_cast<const __nv_bfloat16*>(b);
+  auto* ob = static_cast<__nv_bfloat16*>(out);
+  const dim3 wgrid((rows + 7) / 8);
+  switch (dim) {        // warp-per-row forms for the vision widths; one CTA per row otherwise
+    case 1024: fd_launch(fd_layernorm_warp_kernel<8>, wgrid, dim3(256), (size_t)0, stream, xb, wb, bb, ob, rows, eps); break;
+    case 1152: fd_launch(fd_layernorm_warp_kernel<9>, wgrid, dim3(256), (size_t)0, stream, xb, wb, bb, ob, rows, eps); break;
+    case 2048: fd_launch(fd_layernorm_warp_kernel<16>, wgrid, dim3(256), (size_t)0, stream, xb, wb, bb, ob, rows, eps); break;
+    default: fd_launch(fd_layernorm_kernel, dim3(rows), dim3(256), (size_t)(0), stream, xb, wb, bb, ob, dim, eps); break;
+  }
   return cudaPeekAtLastError() == cudaSuccess ? 0 : 4;
 }
 
@@ -1870,8 +2011,17 @@ int alpamayo15_layernorm_fp8_rows_bf16(const void* x, const void* w, const void*
   if (!x || !w || !b || !q || !scale) return 1;
   if (rows <= 0 || dim <= 0 || (dim % 8) != 0 || dim > 16384) return 2;
   if (!aligned8(x) || !aligned8(w) || !aligned8(b) || (reinterpret_cast<uintptr_t>(q) & 3u) != 0) return 5;
-  fd_launch(fd_layernorm_fp8_rows_kernel, dim3(rows), dim3(256), (size_t)(0), stream, static_cast<const __nv_bfloat16*>(x),
-            static_cast<const __nv_bfloat16*>(w), static_cast<const __nv_bfloat16*>(b), static_cast<uint8_t*>(q), scale, dim, eps);
+  const auto* xb = static_cast<const __nv_bfloat16*>(x);
+  const auto* wb = static_cast<const __nv_bfloat16*>(w);
+  const auto* bb = static_cast<const __nv_bfloat16*>(b);
+  auto* qb = static_cast<uint8_t*>(q);
+  const dim3 wgrid((rows + 7) / 8);
+  switch (dim) {        // the warp-per-row forms of alpamayo15_layernorm_bf16 (same statistics) for the vision widths
+    case 1024: fd_launch(fd_layernorm_fp8_rows_warp_kernel<8>, wgrid, dim3(256), (size_t)0, stream, xb, wb, bb, qb, scale, rows, eps); break;
+    case 1152: fd_launch(fd_layernorm_fp8_rows_warp_kernel<9>, wgrid, dim3(256), (size_t)0, stream, xb, wb, bb, qb, scale, rows, eps); break;
+    case 2048: fd_launch(fd_layernorm_fp8_rows_warp_kernel<16>, wgrid, dim3(256), (size_t)0, stream, xb, wb, bb, qb, scale, rows, eps); break;
+    default: fd_launch(fd_layernorm_fp8_rows_kernel, dim3(rows), dim3(256), (size_t)(0), stream, xb, wb, bb, qb, scale, dim, eps); break;
+  }
   return cudaPeekAtLastError() == cudaSuccess ? 0 : 4;
 }
 

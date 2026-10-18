@@ -24,6 +24,7 @@ from flash_rt.models.alpamayo15.pipeline_thor import (  # noqa: E402
     quantize_fp8_rows,
     quantize_int8_rows,
     require_alpamayo15_kernels,
+    resolve_preset,
     update_stop_state,
 )
 
@@ -455,7 +456,7 @@ def test_fp8_gemm_and_row_quantization_match_reference(M, N, K, tile):
     assert float((D.float() - deq).abs().mean()) < 0.06 * float(deq.abs().mean())   # e4m3 on both operands
 
 
-@pytest.mark.parametrize("rows,dim", [(3072, 1152), (768, 4608), (5, 8)])
+@pytest.mark.parametrize("rows,dim", [(3072, 1152), (1029, 1152), (768, 4608), (40, 2048), (5, 8)])
 def test_layernorm_matches_torch(rows, dim):
     fvk = _kernels()
     torch.manual_seed(24)
@@ -500,10 +501,244 @@ def test_silu_mul_split_matches_torch():
                                     ({"decode_weights": "w4a8"}, "paro_checkpoint"),
                                     ({"vision_weights": "fp8", "vision_gemm": "torch"}, "vision_gemm='cutlass'"),
                                     ({"vision_weights": "int8"}, "vision_weights"),
-                                    ({"paro_checkpoint": "x"}, "paro_checkpoint")])
+                                    ({"paro_checkpoint": "x"}, "paro_checkpoint"),
+                                    ({"preset": "turbo"}, "preset"),
+                                    ({"preset": "balanced"}, "paro_checkpoint"),
+                                    ({"preset": "balanced", "paro_checkpoint": "x", "expert_weights": "int8"}, "expert_weights"),
+                                    ({"lm_head_weights": "int8"}, "lm_head_weights"),
+                                    ({"preset": "fast"}, "paro_checkpoint"),
+                                    ({"lm_head_weights": "int4", "max_samples": 32}, "max_samples <= 16")])
 def test_engine_option_validation(kw, msg):
     with pytest.raises(ValueError, match=msg):
         Alpamayo15Thor(SimpleNamespace(), **kw)
+
+
+def test_presets_resolve_with_explicit_overrides():
+    assert resolve_preset("bf16") == {"decode_weights": "bf16", "expert_weights": "bf16", "prefill_weights": "bf16",
+                                      "vision_weights": "bf16", "lm_head_weights": "decode"}
+    assert resolve_preset("balanced") == {"decode_weights": "w4a8", "expert_weights": "fp8", "prefill_weights": "fp8",
+                                          "vision_weights": "bf16", "lm_head_weights": "decode"}
+    assert resolve_preset("fast") == {"decode_weights": "w4a8", "expert_weights": "fp8", "prefill_weights": "fp8",
+                                      "vision_weights": "bf16", "lm_head_weights": "int4"}
+    assert resolve_preset("balanced", decode_weights="int8", vision_weights=None)["decode_weights"] == "int8"
+    assert resolve_preset("bf16", prefill_weights="fp8")["prefill_weights"] == "fp8"
+    assert resolve_preset("fast", lm_head_weights="decode")["lm_head_weights"] == "decode"
+    with pytest.raises(ValueError, match="preset"):
+        resolve_preset("fp8")
+    with pytest.raises(ValueError, match="not preset options"):
+        resolve_preset("bf16", pdl=True)
+
+
+@pytest.mark.parametrize("M,Ns,K,ksplit,prefetch,warps", [(1, (4096, 1024, 1024), 4096, 1, 2, 4), (1, (12288, 12288), 4096, 2, 4, 4),
+                                                          (1, (4096,), 12288, 0, 2, 4), (8, (1024, 1024), 4096, 2, 2, 8),
+                                                          (16, (256, 512, 1024), 2048, 1, 4, 4), (3, (272,), 1024, 0, 2, 8),
+                                                          (1, (4096,), 12288, 4, 2, 4), (9, (1024, 512), 4096, 4, 4, 8)])
+def test_w4a8_grouped_gemm_is_exact(M, Ns, K, ksplit, prefetch, warps):
+    """The grouped few-row W4A8 GEMM computes Marlin's integers exactly for every problem of a group (float64
+    reference), writing the column blocks of one output."""
+    fvk = _kernels()
+    from flash_rt.models.alpamayo15.marlin_w4a8 import pack_w4a8_grouped, pack_w4a8_small
+    torch.manual_seed(K + sum(Ns))
+    G = K // 128
+    Ma = (M + 7) // 8 * 8
+    ws = [torch.randint(0, 16, (K, N), device="cuda", dtype=torch.uint8) for N in Ns]
+    zs = [torch.randint(0, 16, (G, N), device="cuda", dtype=torch.uint8) for N in Ns]
+    sgs = [torch.randint(0, 4097, (G, N), device="cuda", dtype=torch.int32) for N in Ns]
+    xqs = [torch.randint(-128, 128, (Ma, K), device="cuda", dtype=torch.int8) for _ in Ns]
+    a_ss = [(torch.rand(M, device="cuda") * 2e-2 + 1e-3) * 7e-6 for _ in Ns]
+    out = torch.full((M, sum(Ns)), float("nan"), device="cuda", dtype=BF16)
+    cols = [sum(Ns[:i]) for i in range(len(Ns))]
+    pack = pack_w4a8_grouped(ws, zs, sgs, K)
+    assert pack.shape == (sum(Ns) // 16, G, 1088)
+    # the fused layout carries every tile's zero points, int16 scales and nibbles
+    assert torch.equal(pack[:, :, :16].permute(0, 2, 1).reshape(-1, G).t(), torch.cat(zs, dim=1))
+    assert torch.equal(pack[:, :, 16:48].contiguous().view(torch.int16).permute(0, 2, 1).reshape(-1, G).t().int(), torch.cat(sgs, dim=1))
+    assert torch.equal(pack[:, :, 64:].reshape(-1, K // 64, 32, 16), torch.cat([pack_w4a8_small(w, K, w.shape[1]) for w in ws]))
+    fvk.alpamayo15_w4a8_gemm_grouped([t.data_ptr() for t in xqs], [t.data_ptr() for t in a_ss], pack.data_ptr(),
+                                     [out[:, c:].data_ptr() for c in cols], M, list(Ns), K, out.stride(0), prefetch, warps, _stream(), ksplit)
+    torch.cuda.synchronize()
+    for w, z, sg, xq, a_s, c, N in zip(ws, zs, sgs, xqs, a_ss, cols, Ns):
+        wz = w.to(torch.int64) - z.to(torch.int64).repeat_interleave(128, 0)
+        part = torch.einsum("mgk,gkn->mgn", xq[:M].to(torch.float64).view(M, G, 128), wz.to(torch.float64).view(G, 128, N))
+        total = (part * sg.to(torch.float64).unsqueeze(0)).sum(1)
+        assert torch.equal(total, total.round())
+        ref = (total.to(torch.int64).to(torch.float32) * a_s.unsqueeze(1)).to(BF16)
+        assert torch.equal(out[:, c:c + N], ref)
+
+
+@pytest.mark.parametrize("rows,K", [(1, 4096), (5, 4096), (16, 1024), (3, 12)])
+def test_int8_row_quantization_matches_torch(rows, K):
+    fvk = _kernels()
+    torch.manual_seed(rows + K)
+    x = (torch.randn(rows, K + 8, device="cuda") * 3).to(BF16)[:, :K]          # leading dimension K + 8
+    if rows > 1:
+        x[1].zero_()                                                          # an all-zero row: scale 1, codes 0
+    q = torch.empty(rows, K, device="cuda", dtype=torch.int8)
+    scale = torch.empty(rows, device="cuda")
+    fvk.alpamayo15_quantize_int8_rows_bf16(x.data_ptr(), x.stride(0), q.data_ptr(), scale.data_ptr(), rows, K, _stream())
+    torch.cuda.synchronize()
+    amax = x.float().abs().amax(dim=1)
+    ref_scale = torch.where(amax > 0, amax / 127.0, torch.ones_like(amax))
+    assert torch.equal(scale, ref_scale)
+    ref_q = torch.round(x.float() / ref_scale[:, None]).clamp(-127, 127).to(torch.int8)
+    assert torch.equal(q, ref_q)
+
+
+def test_w4_row_quantization_and_int4_head_match_dequantized_reference():
+    """quantize_w4_rows: codes in range, dequantization error within half a step; the INT4 head on the grouped GEMM
+    with the per-channel factor equals the integer reference of its own quantization."""
+    fvk = _kernels()
+    from flash_rt.models.alpamayo15.marlin_w4a8 import W4LmHead, quantize_w4_rows
+    torch.manual_seed(3)
+    N, K = 2048, 1024
+    G = K // 128
+    w = (torch.randn(N, K, device="cuda") * 0.03).to(BF16)
+    pack, z, sg, cs = quantize_w4_rows(w, chunk_rows=768)                      # chunks that are not a divisor of N
+    assert pack.shape == (N // 16, G, 1088) and z.shape == (G, N) and sg.shape == (G, N) and cs.shape == (N,)
+    assert int(sg.min()) >= 0 and int(sg.max()) == 4096
+    pack_whole, z_whole, sg_whole, cs_whole = quantize_w4_rows(w)
+    assert torch.equal(pack, pack_whole) and torch.equal(z, z_whole) and torch.equal(sg, sg_whole) and torch.equal(cs, cs_whole)
+    scale_eff = sg.float() * cs[None, :]                                          # [G, N]
+    head = W4LmHead(fvk, w, 8)
+    assert head.N == N and head.K == K
+    x = (torch.randn(5, K, device="cuda") * 2).to(BF16)
+    out = torch.full((5, N), float("nan"), device="cuda", dtype=BF16)
+    head(x, out, _stream())
+    torch.cuda.synchronize()
+    # reference: the INT8 rows times the dequantized INT4 weight (the pack inverted tile by tile), in float64
+    amax = x.float().abs().amax(dim=1)
+    a_scale = torch.where(amax > 0, amax / 127.0, torch.ones_like(amax))
+    xq = torch.round(x.float() / a_scale[:, None]).clamp(-127, 127)
+    deq = _dequant_w4(pack, z, sg, cs, N, K)                                   # [N, K] float64
+    ref = (xq.double() @ deq.t()) * a_scale.double()[:, None]
+    err = (out.double() - ref).abs()
+    assert bool((err <= ref.abs() * 2.0 ** -7 + 1e-6).all()), float(err.max())
+    # the dequantized weight is within half an effective step of the BF16 weight
+    step = scale_eff.t().repeat_interleave(128, dim=1).double()                 # [N, K]
+    assert bool(((deq - w.double()).abs() <= step * 0.51 + 1e-7).all())     # half a step, plus the 12-bit scale rounding
+    # a vocabulary that is not a multiple of 16: padded tiles, only the valid channels written
+    Nv = 2051                                                                 # odd vocabulary: odd leading dimension too
+    w_v = (torch.randn(Nv, K, device="cuda") * 0.03).to(BF16)
+    head_v = W4LmHead(fvk, w_v, 8)
+    assert head_v.N == Nv and head_v.N_pad == 2064 and head_v.w_pack.shape[0] == 2064 // 16
+    wide = torch.full((5, Nv + 7), 7.0, device="cuda", dtype=BF16)
+    head_v(x, wide[:, :Nv], _stream())
+    torch.cuda.synchronize()
+    assert torch.equal(wide[:, Nv:], torch.full((5, 7), 7.0, device="cuda", dtype=BF16))
+    deq_v = _dequant_w4(head_v.w_pack, head_v.zp, head_v.sg, head_v.col_scale, 2064, K)[:Nv]
+    ref_v = (xq.double() @ deq_v.t()) * a_scale.double()[:, None]
+    assert bool(((wide[:, :Nv].double() - ref_v).abs() <= ref_v.abs() * 2.0 ** -7 + 1e-6).all())
+
+
+def _dequant_w4(pack, z, sg, cs, N, K):
+    """Invert the fused pack (nibbles after the 64-byte meta block of each tile and group, in the pack_w4a8_small
+    layout: n = 16 T + 8 rh + g, k = 64 C + 32 ks + 16 half + 4 t + j) and dequantize."""
+    G = K // 128
+    pack = pack.view(N // 16, G, 1088)[:, :, 64:].reshape(N // 16, K // 64, 32, 16)
+    v = torch.stack([pack & 0xF, pack >> 4], dim=3)                            # [T, C, lane, ks, 16 bytes]
+    v = v.view(N // 16, K // 64, 8, 4, 2, 2, 2, 4)                             # [T, C, g, t, ks, half, rh, j]
+    v = v.permute(0, 6, 2, 1, 4, 5, 3, 7).reshape(N, K)                        # [T, rh, g | C, ks, half, t, j]
+    G = K // 128
+    zz = z.t().repeat_interleave(128, dim=1)                                    # [N, K]
+    ss = (sg.float() * cs[None, :]).t().repeat_interleave(128, dim=1)
+    return (v.double() - zz.double()) * ss.double()
+
+
+def _rotation_set(K: int, rows: int):
+    """A ParoQuant-shaped rotation set (random angles, random in-group pairings, channel scales) with its workspaces."""
+    pairs = torch.empty(8, K, dtype=torch.int16)
+    for r in range(8):
+        for g in range(K // 128):
+            perm = torch.randperm(128)
+            pr = torch.empty(128, dtype=torch.int16)
+            pr[0::2] = perm[:64].to(torch.int16)
+            pr[1::2] = perm[64:].to(torch.int16)
+            pairs[r, g * 128:(g + 1) * 128] = pr
+    alloc = (rows + 7) // 8 * 8
+    return {"theta": (torch.rand(8, K // 2) * 6.28).to("cuda", torch.float16).contiguous(), "pairs": pairs.cuda().contiguous(),
+            "scales": (torch.rand(K) * 0.5 + 0.75).to("cuda", torch.float16).contiguous(), "igs": torch.full((1,), 7e-6, device="cuda"),
+            "xr": torch.empty(rows, K, device="cuda", dtype=torch.float16), "part": torch.empty(rows, K // 128, device="cuda"),
+            "xq": torch.zeros(alloc, K, device="cuda", dtype=torch.int8), "a_scale": torch.zeros(alloc, device="cuda")}
+
+
+@pytest.mark.parametrize("M,Ns,K,cfg", [(1, (4096, 1024, 1024), 4096, (1, 2, 4)), (3, (12288, 12288), 4096, (2, 4, 4)),
+                                        (4, (4096,), 12288, (1, 2, 4)), (2, (1024, 512), 4096, (4, 2, 8))])
+def test_w4a8_grouped_gemm_with_fused_quantization_matches_two_pass(M, Ns, K, cfg):
+    """Rotation + grouped GEMM with the quantization in its prologue gives the two-pass (rotate, quantize, GEMM)
+    result bit for bit; the two-pass path's INT8 activations and scales stay as the separate kernels wrote them."""
+    fvk = _kernels()
+    from flash_rt.models.alpamayo15.marlin_w4a8 import pack_w4a8_grouped
+    torch.manual_seed(K + M)
+    G = K // 128
+    ks, pf, w = cfg
+    sets = [_rotation_set(K, M) for _ in Ns]
+    x = (torch.randn(M, K + 8, device="cuda") * 2).to(BF16)[:, :K]                  # leading dimension K + 8
+    ws = [torch.randint(0, 16, (K, N), device="cuda", dtype=torch.uint8) for N in Ns]
+    zs = [torch.randint(0, 16, (G, N), device="cuda", dtype=torch.uint8) for N in Ns]
+    sgs = [torch.randint(0, 4097, (G, N), device="cuda", dtype=torch.int32) for N in Ns]
+    pack = pack_w4a8_grouped(ws, zs, sgs, K)
+    ptrs = lambda key: [s_[key].data_ptr() for s_ in sets]
+    s = _stream()
+    out_ref = torch.full((M, sum(Ns)), float("nan"), device="cuda", dtype=BF16)
+    out = torch.full((M, sum(Ns)), float("nan"), device="cuda", dtype=BF16)
+    cols = [sum(Ns[:i]) for i in range(len(Ns))]
+    fvk.flashdrive_w4a8_act_prep(x.data_ptr(), x.stride(0), M, K, ptrs("theta"), ptrs("pairs"), ptrs("scales"), ptrs("igs"), ptrs("xr"),
+                                 ptrs("part"), ptrs("xq"), ptrs("a_scale"), s)
+    fvk.alpamayo15_w4a8_gemm_grouped(ptrs("xq"), ptrs("a_scale"), pack.data_ptr(), [out_ref[:, c:].data_ptr() for c in cols], M, list(Ns), K,
+                                     out_ref.stride(0), pf, w, s, ks)
+    torch.cuda.synchronize()
+    xq_ref = [s_["xq"].clone() for s_ in sets]
+    for s_ in sets:                                                                 # stale rotation outputs: must be recomputed
+        s_["xr"].fill_(float("nan")); s_["part"].fill_(float("nan")); s_["xq"].fill_(7); s_["a_scale"].fill_(-1.0)
+    fvk.flashdrive_w4a8_rotate(x.data_ptr(), x.stride(0), M, K, ptrs("theta"), ptrs("pairs"), ptrs("scales"), ptrs("xr"), ptrs("part"), s)
+    region = torch.empty(1 << 20, device="cuda", dtype=torch.uint8)                       # an L2 prefetch region (any content)
+    fvk.alpamayo15_w4a8_gemm_grouped_q(ptrs("xr"), ptrs("part"), ptrs("igs"), pack.data_ptr(), [out[:, c:].data_ptr() for c in cols], M,
+                                       list(Ns), K, out.stride(0), pf, w, s, ks, [], [], region.data_ptr(), region.numel() - 128)
+    torch.cuda.synchronize()
+    assert torch.equal(out, out_ref) and not bool(torch.isnan(out).any())
+    for s_, q_ref in zip(sets, xq_ref):
+        assert bool((s_["xq"] == 7).all()) and bool((s_["a_scale"] == -1.0).all())   # the fused form leaves them alone
+        assert q_ref[:M].abs().max() > 0
+
+
+def test_w4a8_grouped_gemm_fused_quantization_rejects_unsupported_arguments():
+    fvk = _kernels()
+    K = 1024
+    sets = [_rotation_set(K, 8) for _ in range(2)]
+    ptrs = lambda key: [s_[key].data_ptr() for s_ in sets]
+    pack = torch.zeros((272 + 1024) // 16, K // 128, 1088, device="cuda", dtype=torch.uint8)
+    out = torch.zeros(8, 272 + 1024, device="cuda", dtype=BF16)
+    call = lambda M, Ns, **kw: fvk.alpamayo15_w4a8_gemm_grouped_q(ptrs("xr")[:len(Ns)], ptrs("part")[:len(Ns)], ptrs("igs")[:len(Ns)],
+                                                                 pack.data_ptr(), [out.data_ptr(), out[:, 272:].data_ptr()][:len(Ns)], M, list(Ns),
+                                                                 K, out.stride(0), kw.get("prefetch", 2), kw.get("warps", 4), _stream(),
+                                                                 kw.get("ksplit", 1))
+    with pytest.raises(Exception, match="alpamayo15_w4a8_gemm_grouped_q"):
+        call(5, (1024,))                               # more rows than the fused form serves
+    with pytest.raises(Exception, match="alpamayo15_w4a8_gemm_grouped_q"):
+        call(2, (272, 1024))                           # 17 tiles: the second problem does not start a CTA of 4 tiles
+    with pytest.raises(Exception, match="alpamayo15_w4a8_gemm_grouped_q"):   # a prefetch region must be 128-byte aligned
+        fvk.alpamayo15_w4a8_gemm_grouped_q(ptrs("xr")[:1], ptrs("part")[:1], ptrs("igs")[:1], pack.data_ptr(), [out.data_ptr()], 1, [1024],
+                                           K, out.stride(0), 2, 4, _stream(), 1, [], [], pack.data_ptr() + 64, 4096)
+    call(2, (272, 1024), warps=4, ksplit=4)            # one tile per CTA: fine
+    torch.cuda.synchronize()
+
+
+def test_w4a8_grouped_gemm_rejects_unsupported_arguments():
+    fvk = _kernels()
+    K, N = 1024, 256
+    pack = torch.zeros(N // 16, K // 128, 1088, device="cuda", dtype=torch.uint8)
+    xq = torch.zeros(8, K, device="cuda", dtype=torch.int8)
+    a_s = torch.zeros(1, device="cuda")
+    out = torch.zeros(1, N, device="cuda", dtype=BF16)
+    call = lambda **kw: fvk.alpamayo15_w4a8_gemm_grouped([xq.data_ptr()], [a_s.data_ptr()], pack.data_ptr(), [out.data_ptr()],
+                                                         kw.get("M", 1), [kw.get("N", N)], kw.get("K", K), kw.get("ld", N),
+                                                         kw.get("prefetch", 2), kw.get("warps", 4), _stream(), kw.get("ksplit", 0))
+    call()
+    for kw in ({"M": 17}, {"N": 200}, {"K": 1000}, {"ld": N - 2}, {"prefetch": 3}, {"warps": 2}, {"ksplit": 3}, {"ksplit": 8},
+               {"ksplit": 2, "prefetch": 4, "K": 512}):   # 512 / 128 / 2 groups per warp is not a multiple of 4
+        with pytest.raises(Exception, match="alpamayo15_w4a8_gemm_grouped"):
+            call(**kw)
+    torch.cuda.synchronize()
 
 
 def test_vision_tower_cutlass_and_graph_match_torch_tower():
@@ -575,7 +810,13 @@ def test_fused_fp8_row_producers_match_separate_kernels(rows, dim, with_delta):
     fvk.alpamayo15_rms_fp8_rows_bf16(x_fused.data_ptr(), delta.data_ptr() if with_delta else 0, w.data_ptr(), q.data_ptr(),
                                      sc.data_ptr(), rows, dim, 1e-6, s)
     torch.cuda.synchronize()
-    assert torch.equal(x_fused, x_ref) and torch.equal(sc, s_ref) and torch.equal(q, q_ref)
+    assert torch.equal(x_fused, x_ref)                                       # the residual update is element-wise
+    # the fused producer accumulates the sum of squares over 4-channel vectors: scale within one FP32 ulp, codes equal
+    # or off by one where the scale rounding differs
+    assert bool((torch.abs(sc - s_ref) <= s_ref * 2 ** -22).all())
+    codes = lambda t: t.view(torch.float8_e4m3fn).float()
+    assert float((q != q_ref).float().mean()) < 0.02
+    assert bool((torch.abs(codes(q) * sc[:, None] - codes(q_ref) * s_ref[:, None]) <= torch.abs(codes(q_ref) * s_ref[:, None]) * 2 ** -3 + s_ref[:, None] * 0.5).all())
     F = dim
     g = (torch.randn(rows, F, device="cuda") * 2).to(BF16); u = (torch.randn(rows, F, device="cuda") * 2).to(BF16)
     act = torch.empty_like(g)

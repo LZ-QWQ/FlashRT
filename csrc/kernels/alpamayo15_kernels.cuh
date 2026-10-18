@@ -111,5 +111,40 @@ int alpamayo15_vlm_qk_prep_bf16(const void* qkv, const void* q_norm_w, const voi
 int alpamayo15_w8a16_gemm_bf16(const void* w_frag, const float* scale, const void* x, void* y,
                                int M, int N, int K, int fmt, cudaStream_t stream);
 
+// Grouped few-row W4A8 GEMM (decode tier; Marlin's integer arithmetic, see the .cu): n_problems (1-3) linears that
+// share one input width K and the row count M (<= 16), one launch.
+//   xq[i]      [>= ceil(M/8)*8, K] int8 row-major per problem (its own rotated / quantized activations)
+//   a_scale[i] [M] fp32 per problem
+//   w_pack     one buffer [tiles][K/128][1088 B] (pack_w4a8_grouped): per tile and group 16 zero points (u8), 16
+//              integer group scales (i16, 0..4096), 16 B padding, then the tile's 1 KB of nibbles for the group
+//              (pack_w4a8_small layout); the problems' tiles in order
+//   out[i]     bf16, rows ld_out elements apart (one row-major [M, sum N] block when the pointers are its column blocks)
+//   col_scale  optional per problem: [N_i] fp32 multiplied into the output (own quantization with per-channel
+//              normalized integer group scales); nullptr (or a null array) = Marlin's epilogue
+//   n_valid    optional per problem: output channels written (<= N_i; the rest of the last tile is padding)
+// prefetch (2 or 4 weight groups in flight per warp), warps per CTA (4 or 8), ksplit (0 = auto, 1, 2 or 4 warps per tile).
+// N_i % 16 == 0; ld_out >= n_valid_i (any parity); K % 128 == 0 and (K / 128 / ksplit) % prefetch == 0.
+//   pf_ptr / pf_bytes  optional 128-byte aligned region prefetched into the L2 by the CTAs during the weight stream
+//              (the next group's rotation tables: on Thor a cold read of a few hundred KB right before a streaming
+//              kernel slows that kernel by about 30%; prefetched inside the stream it costs nothing)
+int alpamayo15_w4a8_gemm_grouped(int n_problems, const void* const* xq, const float* const* a_scale, const void* w_pack,
+                                 void* const* out, int M, const int* N, int K, int ld_out, int prefetch, int warps,
+                                 int ksplit, cudaStream_t stream, const float* const* col_scale = nullptr,
+                                 const int* n_valid = nullptr, const void* pf_ptr = nullptr, size_t pf_bytes = 0);
+
+// The same GEMM with the per-token INT8 quantization of the FlashDrive activation preparation folded into the
+// prologue (bit-exact with flashdrive_w4a8_act_prep's quantization pass): xr[i] [rows, K] fp16 rotated activations,
+// part[i] [rows, K/128] fp32 per-group row absmax (both from the rotation pass), igs[i] = input_global_scale (fp32
+// device scalar). M <= 4 and M <= warps; a CTA's tiles belong to one problem (every problem's first tile index must be
+// a multiple of warps / ksplit, as for the engine's q|k|v and gate|up groups). Dynamic shared memory M * K + 32 bytes.
+int alpamayo15_w4a8_gemm_grouped_q(int n_problems, const void* const* xr, const float* const* part, const float* const* igs,
+                                   const void* w_pack, void* const* out, int M, const int* N, int K, int ld_out, int prefetch,
+                                   int warps, int ksplit, cudaStream_t stream, const float* const* col_scale = nullptr,
+                                   const int* n_valid = nullptr, const void* pf_ptr = nullptr, size_t pf_bytes = 0);
+
+// Per-token INT8 quantization of BF16 rows: q [rows, K] int8 = round-to-nearest-even(x / scale[row]) in [-127, 127],
+// scale[row] = absmax / 127 (1 for an all-zero row). x rows ld_x elements apart (8-byte aligned); K % 4 == 0.
+int alpamayo15_quantize_int8_rows_bf16(const void* x, int ld_x, void* q, float* scale, int rows, int K, cudaStream_t stream);
+
 }  // namespace kernels
 }  // namespace flash_rt

@@ -88,6 +88,9 @@ ALPAMAYO15_KERNEL_SYMBOLS = (
     "alpamayo15_rms_fp8_rows_bf16",
     "alpamayo15_silu_mul_fp8_rows_bf16",
     "alpamayo15_res_rms_f32_fp8_rows_bf16",
+    "alpamayo15_w4a8_gemm_grouped",
+    "alpamayo15_w4a8_gemm_grouped_q",
+    "alpamayo15_quantize_int8_rows_bf16",
     "alpamayo15_layernorm_fp8_rows_bf16",
     "alpamayo15_set_pdl",
     # tcgen05 GEMMs (csrc/gemm/alpamayo15_bf16_gemm_sm100.cu), same build gate
@@ -106,8 +109,37 @@ DECODE_WEIGHTS = ("bf16", "fp8", "int8", "w4a8")
 EXPERT_WEIGHTS = ("bf16", "fp8")
 PREFILL_WEIGHTS = ("bf16", "fp8")
 VISION_WEIGHTS = ("bf16", "fp8")
+LM_HEAD_WEIGHTS = ("decode", "int4")        # "decode" = the decode tier's format (INT8 with W4A8), "int4" = own INT4 linear
 PREFILL_FP8_TILE = 2        # FP8 prefill GEMMs: 256 x 128 x 128 tiles on a 2-SM UMMA
 PREFILL_DOWN_SPLIT = 4      # the K=12288 down projection as 4 column blocks (weight blocks that fit the L2: 1.47 vs 3.9 ms)
+# Named option sets. "bf16" is the bit-faithful default; "balanced" is the validated reduced-precision configuration
+# (needs paro_checkpoint); "fast" adds the options measured on top of it. Explicit weight options override the preset's.
+PRESETS = {
+    "bf16": {},
+    "balanced": {"decode_weights": "w4a8", "expert_weights": "fp8", "prefill_weights": "fp8"},
+    "fast": {"decode_weights": "w4a8", "expert_weights": "fp8", "prefill_weights": "fp8", "lm_head_weights": "int4"},
+}
+TIER_OPTIONS = ("decode_weights", "expert_weights", "prefill_weights", "vision_weights", "lm_head_weights")
+# Grouped W4A8 GEMM launch forms "ksplit:prefetch:warps" (warps per tile, weight groups in flight per warp, warps per
+# CTA) for the decode groups under 1024 weight tiles (q|k|v, o, down) and from 1024 on (gate|up, the INT4 LM head).
+W4A8_GEMM_NARROW = "1:2:4"
+W4A8_GEMM_WIDE = "2:4:4"
+
+TIER_DEFAULTS = {"decode_weights": "bf16", "expert_weights": "bf16", "prefill_weights": "bf16", "vision_weights": "bf16",
+                 "lm_head_weights": "decode"}
+
+
+def resolve_preset(preset: str, **explicit) -> dict:
+    """The weight options (``TIER_OPTIONS``) of ``preset`` with the explicitly given ones (not ``None``) on top."""
+    if preset not in PRESETS:
+        raise ValueError(f"unknown preset {preset!r}; choose from {tuple(PRESETS)}")
+    unknown = set(explicit) - set(TIER_OPTIONS)
+    if unknown:
+        raise ValueError(f"not preset options: {sorted(unknown)}")
+    opts = dict(TIER_DEFAULTS)
+    opts.update(PRESETS[preset])
+    opts.update({name: value for name, value in explicit.items() if value is not None})
+    return opts
 
 
 def require_alpamayo15_kernels(fvk: object) -> None:
@@ -338,7 +370,9 @@ class Alpamayo15Thor:
         max_new_tokens: generation budget (official ``max_generation_length``).
         max_samples: largest ``num_traj_samples`` served (cache is sized for it).
         top_p, temperature: sampling parameters, baked into the decode graphs.
-        decode_splits, expert_splits: FA4 KV splits for decode and expert attention.
+        decode_splits, expert_splits: FA4 KV splits for decode and expert attention
+            (one split streams the prompt cache fastest on Thor: 54 against 85 us per
+            layer with four).
         vision_attention: ``"fa4"`` (strided views, no copies), ``"cudnn"`` or ``"sdpa"``.
         prefill: ``"native"`` (fused FlashRT kernels writing the static cache)
             or ``"official"`` (official Qwen3-VL forward; reference path).
@@ -349,6 +383,11 @@ class Alpamayo15Thor:
             ``vision_attention="fa4"`` and equal frame grids (otherwise the
             torch tower runs). The prefill projections stay on cuBLAS, which is
             faster than the tcgen05 BF16 GEMM at those shapes on Thor.
+        preset: ``"bf16"`` (default: the official numerics up to kernel rounding),
+            ``"balanced"`` (``decode_weights="w4a8"``, ``expert_weights="fp8"``,
+            ``prefill_weights="fp8"``; needs ``paro_checkpoint``) or ``"fast"``
+            (``"balanced"`` plus ``lm_head_weights="int4"``). The weight options
+            below default to the preset's and override it when given.
         decode_weights: ``"bf16"`` (official weights), ``"fp8"`` or ``"int8"``
             (opt-in per-row copies for the reasoning-decode projections and the
             LM head; about +7.6 GB, changes decode numerics - see module notes),
@@ -369,6 +408,11 @@ class Alpamayo15Thor:
             proj, fc1 and fc2 with per-row FP8 activations, bias / GELU /
             residual in the epilogue; patch embedding and mergers stay BF16;
             about +0.45 GB, changes the image features).
+        lm_head_weights: ``"decode"`` (the LM head in the decode tier's format:
+            BF16, FP8, INT8, or INT8 with W4A8) or ``"int4"`` (own INT4 linear,
+            group 128 with zero points, per-token INT8 activations; the logits
+            weight stream halves: 2.6 -> about 1.4 ms per token; changes the
+            sampled tokens).
     """
 
     def __init__(
@@ -380,19 +424,25 @@ class Alpamayo15Thor:
         max_samples: int = 1,
         top_p: float = 0.98,
         temperature: float = 0.6,
-        decode_splits: int = 4,
+        decode_splits: int = 1,
         expert_splits: int = 1,
         vision_attention: str = "fa4",
         prefill: str = "native",
-        decode_weights: str = "bf16",
+        preset: str = "bf16",
+        decode_weights: str | None = None,
         vision_gemm: str = "cutlass",
         expert_gemm: str = "cutlass",
-        expert_weights: str = "bf16",
-        prefill_weights: str = "bf16",
-        vision_weights: str = "bf16",
+        expert_weights: str | None = None,
+        prefill_weights: str | None = None,
+        vision_weights: str | None = None,
+        lm_head_weights: str | None = None,
         paro_checkpoint: str | None = None,
         pdl: bool = False,
     ) -> None:
+        tiers = resolve_preset(preset, decode_weights=decode_weights, expert_weights=expert_weights,
+                               prefill_weights=prefill_weights, vision_weights=vision_weights, lm_head_weights=lm_head_weights)
+        decode_weights, expert_weights = tiers["decode_weights"], tiers["expert_weights"]
+        prefill_weights, vision_weights, lm_head_weights = tiers["prefill_weights"], tiers["vision_weights"], tiers["lm_head_weights"]
         if prefill not in ("native", "official"):
             raise ValueError(f"unknown prefill {prefill!r}")
         if decode_weights not in DECODE_WEIGHTS:
@@ -400,13 +450,18 @@ class Alpamayo15Thor:
         if decode_weights != "bf16" and max_samples > 16:
             raise ValueError(f"decode_weights={decode_weights!r} supports max_samples <= 16 (the few-row kernels serve up to 16 rows)")
         if (decode_weights == "w4a8") != (paro_checkpoint is not None):
-            raise ValueError("decode_weights='w4a8' takes the ParoQuant checkpoint directory as paro_checkpoint (and only then)")
+            raise ValueError("decode_weights='w4a8' (also preset='balanced') takes the ParoQuant checkpoint directory as "
+                             "paro_checkpoint, and only then")
         if expert_weights not in EXPERT_WEIGHTS:
             raise ValueError(f"unknown expert_weights {expert_weights!r}; choose from {EXPERT_WEIGHTS}")
         if prefill_weights not in PREFILL_WEIGHTS:
             raise ValueError(f"unknown prefill_weights {prefill_weights!r}; choose from {PREFILL_WEIGHTS}")
         if vision_weights not in VISION_WEIGHTS:
             raise ValueError(f"unknown vision_weights {vision_weights!r}; choose from {VISION_WEIGHTS}")
+        if lm_head_weights not in LM_HEAD_WEIGHTS:
+            raise ValueError(f"unknown lm_head_weights {lm_head_weights!r}; choose from {LM_HEAD_WEIGHTS}")
+        if lm_head_weights == "int4" and max_samples > 16:
+            raise ValueError("lm_head_weights='int4' supports max_samples <= 16 (the few-row kernels serve up to 16 rows)")
         if vision_weights == "fp8" and vision_gemm != "cutlass":
             raise ValueError("vision_weights='fp8' runs on the FlashRT GEMMs (vision_gemm='cutlass')")
         for name, choice in (("vision_gemm", vision_gemm), ("expert_gemm", expert_gemm)):
@@ -459,9 +514,11 @@ class Alpamayo15Thor:
         self.expert_splits = int(expert_splits)
         self.vision_attention = vision_attention
         self.prefill_impl = prefill
+        self.preset = preset
         self.decode_weights = decode_weights
         self.vision_gemm, self.expert_gemm = vision_gemm, expert_gemm
         self.expert_weights, self.prefill_weights, self.vision_weights = expert_weights, prefill_weights, vision_weights
+        self.lm_head_weights = lm_head_weights
         self._gemm = _Gemm(fvk)
         self.pdl = bool(pdl)
         fvk.alpamayo15_set_pdl(self.pdl)
@@ -514,9 +571,10 @@ class Alpamayo15Thor:
         self._expert_graphs: dict[int, torch.cuda.CUDAGraph] = {}
 
         self._fuse_weights()
-        self._q8 = self._quantize_decode_weights("int8" if decode_weights == "w4a8" else decode_weights) \
-            if decode_weights != "bf16" else None
+        self._q8 = self._quantize_decode_weights("int8" if decode_weights == "w4a8" else decode_weights,
+                                                 lm_head=lm_head_weights == "decode") if decode_weights != "bf16" else None
         self._w4 = self._load_w4a8_decode(paro_checkpoint) if decode_weights == "w4a8" else None
+        self._lm4 = self._load_w4_lm_head() if lm_head_weights == "int4" else None
         self._e8 = self._quantize_expert_weights() if expert_weights == "fp8" else None
         self._p8 = self._quantize_prefill_weights() if prefill_weights == "fp8" else None
         self._v8 = self._quantize_vision_weights() if vision_weights == "fp8" else None
@@ -565,9 +623,9 @@ class Alpamayo15Thor:
         torch.cuda.empty_cache()
 
     @torch.no_grad()
-    def _quantize_decode_weights(self, fmt: str) -> dict:
+    def _quantize_decode_weights(self, fmt: str, lm_head: bool = True) -> dict:
         """Per-row FP8 or INT8 fragment copies of the decode projections (the BF16 originals stay for prefill); with
-        the W4A8 tier only the LM head."""
+        the W4A8 tier only the LM head (none with the INT4 LM head)."""
         quant = quantize_int8_rows if fmt == "int8" else quantize_fp8_rows
         q8 = {"qkv": [], "o": [], "gu": [], "down": [], "fmt": 1 if fmt == "int8" else 0}
         if self.decode_weights != "w4a8":
@@ -576,26 +634,35 @@ class Alpamayo15Thor:
                 q8["o"].append(fp8_fragment_layout(*quant(layer.self_attn.o_proj.weight)))
                 q8["gu"].append(fp8_fragment_layout(*quant(self.w_gu[li])))
                 q8["down"].append(fp8_fragment_layout(*quant(layer.mlp.down_proj.weight)))
-        q8["lm_head"] = fp8_fragment_layout(*quant(self.vlm.lm_head.weight))
+        if lm_head:
+            q8["lm_head"] = fp8_fragment_layout(*quant(self.vlm.lm_head.weight))
         torch.cuda.empty_cache()
         return q8
+
+    @torch.no_grad()
+    def _load_w4_lm_head(self):
+        """The LM head as an own INT4 linear on the grouped few-row GEMM (``lm_head_weights="int4"``)."""
+        from flash_rt.models.alpamayo15.marlin_w4a8 import W4LmHead
+        head = W4LmHead(self._fvk, self.vlm.lm_head.weight, self.max_samples, tuple(int(v) for v in W4A8_GEMM_WIDE.split(":")))
+        torch.cuda.empty_cache()
+        return head
 
     @torch.no_grad()
     def _load_w4a8_decode(self, path: str) -> list[dict]:
         """The ParoQuant W4A8 linears of every layer as decode groups (q|k|v, o, gate|up, down)."""
         from flash_rt.models.alpamayo15.marlin_w4a8 import W4A8DecodeGroup, load_paro_language_model
-        missing = [n for n in ("flashdrive_w4a8_act_prep", "flashdrive_w4a8_gemm_tile", "flashdrive_w4a8_gemm_small")
-                   if not hasattr(self._fvk, n)]
+        missing = [n for n in ("flashdrive_w4a8_act_prep", "flashdrive_w4a8_rotate") if not hasattr(self._fvk, n)]
         if missing:
-            raise RuntimeError(f"FlashRT was built without the W4A8 few-row kernels ({', '.join(missing)})")
+            raise RuntimeError(f"FlashRT was built without the W4A8 activation preparation kernels ({', '.join(missing)})")
         layers = load_paro_language_model(path, self.n_layers)
         H, F_ = self.hidden, self.ffn
         groups, maps = [], {}
+        narrow, wide = (tuple(int(v) for v in c.split(":")) for c in (W4A8_GEMM_NARROW, W4A8_GEMM_WIDE))
         for li, lin in enumerate(layers):
             if lin["q_proj"]["N"] != self.n_heads * self.head_dim or lin["k_proj"]["N"] != self.n_kv * self.head_dim \
                     or lin["q_proj"]["K"] != H or lin["gate_proj"]["N"] != F_ or lin["down_proj"]["K"] != F_:
                 raise ValueError(f"layer {li}: ParoQuant linear shapes do not match the model")
-            grp = lambda names: W4A8DecodeGroup(self._fvk, [lin[n] for n in names], self.max_samples, maps)
+            grp = lambda names: W4A8DecodeGroup(self._fvk, [lin[n] for n in names], self.max_samples, maps, narrow, wide)
             groups.append({"qkv": grp(("q_proj", "k_proj", "v_proj")), "o": grp(("o_proj",)),
                            "gu": grp(("gate_proj", "up_proj")), "down": grp(("down_proj",))})
         del maps
@@ -643,13 +710,21 @@ class Alpamayo15Thor:
         torch.cuda.empty_cache()
         return v8
 
+    _W4_NEXT = {"qkv": "o", "o": "gu", "gu": "down", "down": None}
+
     def _proj(self, x: torch.Tensor, w: torch.Tensor, key: str, li: int, out: torch.Tensor, stream: int) -> None:
-        """``out = x @ w.T`` from the BF16 weight or, in the FP8 / INT8 / W4A8 tiers, its quantized form."""
+        """``out = x @ w.T`` from the BF16 weight or, in the FP8 / INT8 / W4A8 / INT4 tiers, its quantized form."""
+        if li < 0 and self._lm4 is not None:
+            self._lm4(x, out, stream)
+            return
         if self._q8 is None:
             torch.mm(x, w.t(), out=out)
             return
         if self._w4 is not None and li >= 0:
-            self._w4[li][key](x, out, stream)
+            # the GEMM prefetches the rotation tables of the group that runs next (o, gate|up, down, next layer's q|k|v)
+            nxt = self._W4_NEXT[key]
+            nxt_group = self._w4[li][nxt] if nxt else (self._w4[li + 1]["qkv"] if li + 1 < self.n_layers else None)
+            self._w4[li][key](x, out, stream, nxt_group.tables_region if nxt_group is not None else None)
             return
         frag, scale = self._q8[key][li] if li >= 0 else self._q8[key]
         if not (x.is_contiguous() and out.is_contiguous() and x.shape[0] == out.shape[0]):
@@ -1057,7 +1132,7 @@ class Alpamayo15Thor:
             self._proj(act, layer.mlp.down_proj.weight, "down", li, d, s)
             nxt = layers[li + 1].input_layernorm.weight if li + 1 < len(layers) else lm.norm.weight
             fvk.alpamayo15_rms_bf16(x.data_ptr(), d.data_ptr(), nxt.data_ptr(), h.data_ptr(), n, H, self.eps, s)
-        if n == 1 or self._q8 is not None:
+        if n == 1 or self._q8 is not None or self._lm4 is not None:
             self._proj(h, self.vlm.lm_head.weight, "lm_head", -1, logits, s)
         else:  # vocab-major product keeps the skinny-M lm_head at full weight-streaming bandwidth
             key = f"logits_t{n}"

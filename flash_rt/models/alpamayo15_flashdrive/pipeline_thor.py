@@ -70,7 +70,7 @@ BACKEND_CHOICES = ("flashrt", "flashdrive")
 # csrc/gemm/alpamayo15_flashdrive_w4a8_sm100.cu), built with
 # -DFLASHRT_ENABLE_ALPAMAYO15=ON next to the Alpamayo 1.5 engine kernels (whose LayerNorm, split SiLU-mul and
 # per-row FP8 quantization kernels and tcgen05 GEMMs the backend shares).
-FLASHDRIVE_KERNEL_SYMBOLS = ("flashdrive_qk_prep_bf16", "flashdrive_rope_rows", "flashdrive_w4a8_act_prep",
+FLASHDRIVE_KERNEL_SYMBOLS = ("flashdrive_qk_prep_bf16", "flashdrive_rope_rows", "flashdrive_w4a8_act_prep", "flashdrive_w4a8_rotate",
                              "flashdrive_shift_cache",
                              "flashdrive_rms_f16delta_bf16", "flashdrive_silu_mul_f16in_bf16",
                              "flashdrive_w4a8_gemm_sm100", "flashdrive_w4a8_gemm_sm100_sizes", "flashdrive_w4a8_gemm_small",

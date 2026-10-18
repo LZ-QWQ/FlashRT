@@ -78,6 +78,12 @@ int flashdrive_w4a8_act_prep(const void* x, int ld_x, int rows, int K, int n_set
                              const float* const* igs, void* const* xr, float* const* part, void* const* xq,
                              float* const* a_scale, cudaStream_t stream);
 
+// The rotation pass of flashdrive_w4a8_act_prep alone (xr / part written; the quantization is left to the consumer, e.g.
+// alpamayo15_w4a8_gemm_grouped_q). Same set arguments without igs / xq / a_scale.
+int flashdrive_w4a8_rotate(const void* x, int ld_x, int rows, int K, int n_sets,
+                           const void* const* theta, const void* const* pairs, const void* const* scales,
+                           void* const* xr, float* const* part, cudaStream_t stream);
+
 // FlashDrive's streaming frame-block shift of every layer's cache in one launch, plus the VLM view of the moved
 // rows: for every view v and frame pair f (F-1 pairs), cache rows [ranges[v][f+1][0], ranges[v][f+1][1]) of keys and
 // values move to rows [ranges[v][f][0], ranges[v][f][1]) (equal lengths; frames processed in increasing f so a
