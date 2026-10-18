@@ -1749,6 +1749,7 @@ if(FLASHRT_ENABLE_ALPAMAYO15)
   )
   target_sources(flash_rt_kernels PRIVATE csrc/kernels/alpamayo15_kernels.cu
                                          csrc/kernels/alpamayo15_flashdrive_kernels.cu
+                                         csrc/gemm/alpamayo15_cublaslt_bf16.cu
                                          $<TARGET_OBJECTS:alpamayo15_fd_w4a8_obj>
                                          $<TARGET_OBJECTS:alpamayo15_bf16_gemm_obj>)
   target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_ALPAMAYO15=1)

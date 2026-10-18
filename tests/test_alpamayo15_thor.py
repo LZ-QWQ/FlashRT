@@ -496,6 +496,7 @@ def test_silu_mul_split_matches_torch():
                                     ({"expert_weights": "int8"}, "expert_weights"),
                                     ({"prefill_weights": "int8"}, "prefill_weights"),
                                     ({"vision_gemm": "cublas"}, "vision_gemm"),
+                                    ({"vision_weights": "fp8", "vision_gemm": "cublaslt"}, "vision_gemm='cutlass'"),
                                     ({"expert_weights": "fp8", "expert_gemm": "torch"}, "expert_gemm='cutlass'"),
                                     ({"decode_weights": "int8", "max_samples": 17}, "max_samples <= 16"),
                                     ({"decode_weights": "w4a8"}, "paro_checkpoint"),
@@ -723,6 +724,42 @@ def test_w4a8_grouped_gemm_fused_quantization_rejects_unsupported_arguments():
     torch.cuda.synchronize()
 
 
+@pytest.mark.parametrize("M,N,K,act,res", [(2880, 3456, 1152, 0, False), (2880, 1152, 1152, 0, True), (2880, 4608, 1152, 1, False),
+                                           (2880, 1152, 4608, 0, True), (64, 256, 64, 1, True), (37, 8, 8, 0, False)])
+def test_cublaslt_gemm_fused_epilogue_matches_reference(M, N, K, act, res):
+    """D = act(A @ W^T + bias) + C on cuBLASLt (bias / GELU / residual fused): within BF16 rounding of the FP32 reference
+    and, where the CUTLASS form runs the same shape, equal to it up to rare last-bit differences."""
+    fvk = _kernels()
+    fvk.alpamayo15_cublaslt_init()
+    torch.manual_seed(N * 3 + K)
+    A = torch.randn(M, K, device="cuda").to(BF16)
+    W = (torch.randn(N, K, device="cuda") * 0.03).to(BF16)
+    bias = (torch.randn(N, device="cuda") * 0.1).to(BF16)
+    wide = torch.randn(M, N + 8, device="cuda").to(BF16)                    # D and C as blocks of wider rows
+    C = wide[:, :N] if res else None
+    D = torch.full((M, N + 16), float("nan"), device="cuda", dtype=BF16)[:, :N]
+    g = _Gemm(fvk)
+    g.lt(A, W, D, bias=bias, C=C, act=act)
+    torch.cuda.synchronize()
+    ref = A.float() @ W.float().t() + bias.float() + (C.float() if res else 0)
+    if act == 1:
+        ref = torch.nn.functional.gelu(ref, approximate="tanh")
+    err = (D.float() - ref).abs()
+    assert bool((err <= ref.abs() * 2 ** -7 + 2 ** -6).all()), float(err.max())
+    if N % 8 == 0 and K % 8 == 0 and N >= 64 and not (act == 1 and res):     # the tcgen05 form has no GELU + residual
+        D2 = torch.empty(M, N, device="cuda", dtype=BF16)
+        g(A, W, D2, bias=bias, C=C.contiguous() if res else None, act=act, tile=0)
+        torch.cuda.synchronize()
+        assert float((D2 != D).float().mean()) < 0.01
+    # the bias-less and the identity forms
+    g.lt(A, W, D, bias=None, C=None, act=0)
+    torch.cuda.synchronize()
+    ref2 = (A.float() @ W.float().t()).to(BF16)
+    assert bool(((D.float() - ref2.float()).abs() <= ref2.float().abs() * 2 ** -7 + 2 ** -6).all())
+    with pytest.raises(Exception, match="alpamayo15_cublaslt_gemm_bf16"):          # odd leading dimension
+        fvk.alpamayo15_cublaslt_gemm_bf16(A.data_ptr(), W.data_ptr(), 0, 0, D.data_ptr(), M, N, K, 0, N + 1, 0, _stream())
+
+
 def test_w4a8_grouped_gemm_rejects_unsupported_arguments():
     fvk = _kernels()
     K, N = 1024, 256
@@ -790,6 +827,19 @@ def test_vision_tower_cutlass_and_graph_match_torch_tower():
     assert torch.equal(g_img, img) and torch.equal(g_deep, deep[0])              # the graph replays the eager path
     assert torch.equal(g2_img, ref2_img) and torch.equal(g2_deep, ref2_deep[0])  # new pixels through the same graph
     assert len(eng._vis_graphs) == 1
+    # the cuBLASLt backend (bias / GELU / residual in the cuBLASLt epilogue) against the same reference, and its graph
+    fvk.alpamayo15_cublaslt_init()
+    eng.vision_gemm = "cublaslt"
+    eng._vis_graphs.clear()
+    with torch.no_grad(), torch.autocast("cuda", dtype=BF16):
+        lt_img, lt_deep = Alpamayo15Thor._vision_cutlass(eng, px, grid)
+        lg_img, lg_deep = Alpamayo15Thor._encode(eng, px, grid)
+        lg_img, lg_deep = lg_img.clone(), lg_deep[0].clone()
+    torch.cuda.synchronize()
+    close(lt_img, ref_img)
+    close(lt_deep[0], ref_deep[0])
+    assert torch.equal(lg_img, lt_img) and torch.equal(lg_deep, lt_deep[0])
+    assert float((lt_img != img).float().mean()) < 0.05                           # the two fused-epilogue paths agree closely
 
 
 @pytest.mark.parametrize("rows,dim,with_delta", [(3086, 4096, True), (37, 4096, False), (300, 12288, True)])

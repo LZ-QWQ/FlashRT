@@ -5566,6 +5566,25 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("col_scale") = std::vector<uintptr_t>{}, py::arg("n_valid") = std::vector<int>{}, py::arg("pf_ptr") = 0,
         py::arg("pf_bytes") = 0);
 
+    m.def("alpamayo15_cublaslt_init", []() {
+            const int rc = flash_rt::kernels::alpamayo15_cublaslt_init();
+            require_kernel(rc == 0, "alpamayo15_cublaslt_init", "cuBLASLt handle / workspace creation failed (rc=" + std::to_string(rc) + ")", "");
+        });
+
+    m.def("alpamayo15_cublaslt_gemm_bf16",
+        [](uintptr_t A, uintptr_t W, uintptr_t bias, uintptr_t C, uintptr_t D, int M, int N, int K, int ldc, int ldd, int act,
+           uintptr_t stream) {
+            const auto shape = kernel_shape({{"M", M}, {"N", N}, {"K", K}, {"ldc", ldc}, {"ldd", ldd}, {"act", act}});
+            require_kernel_ptrs("alpamayo15_cublaslt_gemm_bf16", {{"A", A}, {"W", W}, {"D", D}}, shape);
+            const int rc = flash_rt::kernels::alpamayo15_cublaslt_gemm_bf16(
+                reinterpret_cast<const void*>(A), reinterpret_cast<const void*>(W), reinterpret_cast<const void*>(bias),
+                reinterpret_cast<const void*>(C), reinterpret_cast<void*>(D), M, N, K, ldc, ldd, act, to_stream(stream));
+            require_kernel(rc == 0, "alpamayo15_cublaslt_gemm_bf16",
+                           "unsupported shape/alignment, uninitialized or failed cuBLASLt call (rc=" + std::to_string(rc) + ")", shape);
+        },
+        py::arg("A"), py::arg("W"), py::arg("bias"), py::arg("C"), py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("ldc"), py::arg("ldd"), py::arg("act") = 0, py::arg("stream") = 0);
+
     m.def("alpamayo15_quantize_int8_rows_bf16",
         [](uintptr_t x, int ld_x, uintptr_t q, uintptr_t scale, int rows, int K, uintptr_t stream) {
             const auto shape = kernel_shape({{"rows", rows}, {"K", K}, {"ld_x", ld_x}});

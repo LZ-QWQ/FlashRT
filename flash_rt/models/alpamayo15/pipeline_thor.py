@@ -91,6 +91,8 @@ ALPAMAYO15_KERNEL_SYMBOLS = (
     "alpamayo15_w4a8_gemm_grouped",
     "alpamayo15_w4a8_gemm_grouped_q",
     "alpamayo15_quantize_int8_rows_bf16",
+    "alpamayo15_cublaslt_init",
+    "alpamayo15_cublaslt_gemm_bf16",
     "alpamayo15_layernorm_fp8_rows_bf16",
     "alpamayo15_set_pdl",
     # tcgen05 GEMMs (csrc/gemm/alpamayo15_bf16_gemm_sm100.cu), same build gate
@@ -103,7 +105,8 @@ ALPAMAYO15_KERNEL_SYMBOLS = (
     "alpamayo15_int8_gemm_sm100",
     "alpamayo15_int8_gemm_sm100_workspace",
 )
-GEMM_BACKENDS = ("cutlass", "torch")         # BF16 GEMMs of the vision tower and the action expert
+GEMM_BACKENDS = ("cutlass", "torch")         # BF16 GEMMs of the action expert
+VISION_GEMM_BACKENDS = ("cutlass", "cublaslt", "torch")   # BF16 GEMMs of the vision tower (cublaslt: the blocks' fc1 on cuBLASLt)
 VISION_TILE = 2                              # tcgen05 tile of the vision GEMMs: 256 x 128 on a 2-SM UMMA
 DECODE_WEIGHTS = ("bf16", "fp8", "int8", "w4a8")
 EXPERT_WEIGHTS = ("bf16", "fp8")
@@ -326,6 +329,18 @@ class _Gemm:
                                              ws.data_ptr(), ws.numel(), torch.cuda.current_stream().cuda_stream)
         return D
 
+    def lt(self, A: torch.Tensor, W: torch.Tensor, D: torch.Tensor, bias: torch.Tensor | None = None,
+           C: torch.Tensor | None = None, act: int = 0) -> torch.Tensor:
+        """``D = act(A @ W.T + bias) + C`` on cuBLASLt with the epilogue fused (A [M, K], W [N, K] row-major; D / C
+        row-major blocks of wider tensors; act 1 = GELU tanh). ``alpamayo15_cublaslt_init`` must have run."""
+        M, K = A.shape
+        N = W.shape[0]
+        self._fvk.alpamayo15_cublaslt_gemm_bf16(A.data_ptr(), W.data_ptr(), bias.data_ptr() if bias is not None else 0,
+                                                C.data_ptr() if C is not None else 0, D.data_ptr(), M, N, K,
+                                                C.stride(0) if C is not None else 0, D.stride(0), act,
+                                                torch.cuda.current_stream().cuda_stream)
+        return D
+
     def fp8(self, A8: torch.Tensor, a_s: torch.Tensor, W8: torch.Tensor, w_s: torch.Tensor, D: torch.Tensor,
             tile: int = 1) -> torch.Tensor:
         """``D = bf16((A8 @ W8.T) * a_s[m] * w_s[n])`` on the FP8 tcgen05 GEMM (A8 [M, K], W8 [N, K] e4m3 bytes; D a
@@ -376,13 +391,18 @@ class Alpamayo15Thor:
         vision_attention: ``"fa4"`` (strided views, no copies), ``"cudnn"`` or ``"sdpa"``.
         prefill: ``"native"`` (fused FlashRT kernels writing the static cache)
             or ``"official"`` (official Qwen3-VL forward; reference path).
-        vision_gemm, expert_gemm: ``"cutlass"`` (default; FlashRT's tcgen05 BF16
-            GEMMs, bias / GELU / residual fused into the epilogues, the vision
-            tower as one CUDA graph per frame grid) or ``"torch"`` (cuBLAS and
-            torch elementwise). The CUTLASS vision tower needs
-            ``vision_attention="fa4"`` and equal frame grids (otherwise the
-            torch tower runs). The prefill projections stay on cuBLAS, which is
-            faster than the tcgen05 BF16 GEMM at those shapes on Thor.
+        vision_gemm: ``"cutlass"`` (default; FlashRT's tcgen05 BF16 GEMMs with
+            bias / GELU / residual fused into the epilogues), ``"cublaslt"`` (the
+            same, except the blocks' fc1 on cuBLASLt with the GELU + bias epilogue:
+            147 against 125 TFLOPS, about -3 ms per request, last-bit differences
+            that resample a few windows) or ``"torch"`` (cuBLAS and torch
+            elementwise).
+            Both FlashRT towers run as one CUDA graph per frame grid and need
+            ``vision_attention="fa4"`` and equal frame grids (otherwise the torch
+            tower runs). The prefill projections stay on cuBLAS, which is faster
+            than the tcgen05 BF16 GEMM at those shapes on Thor.
+        expert_gemm: ``"cutlass"`` (default; tcgen05 GEMMs with fused epilogues) or
+            ``"torch"``.
         preset: ``"bf16"`` (default: the official numerics up to kernel rounding),
             ``"balanced"`` (``decode_weights="w4a8"``, ``expert_weights="fp8"``,
             ``prefill_weights="fp8"``; needs ``paro_checkpoint``) or ``"fast"``
@@ -464,9 +484,10 @@ class Alpamayo15Thor:
             raise ValueError("lm_head_weights='int4' supports max_samples <= 16 (the few-row kernels serve up to 16 rows)")
         if vision_weights == "fp8" and vision_gemm != "cutlass":
             raise ValueError("vision_weights='fp8' runs on the FlashRT GEMMs (vision_gemm='cutlass')")
-        for name, choice in (("vision_gemm", vision_gemm), ("expert_gemm", expert_gemm)):
-            if choice not in GEMM_BACKENDS:
-                raise ValueError(f"unknown {name} {choice!r}; choose from {GEMM_BACKENDS}")
+        if vision_gemm not in VISION_GEMM_BACKENDS:
+            raise ValueError(f"unknown vision_gemm {vision_gemm!r}; choose from {VISION_GEMM_BACKENDS}")
+        if expert_gemm not in GEMM_BACKENDS:
+            raise ValueError(f"unknown expert_gemm {expert_gemm!r}; choose from {GEMM_BACKENDS}")
         if expert_weights == "fp8" and expert_gemm != "cutlass":
             raise ValueError("expert_weights='fp8' runs on the FlashRT GEMMs (expert_gemm='cutlass')")
         if vision_attention not in ("fa4", "cudnn", "sdpa"):
@@ -520,6 +541,8 @@ class Alpamayo15Thor:
         self.expert_weights, self.prefill_weights, self.vision_weights = expert_weights, prefill_weights, vision_weights
         self.lm_head_weights = lm_head_weights
         self._gemm = _Gemm(fvk)
+        if vision_gemm == "cublaslt":
+            fvk.alpamayo15_cublaslt_init()
         self.pdl = bool(pdl)
         fvk.alpamayo15_set_pdl(self.pdl)
         self.max_seq = self.max_prompt + self.max_new + self.n_act
@@ -583,7 +606,7 @@ class Alpamayo15Thor:
         self._eb = None
         self._vis_tables: dict = {}
         self._vis_graphs: dict = {}
-        if vision_gemm == "cutlass":
+        if vision_gemm in ("cutlass", "cublaslt"):
             self._check_vision_modules()
         self._mark = None
 
@@ -880,13 +903,19 @@ class Alpamayo15Thor:
             u8 = lambda *shape: torch.empty(*shape, device=DEV, dtype=torch.uint8)
             f32 = lambda n: torch.empty(n, device=DEV, dtype=torch.float32)
             h8, h_s, o8, o_s, f18, f1_s = u8(S, Din), f32(S), u8(S, Din), f32(S), u8(S, Ffc), f32(S)
+        # cuBLASLt where it measured faster in the pipeline: fc1 (bias + GELU epilogue, 796 vs 955 us per block); the
+        # qkv / proj GEMMs tie and the library's fc2 choice (320 x 192 tiles) runs 1.35 ms in situ against 0.90
+        lt = getattr(self, "vision_gemm", "cutlass") == "cublaslt"
+        blk_gemm = lambda A, W, D, bias=None, C=None, act=0: g(A, W, D, bias=bias, C=C, act=act, tile=T)
+        fc1_gemm = (lambda A, W, D, bias: g.lt(A, W, D, bias=bias, act=1)) if lt else \
+                   (lambda A, W, D, bias: g(A, W, D, bias=bias, act=1, tile=T))
         deep = []
         for li, blk in enumerate(V.blocks):
             a, m = blk.attn, blk.mlp
             if v8 is None:
                 fvk.alpamayo15_layernorm_bf16(x.data_ptr(), blk.norm1.weight.data_ptr(), blk.norm1.bias.data_ptr(), h.data_ptr(),
                                               S, Din, blk.norm1.eps, s)
-                g(h, a.qkv.weight, qkv, bias=a.qkv.bias, tile=T)
+                blk_gemm(h, a.qkv.weight, qkv, bias=a.qkv.bias)
             else:
                 fvk.alpamayo15_layernorm_fp8_rows_bf16(x.data_ptr(), blk.norm1.weight.data_ptr(), blk.norm1.bias.data_ptr(),
                                                        h8.data_ptr(), h_s.data_ptr(), S, Din, blk.norm1.eps, s)
@@ -896,11 +925,11 @@ class Alpamayo15Thor:
             o, _ = self._fa4(*(z.view(n_img, L, nh, hd) for z in (q, k, v)), softmax_scale=a.scaling, causal=False)
             o = o.reshape(S, Din)
             if v8 is None:
-                g(o, a.proj.weight, x2, bias=a.proj.bias, C=x, tile=T)                   # x2 = x + proj(o)
+                blk_gemm(o, a.proj.weight, x2, bias=a.proj.bias, C=x)                   # x2 = x + proj(o)
                 fvk.alpamayo15_layernorm_bf16(x2.data_ptr(), blk.norm2.weight.data_ptr(), blk.norm2.bias.data_ptr(), h.data_ptr(),
                                               S, Din, blk.norm2.eps, s)
-                g(h, m.linear_fc1.weight, f1, bias=m.linear_fc1.bias, act=1, tile=T)
-                g(f1, m.linear_fc2.weight, x, bias=m.linear_fc2.bias, C=x2, tile=T)     # x = x2 + fc2(gelu(fc1(h)))
+                fc1_gemm(h, m.linear_fc1.weight, f1, m.linear_fc1.bias)
+                blk_gemm(f1, m.linear_fc2.weight, x, bias=m.linear_fc2.bias, C=x2)     # x = x2 + fc2(gelu(fc1(h)))
             else:
                 fvk.alpamayo15_quantize_fp8_rows_bf16(o.data_ptr(), Din, o8.data_ptr(), o_s.data_ptr(), S, Din, s)
                 g.fp8_act(o8, o_s, *v8[li]["proj"], x2, bias=a.proj.bias, C=x)
@@ -919,7 +948,7 @@ class Alpamayo15Thor:
         key_grid = tuple(grid.flatten().tolist())
         n_img = len(key_grid) // 3
         equal = all(key_grid[3 * i:3 * i + 3] == key_grid[0:3] for i in range(n_img))
-        if self.vision_gemm != "cutlass" or self.vision_attention != "fa4" or not equal:
+        if self.vision_gemm not in ("cutlass", "cublaslt") or self.vision_attention != "fa4" or not equal:
             return self._vision(pixel_values, grid)
         key = (tuple(pixel_values.shape), key_grid)
         ent = self._vis_graphs.get(key)
@@ -1054,6 +1083,8 @@ class Alpamayo15Thor:
                 norm(d, layers[li + 1].input_layernorm.weight)
             else:
                 fvk.residual_add(x.data_ptr(), d.data_ptr(), P * H, s)
+        # The prompt's last-token logits stay on the BF16 LM head in every tier (the GEMV reads 1.2 GB, 5 ms on Thor):
+        # sampling the first token from the INT8 head measured ADE +0.055 [+0.001, +0.161] on the nine clips.
         with _autocast():
             logits = self.vlm.lm_head(lm.norm(x[P - 1:P].unsqueeze(0)))
         return logits, int(rope_deltas.view(-1)[0].item())

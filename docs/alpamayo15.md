@@ -323,8 +323,8 @@ out["pred_xyz"], out["pred_rot"], out["cot"][0]
 #                         engine_kwargs={"decode_weights": "w4a8", "paro_checkpoint": "<Alpamayo-1.5-10B-PARO dir>"}
 #                         engine_kwargs={"expert_weights": "fp8"}, {"prefill_weights": "fp8"}, {"vision_weights": "fp8"}
 #                         engine_kwargs={"lm_head_weights": "int4"}, {"pdl": True}
-# cuBLAS / torch elementwise instead of the tcgen05 paths:
-#                         engine_kwargs={"vision_gemm": "torch", "expert_gemm": "torch"}
+# vision GEMM backends: "cutlass" (default, tcgen05), "cublaslt" (fc1 on cuBLASLt), "torch"
+#                         engine_kwargs={"vision_gemm": "cublaslt"}, {"vision_gemm": "torch", "expert_gemm": "torch"}
 ```
 
 `load_model(config="alpamayo15")` raises a redirect: the model takes camera
@@ -410,7 +410,7 @@ steady windows of the same clip (the same windows for every row):
 | Configuration | request ms (mean / median) | vision | prefill LM | decode ms/token | diffusion | peak GB |
 |---|---|---|---|---|---|---|
 | previous engine (cuBLAS vision / expert, BF16) | 1947 / 1894 | 181 | 520 | 68.2 | 230 | 22.1 |
-| this engine, defaults (BF16) | 1903 / 1904 | 142 | 548 | 66.8 | 212 | 22.3 |
+| this engine, defaults (BF16) | 1903 / 1904 (120 w.) | 142 | 548 | 66.8 | 212 | 22.3 |
 | `decode_weights="int8"` | 1459 (24 w.) | 150 | 545 | 38.0 | 215 | 29.3 |
 | `decode_weights="w4a8"` (ParoQuant) | 1304 (24 w.) | 151 | 552 | 27.2 | 214 | 26.4 |
 | `expert_weights="fp8"` | 1818 (24 w.) | 148 | 543 | 68.5 | 130 | 24.4 |
@@ -419,6 +419,8 @@ steady windows of the same clip (the same windows for every row):
 | W4A8 decode + FP8 expert + FP8 prefill | 941 (24 w.) | 146 | 300 | 26.6 | 126 | 35.1 |
 | `preset="balanced"` (the row above after the grouped W4A8 GEMM with fused quantization and table prefetch, one KV split, warp LayerNorm, vectorized FP8 producer) | 895 / 788 (24 w.) | 142 | 290 | 22.1 | 126 | 35.0 |
 | `preset="fast"` (balanced + INT4 LM head) | 849 / 773 (24 w.) | 141 | 294 | 20.8 | 126 | 34.8 |
+| `preset="balanced"`, `vision_gemm="cublaslt"` | 880 / 786 (24 w.) | 138 | 290 | 22.3 | 126 | 35.0 |
+| `preset="fast"`, `vision_gemm="cublaslt"` | 861 / 771 (24 w.) | 138 | 290 | 21.0 | 126 | 34.8 |
 
 Nine clips of `nvidia/PhysicalAI-Autonomous-Vehicles` (the FlashDrive default
 clip with 120 windows and eight more with 60; windows from t0 = 1.7 s, 0.1 s
@@ -575,6 +577,26 @@ The vision LayerNorm runs one warp per row for the tower's width (statistics
 reduced over 32 lanes instead of a 256-thread block): 17 -> 11 ms per
 request; the LayerNorm -> FP8 producer of the vision FP8 tier uses the same
 form.
+
+The SiLU-mul -> FP8 producer of the prefill tier keeps four gate / up vectors
+in flight per thread (same codes; 817 -> 807 us per layer, within noise).
+
+`vision_gemm="cublaslt"` runs the vision blocks' fc1 on cuBLASLt: bias and
+GELU (tanh) fused into the cuBLASLt epilogue (one BF16 rounding), the
+row-major operands presented in the column-major formulation PyTorch uses;
+796 against 955 us per block in the pipeline (147 against 125 TFLOPS), about
+3 ms per request. It is not the default: the values differ from the tcgen05
+epilogue's in the last bit of a few elements, which resamples some windows
+(nine clips: 71 of 573 windows, ADE +0.047 [-0.007, +0.153] against the
+default backend, latency within noise), and the other three block GEMMs are
+no better on cuBLASLt in the pipeline (qkv ties, proj 403 vs 333 us, the
+library's fc2 choice with bias + residual 1.35 ms against 0.90 although it
+measures 0.87 in isolation).
+
+The prompt's last-token logits stay on the BF16 LM head in every tier (a
+cuBLAS GEMV over 1.2 GB, 5 ms per request): sampling the first token from the
+INT8 head measured ADE +0.055 [+0.001, +0.161] against the BF16 first token
+on the nine clips, for 5 ms.
 
 ## Limitations
 

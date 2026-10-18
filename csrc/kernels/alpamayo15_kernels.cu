@@ -306,12 +306,11 @@ __global__ void __launch_bounds__(256) silu_mul_fp8_rows_kernel(const __nv_bfloa
   a15_pdl_wait();
   __shared__ float smem[32];
   __shared__ __align__(16) __nv_bfloat16 srow[kFusedRowMax];
-  const int row = blockIdx.x;
+  const int row = blockIdx.x, n4 = F >> 2, B = blockDim.x;
   const Bf4* g4 = reinterpret_cast<const Bf4*>(gate + (size_t)row * ld);
   const Bf4* u4 = reinterpret_cast<const Bf4*>(up + (size_t)row * ld);
   Bf4* s4 = reinterpret_cast<Bf4*>(srow);
-  for (int i = threadIdx.x; i < (F >> 2); i += blockDim.x) {
-    const Bf4 g = g4[i], u = u4[i];
+  auto silu4 = [&](const Bf4 g, const Bf4 u) {
     Bf4 o;
 #pragma unroll
     for (int e = 0; e < 4; ++e) {
@@ -319,8 +318,15 @@ __global__ void __launch_bounds__(256) silu_mul_fp8_rows_kernel(const __nv_bfloa
       const float sl = bf(to_bf(gf / (1.0f + expf(-gf))));
       o.v[e] = to_bf(__fmul_rn(sl, bf(u.v[e])));
     }
-    s4[i] = o;
+    return o;
+  };
+  int i = threadIdx.x;
+  for (; i + 3 * B < n4; i += 4 * B) {                // four gate / up vectors in flight per thread
+    const Bf4 g0 = g4[i], g1 = g4[i + B], g2 = g4[i + 2 * B], g3 = g4[i + 3 * B];
+    const Bf4 u0 = u4[i], u1 = u4[i + B], u2 = u4[i + 2 * B], u3 = u4[i + 3 * B];
+    s4[i] = silu4(g0, u0); s4[i + B] = silu4(g1, u1); s4[i + 2 * B] = silu4(g2, u2); s4[i + 3 * B] = silu4(g3, u3);
   }
+  for (; i < n4; i += B) s4[i] = silu4(g4[i], u4[i]);
   __syncthreads();
   quantize_row_fp8(srow, q, scale, row, F, smem);
   a15_pdl_trigger();
