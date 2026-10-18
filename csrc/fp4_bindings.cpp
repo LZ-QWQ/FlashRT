@@ -1145,17 +1145,18 @@ same contract as cutlass_fp4_gemm_geglu_il_hw.
 
   m.def("alpamayo15_nvfp4_gemm_bf16",
         [](uintptr_t A, uintptr_t SFA, uintptr_t B, uintptr_t SFB, uintptr_t D, int M, int N, int K, int tile,
-           uintptr_t workspace, size_t workspace_bytes, uintptr_t stream, int ldd, uintptr_t alpha_ptr) -> int {
+           uintptr_t workspace, size_t workspace_bytes, uintptr_t stream, int ldd, uintptr_t alpha_ptr, int alpha_per_row) -> int {
           return flash_rt::fp4::alpamayo15_nvfp4_gemm_bf16(
               reinterpret_cast<void const*>(A), reinterpret_cast<void const*>(SFA), reinterpret_cast<void const*>(B),
               reinterpret_cast<void const*>(SFB), reinterpret_cast<void*>(D), M, N, K, tile,
               reinterpret_cast<void*>(workspace), workspace_bytes, reinterpret_cast<cudaStream_t>(stream), ldd,
-              reinterpret_cast<const float*>(alpha_ptr));
+              reinterpret_cast<const float*>(alpha_ptr), alpha_per_row);
         },
         py::arg("A"), py::arg("SFA"), py::arg("B"), py::arg("SFB"), py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"),
         py::arg("tile"), py::arg("workspace"), py::arg("workspace_bytes"), py::arg("stream") = 0, py::arg("ldd") = 0,
-        py::arg("alpha_ptr") = 0,
-        "NVFP4 GEMM tile forms (0: 1-SM 128x128, 1: 2-SM 256x128, 2: 2-SM 256x256), bf16 out, alpha from a device float.");
+        py::arg("alpha_ptr") = 0, py::arg("alpha_per_row") = 0,
+        "NVFP4 GEMM tile forms (0: 1-SM 128x128, 1: 2-SM 256x128, 2: 2-SM 256x256), bf16 out, alpha from a device float "
+        "(a scalar, or alpha_per_row = 1: one per row of D).");
 
   m.def("alpamayo15_nvfp4_sf_bytes", [](int rows, int K) -> size_t { return flash_rt::fp4::alpamayo15_nvfp4_sf_bytes(rows, K); },
         py::arg("rows"), py::arg("K"));
@@ -1182,6 +1183,43 @@ same contract as cutlass_fp4_gemm_geglu_il_hw.
         py::arg("sf"), py::arg("is_sfb"), py::arg("gs_dev") = 0, py::arg("gs_other") = 0, py::arg("n_alpha") = 0,
         py::arg("alpha_dev") = 0, py::arg("stream") = 0,
         "bf16 rows -> NVFP4 (e2m1 + UE4M3 block-16 scales, per-tensor scale from the partial maxima).");
+
+  m.def("alpamayo15_nvfp4_quantize_rows_rowscale_bf16",
+        [](uintptr_t x, int ld, int rows, int K, uintptr_t packed, uintptr_t sf, uintptr_t gs_other, int n_alpha, uintptr_t alpha_rows,
+           int alpha_ld, uintptr_t gs_rows, uintptr_t stream) -> int {
+          return flash_rt::fp4::alpamayo15_nvfp4_quantize_rows_rowscale_bf16(
+              reinterpret_cast<const void*>(x), ld, rows, K, reinterpret_cast<void*>(packed), reinterpret_cast<void*>(sf),
+              reinterpret_cast<const float*>(gs_other), n_alpha, reinterpret_cast<float*>(alpha_rows), alpha_ld,
+              reinterpret_cast<float*>(gs_rows), reinterpret_cast<cudaStream_t>(stream));
+        },
+        py::arg("x"), py::arg("ld"), py::arg("rows"), py::arg("K"), py::arg("packed"), py::arg("sf"), py::arg("gs_other") = 0,
+        py::arg("n_alpha") = 0, py::arg("alpha_rows") = 0, py::arg("alpha_ld") = 0, py::arg("gs_rows") = 0, py::arg("stream") = 0,
+        "bf16 rows -> NVFP4 with per-row scales (SFA layout) and the rows' GEMM alphas gs_row * gs_other[j].");
+
+  m.def("alpamayo15_nvfp4_rms_rows_bf16",
+        [](uintptr_t residual, uintptr_t delta, uintptr_t weight, int rows, int dim, float eps, uintptr_t packed, uintptr_t sf,
+           uintptr_t gs_other, int n_alpha, uintptr_t alpha_rows, int alpha_ld, uintptr_t stream) -> int {
+          return flash_rt::fp4::alpamayo15_nvfp4_rms_rows_bf16(
+              reinterpret_cast<void*>(residual), reinterpret_cast<const void*>(delta), reinterpret_cast<const void*>(weight), rows, dim,
+              eps, reinterpret_cast<void*>(packed), reinterpret_cast<void*>(sf), reinterpret_cast<const float*>(gs_other), n_alpha,
+              reinterpret_cast<float*>(alpha_rows), alpha_ld, reinterpret_cast<cudaStream_t>(stream));
+        },
+        py::arg("residual"), py::arg("delta"), py::arg("weight"), py::arg("rows"), py::arg("dim"), py::arg("eps"), py::arg("packed"),
+        py::arg("sf"), py::arg("gs_other") = 0, py::arg("n_alpha") = 0, py::arg("alpha_rows") = 0, py::arg("alpha_ld") = 0,
+        py::arg("stream") = 0,
+        "residual += delta (optional), RMSNorm(residual) * weight -> per-row-scaled NVFP4 rows + the rows' GEMM alphas.");
+
+  m.def("alpamayo15_nvfp4_silu_mul_rows_bf16",
+        [](uintptr_t gate, uintptr_t up, int ld, int rows, int F, uintptr_t packed, uintptr_t sf, uintptr_t gs_other, int n_alpha,
+           uintptr_t alpha_rows, int alpha_ld, uintptr_t stream) -> int {
+          return flash_rt::fp4::alpamayo15_nvfp4_silu_mul_rows_bf16(
+              reinterpret_cast<const void*>(gate), reinterpret_cast<const void*>(up), ld, rows, F, reinterpret_cast<void*>(packed),
+              reinterpret_cast<void*>(sf), reinterpret_cast<const float*>(gs_other), n_alpha, reinterpret_cast<float*>(alpha_rows),
+              alpha_ld, reinterpret_cast<cudaStream_t>(stream));
+        },
+        py::arg("gate"), py::arg("up"), py::arg("ld"), py::arg("rows"), py::arg("F"), py::arg("packed"), py::arg("sf"),
+        py::arg("gs_other") = 0, py::arg("n_alpha") = 0, py::arg("alpha_rows") = 0, py::arg("alpha_ld") = 0, py::arg("stream") = 0,
+        "bf16(silu(gate)) * up -> per-row-scaled NVFP4 rows + the rows' GEMM alphas.");
 
   m.def("cutlass_fp4_gemm_bias_bf16",
         [](uintptr_t A, uintptr_t SFA, uintptr_t B, uintptr_t SFB,

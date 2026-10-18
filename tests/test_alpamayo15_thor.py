@@ -772,15 +772,21 @@ def _fp4_module():
     return f4
 
 
-def _nvfp4_emulate(x: torch.Tensor):
-    """The quantizer's arithmetic in torch: per-tensor gs = amax / 2688, block-16 scales e4m3(block_amax / 6 / gs)
-    (round to nearest even), e2m1 codes with ties to even; returns the dequantized tensor (fp32) and gs."""
+def _nvfp4_emulate(x: torch.Tensor, per_row: bool = False):
+    """The quantizer's arithmetic in torch: gs = amax / 2688 per tensor (or per row), block-16 scales
+    e4m3(block_amax / 6 / gs) (round to nearest even), e2m1 codes with ties to even; returns the dequantized tensor
+    (fp32) and gs (a float, or a [rows] tensor)."""
     x = x.float()
-    amax = float(x.abs().max())
-    gs = amax / 2688.0 if amax > 0 else 1.0
+    if per_row:
+        amax = x.abs().amax(dim=1)
+        gs = torch.where(amax > 0, amax / 2688.0, torch.ones_like(amax))
+        gs_b = gs.view(-1, 1)
+    else:
+        amax = float(x.abs().max())
+        gs = gs_b = amax / 2688.0 if amax > 0 else 1.0
     blocks = x.view(x.shape[0], -1, 16)
-    bs = (blocks.abs().amax(dim=2) / (6.0 * gs)).clamp(max=448.0).to(torch.float8_e4m3fn).float()      # [rows, nb]
-    scaled = blocks / (bs * gs).unsqueeze(2).clamp_min(1e-30)
+    bs = (blocks.abs().amax(dim=2) / (6.0 * gs_b)).clamp(max=448.0).to(torch.float8_e4m3fn).float()    # [rows, nb]
+    scaled = blocks / (bs * gs_b).unsqueeze(2).clamp_min(1e-30)
     grid = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=x.device)
     mag = scaled.abs().clamp(max=6.0)
     dist = (mag.unsqueeze(-1) - grid).abs()
@@ -789,9 +795,180 @@ def _nvfp4_emulate(x: torch.Tensor):
     tie = (dist.gather(-1, up.unsqueeze(-1)).squeeze(-1) == dist.gather(-1, idx.unsqueeze(-1)).squeeze(-1)) & (up != idx)
     idx = torch.where(tie & (idx % 2 == 1), up, idx)                           # ties to the even code
     q = grid[idx] * torch.sign(scaled)
-    deq = (q * (bs * gs).unsqueeze(2)).view_as(x)
+    deq = (q * (bs * gs_b).unsqueeze(2)).view_as(x)
     deq[(bs == 0).unsqueeze(2).expand_as(blocks).reshape(x.shape)] = 0.0
     return deq, gs
+
+
+def _nvfp4_weight(f4, w, s):
+    """A weight through the per-tensor quantizer (the engine's static path): packed, SFB layout, gs."""
+    N, K = w.shape
+    part = torch.empty(1024, device="cuda"); gs_dev = torch.empty(1, device="cuda")
+    wp = torch.empty(N, K // 2, device="cuda", dtype=torch.uint8); wsf = torch.zeros(int(f4.alpamayo15_nvfp4_sf_bytes(N, K)), device="cuda", dtype=torch.uint8)
+    n = f4.alpamayo15_nvfp4_absmax_bf16(w.data_ptr(), K, N, K, part.data_ptr(), 1024, s)
+    assert n > 0
+    assert f4.alpamayo15_nvfp4_quantize_rows_bf16(w.data_ptr(), K, N, K, part.data_ptr(), n, wp.data_ptr(), wsf.data_ptr(), 1, gs_dev.data_ptr(), 0, 0, 0, s) == 0
+    torch.cuda.synchronize()
+    return wp, wsf, gs_dev.clone()
+
+
+@pytest.mark.parametrize("M,N,K,tile", [(3086, 4096, 4096, 2), (300, 2048, 12288, 2), (257, 1024, 1024, 1), (70, 2048, 4096, 0)])
+def test_nvfp4_rowscale_quantizer_and_per_row_alpha_gemm(M, N, K, tile):
+    """The per-row quantizer (the W4A4 tier's activation path) equals the torch emulation with per-row scales, writes
+    the rows' alphas gs_row * gs_weight, and the GEMM's per-row alpha epilogue applies them: the product equals the
+    emulated dequantized product within the kernel's midpoint rounding; exactly representable operands with per-row
+    power-of-two factors come out exact up to the BF16 output rounding."""
+    f4 = _fp4_module()
+    torch.manual_seed(M + 2 * N)
+    s = _stream()
+    x = (torch.randn(M, K, device="cuda") * (torch.rand(M, 1, device="cuda") * 4 + 0.1)).to(BF16)   # rows of very different magnitude
+    x[3] = 0
+    w = (torch.randn(N, K, device="cuda") * 0.02).to(BF16)
+    wp, wsf, gsw = _nvfp4_weight(f4, w, s)
+    gsw2 = torch.stack([gsw[0], gsw[0] * 3])
+    ld_a = (M + 127) // 128 * 128
+    alpha = torch.zeros(2, ld_a, device="cuda"); gs_rows = torch.zeros(M, device="cuda")
+    xp = torch.empty(M, K // 2, device="cuda", dtype=torch.uint8); xsf = torch.zeros(int(f4.alpamayo15_nvfp4_sf_bytes(M, K)), device="cuda", dtype=torch.uint8)
+    assert f4.alpamayo15_nvfp4_quantize_rows_rowscale_bf16(x.data_ptr(), K, M, K, xp.data_ptr(), xsf.data_ptr(), gsw2.data_ptr(), 2,
+                                                            alpha.data_ptr(), ld_a, gs_rows.data_ptr(), s) == 0
+    torch.cuda.synchronize()
+    xd, gx = _nvfp4_emulate(x, per_row=True); wd, gw = _nvfp4_emulate(w)
+    assert torch.allclose(gs_rows, gx, rtol=1e-6) and float(gs_rows[3]) == 1.0
+    assert torch.allclose(alpha[0, :M], gx * gw, rtol=1e-5) and torch.allclose(alpha[1, :M], gx * gw * 3, rtol=1e-5)
+    ws = torch.empty(max(int(f4.alpamayo15_nvfp4_gemm_workspace(M, N, K, tile)), 16), device="cuda", dtype=torch.uint8)
+    out = torch.empty(M, N, device="cuda", dtype=BF16)
+    assert f4.alpamayo15_nvfp4_gemm_bf16(xp.data_ptr(), xsf.data_ptr(), wp.data_ptr(), wsf.data_ptr(), out.data_ptr(), M, N, K, tile,
+                                         ws.data_ptr(), ws.numel(), s, N, alpha[0].data_ptr(), 1) == 0
+    torch.cuda.synchronize()
+    ref = xd.double() @ wd.double().t()
+    err = (out.double() - ref).abs()
+    assert float(err.pow(2).mean().sqrt() / ref.pow(2).mean().sqrt()) < 3e-2, "GEMM / layout / per-row alpha mismatch"
+    assert bool((out[3] == 0).all())
+    exact = x.float() @ w.float().t()
+    rel = float((out.float() - exact).pow(2).mean().sqrt() / exact.pow(2).mean().sqrt())
+    assert 0.05 < rel < 0.25, rel
+    # per-row scales keep every row at the 4-bit level (a per-tensor scale would crush the small rows): the relative
+    # error of the smallest-magnitude rows is no worse than that of the largest
+    rr = (out.float() - exact).pow(2).mean(1).sqrt() / exact.pow(2).mean(1).sqrt().clamp_min(1e-20)
+    mag = x.float().abs().amax(1)
+    small, large = rr[mag < mag.median()], rr[mag >= mag.median()]
+    assert float(small[torch.isfinite(small)].mean()) < 1.5 * float(large.mean())
+    # the second consumer's alphas (3 x) scale the output by 3
+    out3 = torch.empty_like(out)
+    assert f4.alpamayo15_nvfp4_gemm_bf16(xp.data_ptr(), xsf.data_ptr(), wp.data_ptr(), wsf.data_ptr(), out3.data_ptr(), M, N, K, tile,
+                                         ws.data_ptr(), ws.numel(), s, N, alpha[1].data_ptr(), 1) == 0
+    torch.cuda.synchronize()
+    assert bool(((out3.float() - 3 * out.float()).abs() <= 3 * out.float().abs() * 2 ** -7 + 1e-3).all())
+    # exactly representable operands times per-row powers of two
+    grid = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device="cuda")
+    def representable(rows, cols, row_pow):
+        g = grid[torch.randint(0, 8, (rows, cols), device="cuda")] * torch.where(torch.rand(rows, cols, device="cuda") < 0.5, -1.0, 1.0) * 0.125
+        g = g.view(rows, -1, 16)
+        g[:, :, 0] = 0.75
+        g = g * (2.0 ** (torch.arange(g.shape[1], device="cuda") % 5)).view(1, -1, 1)
+        if row_pow:
+            g = g * (2.0 ** (torch.arange(rows, device="cuda") % 4)).view(-1, 1, 1)
+        return g.view(rows, cols).to(BF16)
+    xg, wg = representable(M, K, True), representable(N, K, False)
+    wp, wsf, gsw = _nvfp4_weight(f4, wg, s)
+    assert f4.alpamayo15_nvfp4_quantize_rows_rowscale_bf16(xg.data_ptr(), K, M, K, xp.data_ptr(), xsf.data_ptr(), gsw.data_ptr(), 1,
+                                                            alpha.data_ptr(), ld_a, 0, s) == 0
+    assert f4.alpamayo15_nvfp4_gemm_bf16(xp.data_ptr(), xsf.data_ptr(), wp.data_ptr(), wsf.data_ptr(), out.data_ptr(), M, N, K, tile,
+                                         ws.data_ptr(), ws.numel(), s, N, alpha[0].data_ptr(), 1) == 0
+    torch.cuda.synchronize()
+    exact = xg.float() @ wg.float().t()
+    assert float((out != exact.to(BF16)).float().mean()) < 0.02 and bool(((out.float() - exact).abs() <= exact.abs() * 2 ** -7 + 2 ** -4).all())
+
+
+@pytest.mark.parametrize("rows,dim,with_delta", [(300, 4096, True), (129, 1024, False), (64, 12288, True)])
+def test_nvfp4_fused_producers_match_rowscale_quantizer(rows, dim, with_delta):
+    """RMSNorm -> NVFP4 rows and SiLU-mul -> NVFP4 rows give the rows, scales, alphas and residual of the separate
+    kernels followed by the per-row quantizer; the rowscale quantizer honours ld and rejects bad arguments."""
+    f4 = _fp4_module()
+    fvk = _kernels()
+    torch.manual_seed(37)
+    s = _stream()
+    gsw = torch.tensor([0.0123, 0.0456], device="cuda")
+    ld_a = (rows + 127) // 128 * 128
+    nb = int(f4.alpamayo15_nvfp4_sf_bytes(rows, dim))
+    mk = lambda: (torch.full((rows, dim // 2), 7, device="cuda", dtype=torch.uint8), torch.full((nb,), 9, device="cuda", dtype=torch.uint8),
+                  torch.zeros(2, ld_a, device="cuda"))
+    x = (torch.randn(rows, dim, device="cuda") * 1.5).to(BF16)
+    delta = (torch.randn(rows, dim, device="cuda") * 0.3).to(BF16) if with_delta else None
+    dp = delta.data_ptr() if with_delta else 0
+    w = (torch.rand(dim, device="cuda") + 0.5).to(BF16)
+    x_ref, x_fused = x.clone(), x.clone()
+    h = torch.empty_like(x)
+    fvk.alpamayo15_rms_bf16(x_ref.data_ptr(), dp, w.data_ptr(), h.data_ptr(), rows, dim, 1e-6, s)
+    p_ref, sf_ref, a_ref = mk()
+    gs_ref = torch.zeros(rows, device="cuda")
+    assert f4.alpamayo15_nvfp4_quantize_rows_rowscale_bf16(h.data_ptr(), dim, rows, dim, p_ref.data_ptr(), sf_ref.data_ptr(), gsw.data_ptr(), 2,
+                                                            a_ref.data_ptr(), ld_a, gs_ref.data_ptr(), s) == 0
+    p, sf, a = mk()
+    assert f4.alpamayo15_nvfp4_rms_rows_bf16(x_fused.data_ptr(), dp, w.data_ptr(), rows, dim, 1e-6, p.data_ptr(), sf.data_ptr(), gsw.data_ptr(), 2,
+                                             a.data_ptr(), ld_a, s) == 0
+    torch.cuda.synchronize()
+    assert torch.equal(x_fused, x_ref)                                       # the residual update is element-wise
+    # the fused producer accumulates the sum of squares over 4-channel vectors: the normalized row can differ in the
+    # last BF16 bit where the scale rounding differs, so the row maxima / alphas within one BF16 ulp and a few codes off
+    assert bool((torch.abs(a - a_ref) <= a_ref * 2 ** -7).all()) and bool((a[:, rows:] == 0).all())
+    assert float((p != p_ref).float().mean()) < 0.03 and float((sf != sf_ref).float().mean()) < 0.03
+    hd, _ = _nvfp4_emulate(h, per_row=True)
+
+    def deq(pk, sfb, gs):
+        """Dequantized rows and their block scales (per element) from the packed codes, the per-row gs and the scales
+        read through the SFA layout: 128-row x 4-block atoms ((32, 4), 4) : ((16, 4), 1), K-blocks of 4 tiled first,
+        then row blocks."""
+        lo = (pk & 15).int(); hi = (pk >> 4).int()
+        codes = torch.stack([lo, hi], -1).view(rows, dim)
+        grid = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0], device="cuda")
+        vals = grid[codes]
+        r = torch.arange(rows, device="cuda").view(-1, 1); bidx = torch.arange(dim // 16, device="cuda").view(1, -1)
+        nbk = (dim // 16 + 3) // 4
+        byte = (r // 128) * (512 * nbk) + (bidx // 4) * 512 + (r % 32) * 16 + ((r // 32) % 4) * 4 + (bidx % 4)
+        bs = sfb[byte].view(torch.float8_e4m3fn).float()
+        gs = gs.view(-1, 1)
+        scale = (bs * gs).unsqueeze(2).expand(rows, dim // 16, 16).reshape(rows, dim)
+        return (vals.view(rows, -1, 16) * (bs * gs).unsqueeze(2)).view(rows, dim), scale
+    d_ref, sc_ref = deq(p_ref, sf_ref, gs_ref)
+    # the separate path dequantized through the layout equals the emulation up to the kernel's midpoint rounding (a
+    # few per mille of the codes one e2m1 step off; the largest step, 4 -> 6, is two block-scale units)
+    assert float((d_ref != hd).float().mean()) < 0.01 and bool(((d_ref - hd).abs() <= sc_ref * 2.0 + 1e-6).all())
+    # the fused path (its gs recovered from the alphas, so compared with a tolerance): at most one e2m1 step (plus one
+    # e4m3 step of the block scale) away from the separate path, and a few per cent of the codes different
+    d_f, _ = deq(p, sf, a[0, :rows] / gsw[0])
+    assert bool(((d_f - d_ref).abs() <= sc_ref * 2.5 + 1e-6).all())
+    assert float(((d_f - d_ref).abs() > sc_ref * 0.01 + 1e-9).float().mean()) < 0.03
+    # SiLU-mul: identical inputs and arithmetic -> identical rows, scales and alphas
+    F = dim
+    g = (torch.randn(rows, F, device="cuda") * 2).to(BF16); u = (torch.randn(rows, F, device="cuda") * 2).to(BF16)
+    act = torch.empty_like(g)
+    fvk.alpamayo15_silu_mul_split_bf16(g.data_ptr(), u.data_ptr(), F, act.data_ptr(), rows, F, s)
+    assert f4.alpamayo15_nvfp4_quantize_rows_rowscale_bf16(act.data_ptr(), F, rows, F, p_ref.data_ptr(), sf_ref.data_ptr(), gsw.data_ptr(), 1,
+                                                            a_ref.data_ptr(), ld_a, 0, s) == 0
+    assert f4.alpamayo15_nvfp4_silu_mul_rows_bf16(g.data_ptr(), u.data_ptr(), F, rows, F, p.data_ptr(), sf.data_ptr(), gsw.data_ptr(), 1,
+                                                  a.data_ptr(), ld_a, s) == 0
+    torch.cuda.synchronize()
+    assert torch.equal(p, p_ref) and torch.equal(sf, sf_ref) and torch.equal(a[0], a_ref[0])
+    # the gate | up form of the engine (rows 2F apart) equals the split form
+    gu = torch.cat([g, u], 1)
+    assert f4.alpamayo15_nvfp4_silu_mul_rows_bf16(gu.data_ptr(), gu[:, F:].data_ptr(), 2 * F, rows, F, p.data_ptr(), sf.data_ptr(), gsw.data_ptr(), 1,
+                                                  a.data_ptr(), ld_a, s) == 0
+    torch.cuda.synchronize()
+    assert torch.equal(p, p_ref) and torch.equal(sf, sf_ref)
+    # a column block of a wider tensor (ld > K) quantizes the same rows
+    wide = torch.cat([act, torch.randn(rows, 64, device="cuda").to(BF16)], 1)
+    assert f4.alpamayo15_nvfp4_quantize_rows_rowscale_bf16(wide.data_ptr(), F + 64, rows, F, p.data_ptr(), sf.data_ptr(), gsw.data_ptr(), 1,
+                                                            a.data_ptr(), ld_a, 0, s) == 0
+    torch.cuda.synchronize()
+    assert torch.equal(p, p_ref) and torch.equal(sf, sf_ref)
+    # rejections: a row beyond the shared-memory bound, alphas without room for every row, an unaligned per-row alpha
+    assert f4.alpamayo15_nvfp4_quantize_rows_rowscale_bf16(act.data_ptr(), F, rows, 16384 + 16, p.data_ptr(), sf.data_ptr(), 0, 0, 0, 0, 0, s) == -2
+    assert f4.alpamayo15_nvfp4_rms_rows_bf16(x_fused.data_ptr(), 0, w.data_ptr(), rows, dim, 1e-6, p.data_ptr(), sf.data_ptr(), gsw.data_ptr(), 2,
+                                             a.data_ptr(), rows - 1, s) == -1
+    ws = torch.empty(16, device="cuda", dtype=torch.uint8)
+    assert f4.alpamayo15_nvfp4_gemm_bf16(p.data_ptr(), sf.data_ptr(), p.data_ptr(), sf.data_ptr(), act.data_ptr(), rows, 64, dim, 2,
+                                         ws.data_ptr(), ws.numel(), s, 0, a.data_ptr() + 4, 1) == 3
 
 
 @pytest.mark.parametrize("M,N,K,tile,ldd_extra", [(3086, 6144, 4096, 2, 0), (300, 4096, 12288, 2, 8), (257, 1024, 1024, 1, 0),
