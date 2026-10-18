@@ -421,8 +421,8 @@ steady windows of the same clip (the same windows for every row):
 | balanced + INT4 LM head | 849 / 773 (24 w.) | 141 | 294 | 20.8 | 126 | 34.8 |
 | balanced + INT4 LM head + NVFP4 prefill with per-tensor activation scales | 811 / 717 (24 w.) | 142 | 233 | 21.1 | 126 | 32.0 |
 | `preset="fast"` (the row above with per-row activation scales written by the fused NVFP4 producers) | 741 / 669 (24 w.) | 141 | 185 | 20.9 | 126 | 32.0 |
-| this engine, defaults (BF16), vision tile 256 x 256 (current default) | 1848 / 1555 (24 w.) | 122 | 547 | 66.5 | 211 | 22.3 |
-| `preset="fast"`, vision tile 256 x 256 (current default) | 726 / 651 (24 w.) | 121 | 186 | 21.2 | 126 | 32.0 |
+| this engine, defaults (BF16), vision tile 256 x 256 (current default; 117/117 tokens = the row above) | 1873 / 1872 (120 w.) | 121 | 541 | 66.6 | 212 | 22.3 |
+| `preset="fast"`, vision tile 256 x 256 (current default) | 725 / 653 (24 w.) | 121 | 189 | 20.9 | 126 | 32.0 |
 | `preset="balanced"`, `vision_gemm="cublaslt"` | 880 / 786 (24 w.) | 138 | 290 | 22.3 | 126 | 35.0 |
 | `preset="fast"`, `vision_gemm="cublaslt"` | 861 / 771 (24 w.) | 138 | 290 | 21.0 | 126 | 34.8 |
 
@@ -448,6 +448,29 @@ intervals over clips, paired differences are per (clip, window):
 | balanced + INT4 LM head | 952 [885, 1050] | 902 | 1071 | 1961 | 34.8 | 2.861 | -1208 [-1407, -1060] | -0.020 [-0.104, +0.038] | -0.006 [-0.057, +0.031] |
 | balanced + INT4 LM head + NVFP4 prefill with per-tensor activation scales | 884 [819, 974] | 836 | 1007 | 1762 | 32.0 | 2.859 | -1275 [-1485, -1128] | -0.022 [-0.090, +0.026] | -0.008 [-0.076, +0.054] |
 | `preset="fast"` (per-row activation scales, fused NVFP4 producers) | 837 [778, 916] | 790 | 963 | 1645 | 32.0 | 2.845 | -1323 [-1542, -1168] | -0.036 [-0.139, +0.036] | -0.022 [-0.100, +0.035] |
+
+Seeds 1 and 2 of the same nine clips (the request re-seeds every window with
+seed x 1000 + k, as the official example) for the official model, the default
+engine, `"balanced"` and `"fast"`; the paired differences are pooled over the
+three seeds (1719 windows, bootstrap over clips). Latency rows are the
+per-seed means; the fast rows of seeds 1 and 2 ran with the 256 x 128 vision
+tile (same outputs as the current tile).
+
+| Path | mean ms (seed 0 / 1 / 2) | ADE (seed 0 / 1 / 2) | pooled ADE vs official | pooled ADE vs default | pooled ADE vs balanced |
+|---|---|---|---|---|---|
+| Official Alpamayo 1.5 | 3320 / 3297 / 3349 | 2.867 / 2.872 / 2.795 | - | | |
+| this engine, defaults (BF16) | 2159 / 2085 / 2123 | 2.881 / 2.872 / 2.805 | +0.008 [-0.011, +0.042] | - | |
+| `preset="balanced"` | 966 / 962 / 973 | 2.824 / 2.901 / 2.805 | -0.001 [-0.052, +0.053] | -0.009 [-0.052, +0.025] | - |
+| `preset="fast"` | 837 / 846 / 841 | 2.845 / 2.873 / 2.761 | -0.019 [-0.080, +0.037] | -0.027 [-0.094, +0.038] | -0.017 [-0.080, +0.040] |
+
+Every pooled interval includes zero: on this evaluation the presets are
+indistinguishable from the official model and from each other in ADE (the
+seed-0 differences of the single-seed table are within that spread), while
+the interval width of about +-0.05 m is set by the nine clips, not by the
+number of windows. FDE pools the same way (fast -0.080 [-0.357, +0.151] vs
+official). The offline ADE of sampled trajectories is not a closed-loop
+driving metric; a deployment decision between the presets needs the
+downstream evaluation.
 
 The default engine generates the same tokens as the previous engine on 549 of
 573 requests; the INT8 decode tier on 532, the FP8 prefill tier on 531 and all
@@ -616,9 +639,10 @@ The vision tower's BF16 GEMMs run on a 2-SM 256 x 256 x 64 tcgen05 tile
 736 -> 551 us (166 TFLOPS), fc1 972 -> 708 (173), fc2 969 -> 816 (150), proj
 331 -> 337 (N = 1152 is 4.5 tiles wide); the outputs are identical to the
 256 x 128 tile's on every GEMM (the N tiling does not change the K reduction
-order), so the tokens and trajectories are unchanged. The tower drops from
-141 to 122 ms per request (the default engine 1869 -> 1848 ms on the author
-clip, `"fast"` 744 -> 726).
+order), so the tokens and trajectories are unchanged (117 of 117 windows of
+the default engine, 24 of 24 of `"fast"`, with identical trajectories). The
+tower drops from 141 to 121 ms per request (the default engine 1896 -> 1873
+ms over 120 windows of the author clip, `"fast"` 741 -> 725 over 24).
 
 `vision_gemm="cublaslt"` runs the vision blocks' fc1 on cuBLASLt: bias and
 GELU (tanh) fused into the cuBLASLt epilogue (one BF16 rounding), the
