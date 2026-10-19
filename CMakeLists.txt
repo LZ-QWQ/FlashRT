@@ -1760,6 +1760,8 @@ if(FLASHRT_ENABLE_ALPAMAYO15)
   target_compile_options(alpamayo15_fd_w4a8_obj PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr -O3 ${GPU_GENCODE}>
   )
+  # the GEMMs honour programmatic dependent launch (they wait for the previous kernel before reading their operands)
+  target_compile_definitions(alpamayo15_fd_w4a8_obj PRIVATE CUTLASS_ENABLE_GDC_FOR_SM100=1)
   # BF16 GEMMs (vision tower, action expert) on tcgen05 with fused bias / GELU / residual epilogues.
   add_library(alpamayo15_bf16_gemm_obj OBJECT csrc/gemm/alpamayo15_bf16_gemm_sm100.cu)
   set_target_properties(alpamayo15_bf16_gemm_obj PROPERTIES
@@ -1773,6 +1775,7 @@ if(FLASHRT_ENABLE_ALPAMAYO15)
   target_compile_options(alpamayo15_bf16_gemm_obj PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr -O3 ${GPU_GENCODE}>
   )
+  target_compile_definitions(alpamayo15_bf16_gemm_obj PRIVATE CUTLASS_ENABLE_GDC_FOR_SM100=1)
   target_sources(flash_rt_kernels PRIVATE csrc/kernels/alpamayo15_kernels.cu
                                          csrc/kernels/alpamayo15_request_kernels.cu
                                          csrc/gemm/alpamayo15_cublaslt.cu

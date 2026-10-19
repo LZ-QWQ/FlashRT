@@ -991,7 +991,8 @@ def test_draft_qkv_prep_matches_flashdrive_draft_attention():
 
 @pytest.mark.parametrize("backends", [
     dict(expert="flashrt", vision="flashrt", prefill="flashrt", decode="flashrt", w4a8="fused", pdl=False),
-], ids=["all_flashrt_pdl_off"])
+    dict(expert="flashrt", vision="flashrt", prefill="flashrt", decode="flashrt", w4a8="fused", pdl=True),
+], ids=["all_flashrt_pdl_off", "all_flashrt_pdl_on"])
 def test_backend_primitives_are_repeatable(backends):
     """Every FlashRT primitive, called twice on identical cache / RNG state, returns identical bits and writes identical
     cache rows (run-to-run reproducibility of the stream)."""
