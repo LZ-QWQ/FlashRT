@@ -104,6 +104,10 @@ ALPAMAYO15_KERNEL_SYMBOLS = (
     "alpamayo15_action_out_euler",
     "alpamayo15_euler_bf16",
     "alpamayo15_action_to_traj",
+    # cuBLASLt GEMMs (csrc/gemm/alpamayo15_cublaslt.cu), same build gate
+    "alpamayo15_cublaslt_init",
+    "alpamayo15_cublaslt_gemm_bf16",
+    "alpamayo15_cublaslt_gemm_fp8",
     # few-row BF16 GEMM shared with the streaming backend (csrc/kernels/alpamayo15_flashdrive_kernels.cu)
     "flashdrive_bf16_gemm_small",
     # tcgen05 GEMMs (csrc/gemm/alpamayo15_bf16_gemm_sm100.cu), same build gate
@@ -123,7 +127,10 @@ PREFILL_WEIGHTS = ("bf16", "fp8", "nvfp4")
 NVFP4_TILE = 2              # NVFP4 prefill GEMMs: 256 x 256 x 256 tiles on a 2-SM UMMA (500-575 TOPS on Thor)
 VISION_WEIGHTS = ("bf16", "fp8")
 LM_HEAD_WEIGHTS = ("decode", "int4")        # "decode" = the decode tier's format (INT8 with W4A8), "int4" = own INT4 linear
-PREFILL_FP8_TILE = 2        # FP8 prefill GEMMs: 256 x 128 x 128 tiles on a 2-SM UMMA
+PREFILL_FP8_TILE = 3        # FP8 prefill GEMMs: 256 x 256 x 128 tiles on a 2-SM UMMA (360-375 TOPS on Thor; 256 x 128: 250)
+# BF16 prefill projections (preset bf16): q|k|v and o on the 2-SM 256 x 256 tcgen05 tile, gate / up / down on cuBLASLt
+# (called from C++), whichever is faster at the prompt's shapes on Thor.
+BF16_PREFILL_CUBLASLT = "gu+down"   # projections ("+"-separated) on cuBLASLt; the others on the 256 x 256 tile
 PREFILL_DOWN_SPLIT = 4      # the K=12288 down projection as 4 column blocks (weight blocks that fit the L2: 1.47 vs 3.9 ms)
 # Named option sets. "balanced" (the default) is the validated reduced-precision configuration (needs paro_checkpoint;
 # neutral against the official model over three seeds of the nine-clip evaluation); "bf16" keeps the official weights
@@ -497,6 +504,7 @@ class Alpamayo15Thor:
         self._gemm = _Gemm(fvk)
         self.pdl = bool(pdl)
         fvk.alpamayo15_set_pdl(self.pdl)
+        fvk.alpamayo15_cublaslt_init()          # handle + workspace for the cuBLASLt GEMMs (outside any graph capture)
         self.max_seq = self.max_prompt + self.max_new + self.n_act
         self.scale = self.head_dim ** -0.5
 
@@ -580,9 +588,15 @@ class Alpamayo15Thor:
         if li < 0 and self.w.lm4 is not None:
             self.w.lm4(x, out, stream)
             return
-        if self.w.q8 is None:                     # BF16 weights read in place by the few-row tensor-core GEMM
-            self._fvk.flashdrive_bf16_gemm_small(x.data_ptr(), x.stride(0), w.data_ptr(), out.data_ptr(), out.stride(0), 0,
-                                                 x.shape[0], w.shape[0], w.shape[1], stream)
+        if self.w.q8 is None:                     # BF16 weights read in place
+            M, (N, K) = x.shape[0], w.shape
+            if x.stride(0) == K and (li >= 0 or M == 1):
+                # cuBLASLt's few-row kernels stream the projections at 230-250 GB/s on Thor (the LM head for one row too)
+                self._fvk.alpamayo15_cublaslt_gemm_bf16(x.data_ptr(), w.data_ptr(), 0, 0, out.data_ptr(), M, N, K, 0, out.stride(0), 0,
+                                                        stream)
+            else:                                 # the LM head over several rows: FlashRT's few-row tensor-core GEMM
+                self._fvk.flashdrive_bf16_gemm_small(x.data_ptr(), x.stride(0), w.data_ptr(), out.data_ptr(), out.stride(0), 0,
+                                                     M, N, K, stream)
             return
         if self.w.w4 is not None and li >= 0:
             # the GEMM prefetches the rotation tables of the group that runs next (o, gate|up, down, next layer's q|k|v)
@@ -687,7 +701,7 @@ class Alpamayo15Thor:
             f32 = lambda n: torch.empty(n, device=DEV, dtype=torch.float32)
             h8, h_s, o8, o_s, f18, f1_s = u8(S, Din), f32(S), u8(S, Din), f32(S), u8(S, Ffc), f32(S)
         blk_gemm = lambda A, W, D, bias=None, C=None, act=0: g(A, W, D, bias=bias, C=C, act=act, tile=T)
-        fc1_gemm = lambda A, W, D, bias: g(A, W, D, bias=bias, act=1, tile=T)
+        fc1_gemm = lambda A, W, D, bias: g(A, W, D, bias=bias, act=1, tile=T)   # faster in situ than cuBLASLt's GELU epilogue
         deep = []
         for li, blk in enumerate(V.blocks):
             a, m = blk.attn, blk.mlp
@@ -856,14 +870,22 @@ class Alpamayo15Thor:
                                                  self.eps, s)
 
         def lin(src, akey, w, wname, li, out, col0=0, quantized=False):
-            """``out = src @ w.T``: cuBLAS on the BF16 weight ``w``, or (W8A8 tier) per-row FP8 rows of ``src``
+            """``out = src @ w.T``: the BF16 weight ``w`` (tcgen05 or cuBLASLt), or (W8A8 tier) per-row FP8 rows of ``src``
             (buffers ``akey``, written by the producer when ``quantized``) times rows ``col0:`` of the FP8 copy
             ``wname`` of layer ``li``; the W4A4 tier always reads the producer's NVFP4 rows of ``akey``."""
             if p4 is not None:
                 nvfp4_lin(akey, wname, li, out, col0)
                 return
-            if p8 is None:                               # BF16 weights on the 2-SM 256 x 256 tcgen05 tile
-                self._gemm(src, w, out, tile=3)
+            if p8 is None:                               # BF16 weights: the faster of the 2-SM 256 x 256 tile and cuBLASLt
+                if wname not in BF16_PREFILL_CUBLASLT.split("+"):
+                    self._gemm(src, w, out, tile=3)
+                    return
+                N, K = out.shape[1], src.shape[1]
+                nb = PREFILL_DOWN_SPLIT if wname == "down" else 1    # down as column blocks whose weights fit the L2
+                Nb = N // nb
+                for j in range(nb):
+                    fvk.alpamayo15_cublaslt_gemm_bf16(src.data_ptr(), w[j * Nb:(j + 1) * Nb].data_ptr(), 0, 0, out[:, j * Nb:].data_ptr(),
+                                                      P, Nb, K, 0, out.stride(0), 0, s)
                 return
             q8, q_s = b[akey + "8"][:P], b[akey + "_s"][:P]
             if col0 == 0 and not quantized:
@@ -938,8 +960,8 @@ class Alpamayo15Thor:
         # sampling the first token from the INT8 head measured ADE +0.055 [+0.001, +0.161] on the nine clips.
         last, logits = b["last"], b["logits1"]
         fvk.alpamayo15_rms_bf16(x[P - 1:P].data_ptr(), 0, lm.norm.weight.data_ptr(), last.data_ptr(), 1, H, self.eps, s)
-        fvk.flashdrive_bf16_gemm_small(last.data_ptr(), H, self.vlm.lm_head.weight.data_ptr(), logits.data_ptr(), logits.shape[1], 0, 1,
-                                       logits.shape[1], H, s)
+        fvk.alpamayo15_cublaslt_gemm_bf16(last.data_ptr(), self.vlm.lm_head.weight.data_ptr(), 0, 0, logits.data_ptr(), 1,
+                                          logits.shape[1], H, 0, logits.shape[1], 0, s)
         return logits
 
     # ------------------------------------------------------------------

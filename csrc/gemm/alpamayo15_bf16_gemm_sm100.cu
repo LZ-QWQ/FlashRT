@@ -120,6 +120,7 @@ struct Fp8GemmDef {
 using F8G64 = Fp8GemmDef<Shape<_64, _128, _128>>;            // tile 1: few-row operands (action expert)
 using F8G128 = Fp8GemmDef<Shape<_128, _128, _128>>;          // tile 0
 using F8G256P = Fp8GemmDef<Shape<_256, _128, _128>, true>;   // tile 2: 2-SM UMMA, 2 x 1 cluster (prefill)
+using F8G256W = Fp8GemmDef<Shape<_256, _256, _128>, true>;   // tile 3: 2-SM UMMA, 256 x 256 (wide prefill outputs)
 using Tile256F8 = Shape<_256, _128, _128>;
 template <class T> using IdentityActF = cutlass::epilogue::thread::Identity<T>;
 template <class T> using GeluTanhActF = cutlass::epilogue::thread::GELU_taylor<T>;
@@ -163,6 +164,7 @@ struct Int8GemmDef {
 using I8G128 = Int8GemmDef<Shape<_128, _128, _128>>;
 using I8G64 = Int8GemmDef<Shape<_64, _128, _128>>;
 using I8G256P = Int8GemmDef<Shape<_256, _128, _128>, true>;   // 2-SM UMMA, 2 x 1 cluster
+using I8G256W = Int8GemmDef<Shape<_256, _256, _128>, true>;   // tile 3: 2-SM UMMA, 256 x 256
 
 template <class G>
 typename G::Gemm::Arguments make_int8_args(const void* A, const void* B, const float* a_s, const float* w_s, void* D,
@@ -375,11 +377,12 @@ int flashrt_a15_bf16_gemm_sm100_workspace(int M, int N, int K, int act, int tile
 
 // FP8 W8A8 GEMM (action expert tier): A [M, K] e4m3 row-major, B [N, K] e4m3 row-major, a_s [M] fp32, w_s [N] fp32,
 // D [M, N] bf16. K % 16 == 0, N % 8 == 0, 16-byte aligned operands.
-// tile 0 = 128 x 128 x 128, 1 = 64 x 128 x 128, 2 = 256 x 128 x 128 on a 2-SM UMMA; ldd = leading dimension of D
-// (>= N: a column block of a wider output).
+// tile 0 = 128 x 128 x 128, 1 = 64 x 128 x 128, 2 = 256 x 128 x 128 and 3 = 256 x 256 x 128 on a 2-SM UMMA;
+// ldd = leading dimension of D (>= N: a column block of a wider output).
 int flashrt_a15_fp8_gemm_sm100_workspace(int M, int N, int K, int tile, unsigned long long* workspace_bytes) {
-  if (M <= 0 || N <= 0 || K <= 0 || (N % kAlign) || (K % 16) || tile < 0 || tile > 2) return 2;
-  *workspace_bytes = tile == 2 ? F8G256P::Gemm::get_workspace_size(make_fp8_args<F8G256P>(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K, N))
+  if (M <= 0 || N <= 0 || K <= 0 || (N % kAlign) || (K % 16) || tile < 0 || tile > 3) return 2;
+  *workspace_bytes = tile == 3 ? F8G256W::Gemm::get_workspace_size(make_fp8_args<F8G256W>(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K, N))
+                   : tile == 2 ? F8G256P::Gemm::get_workspace_size(make_fp8_args<F8G256P>(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K, N))
                    : tile == 1 ? F8G64::Gemm::get_workspace_size(make_fp8_args<F8G64>(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K, N))
                    : F8G128::Gemm::get_workspace_size(make_fp8_args<F8G128>(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K, N));
   return 0;
@@ -410,19 +413,21 @@ int flashrt_a15_fp8_gemm_sm100(const void* A, const void* B, const float* a_s, c
                                int K, int tile, int ldd, void* workspace, unsigned long long workspace_bytes, int pdl,
                                cudaStream_t stream) {
   if (!A || !B || !a_s || !w_s || !D || (workspace_bytes && !workspace)) return 1;
-  if (M <= 0 || N <= 0 || K <= 0 || (N % kAlign) || (K % 16) || tile < 0 || tile > 2 || ldd < N || (ldd % kAlign)) return 2;
+  if (M <= 0 || N <= 0 || K <= 0 || (N % kAlign) || (K % 16) || tile < 0 || tile > 3 || ldd < N || (ldd % kAlign)) return 2;
   if (!aligned16(A) || !aligned16(B) || !aligned16(D) || !aligned16(a_s) || !aligned16(w_s)) return 5;
+  if (tile == 3) return run_fp8<F8G256W>(A, B, a_s, w_s, D, M, N, K, ldd, workspace, workspace_bytes, pdl, stream);
   if (tile == 2) return run_fp8<F8G256P>(A, B, a_s, w_s, D, M, N, K, ldd, workspace, workspace_bytes, pdl, stream);
   if (tile == 1) return run_fp8<F8G64>(A, B, a_s, w_s, D, M, N, K, ldd, workspace, workspace_bytes, pdl, stream);
   return run_fp8<F8G128>(A, B, a_s, w_s, D, M, N, K, ldd, workspace, workspace_bytes, pdl, stream);
 }
 
 // Per-channel INT8 GEMM (prefill tier): A [M, K] int8 row-major, B [N, K] int8 row-major, a_s [M] fp32, w_s [N] fp32,
-// D [M, N] fp16; tile 0 = 128 x 128 x 128, 1 = 64 x 128 x 128, 2 = 256 x 128 x 128 on a 2-SM UMMA (2 x 1 cluster).
-// K % 16 == 0, N % 8 == 0, 16-byte aligned operands.
+// D [M, N] fp16; tile 0 = 128 x 128 x 128, 1 = 64 x 128 x 128, 2 = 256 x 128 x 128 on a 2-SM UMMA (2 x 1 cluster),
+// 3 = 256 x 256 x 128 on a 2-SM UMMA. K % 16 == 0, N % 8 == 0, 16-byte aligned operands.
 int flashrt_a15_int8_gemm_sm100_workspace(int M, int N, int K, int tile, unsigned long long* workspace_bytes) {
-  if (M <= 0 || N <= 0 || K <= 0 || (N % kAlign) || (K % 16) || tile < 0 || tile > 2) return 2;
-  *workspace_bytes = tile == 2 ? I8G256P::Gemm::get_workspace_size(make_int8_args<I8G256P>(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K))
+  if (M <= 0 || N <= 0 || K <= 0 || (N % kAlign) || (K % 16) || tile < 0 || tile > 3) return 2;
+  *workspace_bytes = tile == 3 ? I8G256W::Gemm::get_workspace_size(make_int8_args<I8G256W>(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K))
+                   : tile == 2 ? I8G256P::Gemm::get_workspace_size(make_int8_args<I8G256P>(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K))
                    : tile == 1 ? I8G64::Gemm::get_workspace_size(make_int8_args<I8G64>(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K))
                                : I8G128::Gemm::get_workspace_size(make_int8_args<I8G128>(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K));
   return 0;
@@ -432,8 +437,9 @@ int flashrt_a15_int8_gemm_sm100(const void* A, const void* B, const float* a_s, 
                                 int K, int tile, void* workspace, unsigned long long workspace_bytes, int pdl,
                                 cudaStream_t stream) {
   if (!A || !B || !a_s || !w_s || !D || (workspace_bytes && !workspace)) return 1;
-  if (M <= 0 || N <= 0 || K <= 0 || (N % kAlign) || (K % 16) || tile < 0 || tile > 2) return 2;
+  if (M <= 0 || N <= 0 || K <= 0 || (N % kAlign) || (K % 16) || tile < 0 || tile > 3) return 2;
   if (!aligned16(A) || !aligned16(B) || !aligned16(D) || !aligned16(a_s) || !aligned16(w_s)) return 5;
+  if (tile == 3) return run_int8<I8G256W>(A, B, a_s, w_s, D, M, N, K, workspace, workspace_bytes, pdl, stream);
   if (tile == 2) return run_int8<I8G256P>(A, B, a_s, w_s, D, M, N, K, workspace, workspace_bytes, pdl, stream);
   return tile ? run_int8<I8G64>(A, B, a_s, w_s, D, M, N, K, workspace, workspace_bytes, pdl, stream)
               : run_int8<I8G128>(A, B, a_s, w_s, D, M, N, K, workspace, workspace_bytes, pdl, stream);

@@ -146,5 +146,19 @@ int alpamayo15_w4a8_gemm_grouped_q(int n_problems, const void* const* xr, const 
 // scale[row] = absmax / 127 (1 for an all-zero row). x rows ld_x elements apart (8-byte aligned); K % 4 == 0.
 int alpamayo15_quantize_int8_rows_bf16(const void* x, int ld_x, void* q, float* scale, int rows, int K, cudaStream_t stream);
 
+// cuBLASLt GEMMs called from C++ (csrc/gemm/alpamayo15_cublaslt.cu), row-major operands, 16-byte aligned:
+//   alpamayo15_cublaslt_gemm_bf16: D[M, N] = act(A[M, K] @ W[N, K]^T + bias[N]) + C[M, N] (act 0 identity, 1 GELU
+//     tanh; bias and C optional; D / C rows ldd / ldc elements apart, multiples of 8, and N % 8 == 0 unless M == 1),
+//     FP32 accumulation;
+//   alpamayo15_cublaslt_gemm_fp8: D[M, N] = bf16((A8 @ W8^T) * a_scale[0] * w_scale[0]) with e4m3 operands and
+//     per-tensor scales in device memory (K % 16 == 0, N % 16 == 0).
+// alpamayo15_cublaslt_init() creates the handle and the workspace (not inside graph capture); each shape's first call
+// must also happen outside capture (it selects and caches the algorithm).
+int alpamayo15_cublaslt_init();
+int alpamayo15_cublaslt_gemm_bf16(const void* A, const void* W, const void* bias, const void* C, void* D, int M, int N,
+                                  int K, int ldc, int ldd, int act, cudaStream_t stream);
+int alpamayo15_cublaslt_gemm_fp8(const void* A8, const void* W8, const float* a_scale, const float* w_scale, void* D, int M,
+                                 int N, int K, int ldd, cudaStream_t stream);
+
 }  // namespace kernels
 }  // namespace flash_rt

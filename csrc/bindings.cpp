@@ -5421,6 +5421,35 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         },
         py::arg("pos3"), py::arg("inv_freq"), py::arg("sec_h"), py::arg("sec_w"), py::arg("scaling"), py::arg("cos"), py::arg("sin"),
         py::arg("P"), py::arg("D"), py::arg("out_f32") = 0, py::arg("stream") = 0);
+    m.def("alpamayo15_cublaslt_init", []() {
+            const int rc = flash_rt::kernels::alpamayo15_cublaslt_init();
+            require_kernel(rc == 0, "alpamayo15_cublaslt_init", "cuBLASLt handle / workspace creation failed (rc=" + std::to_string(rc) + ")", "");
+        });
+    m.def("alpamayo15_cublaslt_gemm_bf16",
+        [](uintptr_t A, uintptr_t W, uintptr_t bias, uintptr_t C, uintptr_t D, int M, int N, int K, int ldc, int ldd, int act,
+           uintptr_t stream) {
+            const auto shape = kernel_shape({{"M", M}, {"N", N}, {"K", K}, {"ldc", ldc}, {"ldd", ldd}, {"act", act}});
+            require_kernel_ptrs("alpamayo15_cublaslt_gemm_bf16", {{"A", A}, {"W", W}, {"D", D}}, shape);
+            const int rc = flash_rt::kernels::alpamayo15_cublaslt_gemm_bf16(
+                reinterpret_cast<const void*>(A), reinterpret_cast<const void*>(W), reinterpret_cast<const void*>(bias),
+                reinterpret_cast<const void*>(C), reinterpret_cast<void*>(D), M, N, K, ldc, ldd, act, to_stream(stream));
+            require_kernel(rc == 0, "alpamayo15_cublaslt_gemm_bf16",
+                           "unsupported shape/alignment, uninitialized or failed cuBLASLt call (rc=" + std::to_string(rc) + ")", shape);
+        },
+        py::arg("A"), py::arg("W"), py::arg("bias"), py::arg("C"), py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("ldc"), py::arg("ldd"), py::arg("act") = 0, py::arg("stream") = 0);
+    m.def("alpamayo15_cublaslt_gemm_fp8",
+        [](uintptr_t A8, uintptr_t W8, uintptr_t a_scale, uintptr_t w_scale, uintptr_t D, int M, int N, int K, int ldd, uintptr_t stream) {
+            const auto shape = kernel_shape({{"M", M}, {"N", N}, {"K", K}, {"ldd", ldd}});
+            require_kernel_ptrs("alpamayo15_cublaslt_gemm_fp8", {{"A8", A8}, {"W8", W8}, {"a_scale", a_scale}, {"w_scale", w_scale}, {"D", D}}, shape);
+            const int rc = flash_rt::kernels::alpamayo15_cublaslt_gemm_fp8(
+                reinterpret_cast<const void*>(A8), reinterpret_cast<const void*>(W8), reinterpret_cast<const float*>(a_scale),
+                reinterpret_cast<const float*>(w_scale), reinterpret_cast<void*>(D), M, N, K, ldd > 0 ? ldd : N, to_stream(stream));
+            require_kernel(rc == 0, "alpamayo15_cublaslt_gemm_fp8",
+                           "unsupported shape/alignment, uninitialized or failed cuBLASLt call (rc=" + std::to_string(rc) + ")", shape);
+        },
+        py::arg("A8"), py::arg("W8"), py::arg("a_scale"), py::arg("w_scale"), py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("ldd") = 0, py::arg("stream") = 0);
     m.def("alpamayo15_sample_workspace_bytes", [](int n) { return flash_rt::kernels::alpamayo15_sample_workspace_bytes(n); }, py::arg("n"));
     m.def("alpamayo15_sample_tokens_bf16",
         [](uintptr_t logits, int ld, int n, int V, int mask_lo, int mask_n, float temperature, float top_p, int top_p_rule,

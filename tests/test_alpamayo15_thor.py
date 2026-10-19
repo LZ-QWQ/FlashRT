@@ -921,3 +921,67 @@ def test_action_expert_projection_kernels_match_official_modules():
     torch.cuda.synchronize()
     assert torch.allclose(xyz, xyz_ref, atol=2e-3, rtol=1e-4), float((xyz - xyz_ref).abs().max())
     assert torch.allclose(rot, rot_ref, atol=1e-4)
+
+
+@pytest.mark.parametrize("M,N,K", [(300, 384, 512), (3086, 1024, 4096), (802, 4096, 1024)])
+def test_wide_fp8_and_int8_tiles_equal_the_reference_tiles(M, N, K):
+    """The 2-SM 256 x 256 FP8 and INT8 tiles tile N differently but reduce K in the same order: identical outputs to
+    the 256 x 128 tiles, per-row / per-column scales included."""
+    fvk = _kernels()
+    s = _stream()
+    torch.manual_seed(3)
+    A8 = (torch.randn(M, K, device="cuda") * 2).to(torch.float8_e4m3fn).view(torch.uint8)
+    W8 = (torch.randn(N, K, device="cuda") * 2).to(torch.float8_e4m3fn).view(torch.uint8)
+    a_s = torch.rand(M, device="cuda") + 0.5; w_s = torch.rand(N, device="cuda") * 1e-2
+    outs = {}
+    for tile in (2, 3):
+        ws = torch.empty(max(int(fvk.alpamayo15_fp8_gemm_sm100_workspace(M, N, K, tile)), 16), dtype=torch.uint8, device="cuda")
+        D = torch.empty(M, N, device="cuda", dtype=BF16)
+        fvk.alpamayo15_fp8_gemm_sm100(A8.data_ptr(), W8.data_ptr(), a_s.data_ptr(), w_s.data_ptr(), D.data_ptr(), M, N, K, ws.data_ptr(),
+                                      ws.numel(), s, tile, N)
+        outs[tile] = D
+    torch.cuda.synchronize()
+    ref = (A8.view(torch.float8_e4m3fn).float() @ W8.view(torch.float8_e4m3fn).float().t()) * a_s[:, None] * w_s[None, :]
+    assert torch.equal(outs[3], outs[2])
+    assert float((outs[2].float() - ref).abs().max()) <= 2 ** -7 * float(ref.abs().max())
+    xq = torch.randint(-127, 128, (M, K), device="cuda", dtype=torch.int8)
+    wq = torch.randint(-127, 128, (N, K), device="cuda", dtype=torch.int8)
+    i_outs = {}
+    for tile in (2, 3):
+        ws = torch.empty(max(int(fvk.alpamayo15_int8_gemm_sm100_workspace(M, N, K, tile)), 16), dtype=torch.uint8, device="cuda")
+        D = torch.empty(M, N, device="cuda", dtype=torch.float16)
+        fvk.alpamayo15_int8_gemm_sm100(xq.data_ptr(), wq.data_ptr(), a_s.data_ptr(), w_s.data_ptr(), D.data_ptr(), M, N, K, tile,
+                                       ws.data_ptr(), ws.numel(), s)
+        i_outs[tile] = D
+    torch.cuda.synchronize()
+    assert torch.equal(i_outs[3], i_outs[2])
+
+
+def test_cublaslt_gemms_from_cpp():
+    """The C++ cuBLASLt paths: BF16 equals torch.mm up to accumulation order (column blocks of a wider output via ldd,
+    one row over an odd N as for the LM head); FP8 with device-side per-tensor scales equals the scaled product."""
+    fvk = _kernels()
+    s = _stream()
+    fvk.alpamayo15_cublaslt_init()
+    torch.manual_seed(4)
+    M, N, K = 300, 1024, 2048
+    A = torch.randn(M, K, device="cuda").to(BF16); W = (torch.randn(N, K, device="cuda") * 0.05).to(BF16)
+    D = torch.zeros(M, 2 * N, device="cuda", dtype=BF16)
+    fvk.alpamayo15_cublaslt_gemm_bf16(A.data_ptr(), W.data_ptr(), 0, 0, D[:, N:].data_ptr(), M, N, K, 0, 2 * N, 0, s)
+    torch.cuda.synchronize()
+    ref = (A.float() @ W.float().t())
+    assert float((D[:, N:].float() - ref).abs().max()) <= 2 ** -7 * float(ref.abs().max()) and not D[:, :N].any()
+    V = 1001                                            # one row over an odd N (the LM head of one token)
+    Wv = (torch.randn(V, K, device="cuda") * 0.05).to(BF16); y = torch.zeros(1, V, device="cuda", dtype=BF16)
+    fvk.alpamayo15_cublaslt_gemm_bf16(A[:1].data_ptr(), Wv.data_ptr(), 0, 0, y.data_ptr(), 1, V, K, 0, V, 0, s)
+    torch.cuda.synchronize()
+    refv = A[:1].float() @ Wv.float().t()
+    assert float((y.float() - refv).abs().max()) <= 2 ** -7 * float(refv.abs().max())
+    A8 = A.to(torch.float8_e4m3fn); W8 = (W * 8).to(torch.float8_e4m3fn)
+    sa = torch.tensor([0.5], device="cuda"); sw = torch.tensor([0.125], device="cuda")
+    D8 = torch.empty(M, N, device="cuda", dtype=BF16)
+    fvk.alpamayo15_cublaslt_gemm_fp8(A8.view(torch.uint8).data_ptr(), W8.view(torch.uint8).data_ptr(), sa.data_ptr(), sw.data_ptr(),
+                                     D8.data_ptr(), M, N, K, N, s)
+    torch.cuda.synchronize()
+    ref8 = (A8.float() @ W8.float().t()) * 0.5 * 0.125
+    assert float((D8.float() - ref8).abs().max()) <= 2 ** -7 * float(ref8.abs().max())

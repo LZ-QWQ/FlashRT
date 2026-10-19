@@ -89,7 +89,7 @@ EXPERT_WEIGHTS = ("bf16", "fp8")       # action expert projections (FP8 = W8A8 w
 W4A8_BACKENDS = ("flashdrive", "fused")
 ACT_ROTS = ("paro", "dense")
 TCGEN05_MIN_ROWS = 256      # rows of the construction-time check of the unpacked W4A8 layout against Marlin
-INT8_PREFILL_TILE = 2       # per-channel INT8 prefill GEMM: 256 x 128 x 128 on a 2-SM UMMA (0: 128 x 128, 1: 64 x 128; identical integers)
+INT8_PREFILL_TILE = 3       # per-channel INT8 prefill GEMM: 256 x 256 x 128 on a 2-SM UMMA (278-370 TOPS on Thor; 2: 256 x 128, 200-250; identical integers)
 SMALL_MAX_ROWS = 16         # ... and with at most this many (verification, trajectory start) on the few-row mma kernel
 
 
