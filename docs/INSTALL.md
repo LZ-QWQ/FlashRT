@@ -166,6 +166,61 @@ general `vla` / `llm` / `vlm` / `tts` / `video` profile system; it is a
 conservative opt-in compile-time reduction with tests covering the exported
 binding surface.
 
+### 6.3 Build time, FA2 slim flags and ccache
+
+#### Build time (one-time)
+
+On a 5090 with CUDA 13 in a warm container, `make -j$(nproc)`:
+
+| Target | Time |
+|---|---|
+| `flash_rt_kernels` (main kernels) | ~2 min |
+| `flash_rt_fa2` (FA2 vendor, default — 12 kernel .cu files × sm_80 + sm_120/sm_121 + Blackwell PTX fallback) | **~4.5 min** (267 s) |
+| Full `make -j$(nproc)` | ~6.5 min |
+
+Subsequent rebuilds of only the hand-written kernels take ~2 min —
+FA2 is a separate CMake target and is only re-linked, not recompiled,
+unless the vendored source itself changes.
+
+#### FA2 slim-build flags (developer iteration speed)
+
+FA2's CUTLASS 3.x templates dominate cold-build cost. The default
+matrix covers every RTX family card × fp16+bf16 × all 3 hdim
+buckets, which is right for distribution but overkill when you're
+iterating on a single 5090/4090 and a single model family. Three
+opt-in CMake flags trade binary coverage for iteration speed:
+
+| Flag | Default | What it does | `fa2` cold build on 5090 |
+|---|---|---|---|
+| — | (none) | 12 .cu × sm_80 + sm_120/sm_121 + Blackwell PTX fallback | **267 s (4.5 min)** |
+| `-DFA2_ARCH_NATIVE_ONLY=ON` | OFF | Only emit SASS for the detected GPU; skip sm_80 + PTX passes | **110 s** (−59%) |
+| `-DFA2_HDIMS="96;256"` | `"96;128;256"` | Drop `head_dim=128` (shipped models don't use it; reserved for future DiT variants) | **210 s** (−21%) |
+| `-DFA2_DTYPES="fp16"` | `"fp16;bf16"` | Drop bf16 (Pi0 is fp16-only; Pi0.5 / GROOT need bf16) | **179 s** (−33%) |
+| `-DFA2_ARCH_NATIVE_ONLY=ON -DFA2_HDIMS="96;256" -DFA2_DTYPES="fp16"` | — | All three combined (single-card + pi0-only) | **87 s** (−67%) |
+
+Shipped `flash_rt_fa2.so` size also shrinks — the all-three-slim
+build produces **17.8 MB** (vs 135 MB default), a **87% reduction**
+in binary size on the FA2 module.
+
+Dropped entries still resolve at the Python layer — calling a
+stubbed entry (e.g. `fa2.fwd_bf16` on a build with
+`FA2_DTYPES="fp16"`) aborts the process with a clear
+"rebuild with -DFA2_DTYPES=…" message instead of linker errors or
+silent wrong output.
+
+#### ccache (iterative C++ rebuild speedup)
+
+If `ccache` is on PATH at CMake-config time, it is enabled
+automatically for both C++ and CUDA compiles. First build is
+unchanged. Hit rate on the `.cpp` side (pybind bindings) is high,
+so repeat edits to `csrc/bindings.cpp` / `csrc/fa2_bindings.cpp` get
+fast rebuilds. CUDA .cu files — nvcc's invocation style makes
+`ccache` hit rate unreliable, so treat CUDA speedup as a bonus
+rather than a guarantee. Tip: set `CCACHE_DIR` to a host-mounted
+path so the cache survives container rebuilds.
+
+Install via `apt-get install ccache` (Ubuntu) or equivalent.
+
 ## 7. Verify
 
 ```bash
