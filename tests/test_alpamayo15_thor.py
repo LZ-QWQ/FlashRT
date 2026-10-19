@@ -985,3 +985,40 @@ def test_cublaslt_gemms_from_cpp():
     torch.cuda.synchronize()
     ref8 = (A8.float() @ W8.float().t()) * 0.5 * 0.125
     assert float((D8.float() - ref8).abs().max()) <= 2 ** -7 * float(ref8.abs().max())
+
+
+@pytest.mark.parametrize("rule", [0, 1])
+def test_sampler_tie_plateau_matches_multinomial_and_repeats(rule):
+    """More than 2048 tokens tie at the top-p threshold (a flat BF16 tail, as in long uncertain reasoning): the
+    sampler's index-order path must still return torch.multinomial's token and the same token on every repeat,
+    with the row split over several cooperating blocks."""
+    fvk = _kernels()
+    from flash_rt.models.alpamayo15.pipeline_thor import torch_philox_blocks, torch_rng_state
+    s = _stream()
+    gen = torch.cuda.default_generators[torch.cuda.current_device()]
+    blocks = torch_philox_blocks()
+    V, lo, n_mask, n = 155697, 151669, 4000, 8
+    scratch = torch.empty(n, V, device="cuda"); ws = torch.zeros(int(fvk.alpamayo15_sample_workspace_bytes(n)), dtype=torch.uint8, device="cuda")
+    filt = _hf_top_p_filter if rule == 0 else _fd_top_p_filter
+    torch.manual_seed(31 + rule)
+    logits = torch.full((n, V), -4.0, device="cuda")
+    logits[:, :40] = torch.randn(n, 40, device="cuda") + 6.0         # a few likely tokens
+    logits[:, 1000:9000] = 1.5                                         # 8000 tokens tied on a plateau
+    logits = logits.to(BF16)
+    probs = filt(logits, 0.98, lo, n_mask, 0.6)
+    rng = torch.zeros(3, dtype=torch.int64, device="cuda"); tok = torch.zeros(n, dtype=torch.long, device="cuda")
+    outs, mism = [], 0
+    for rep in range(200):
+        state = torch_rng_state(gen) if rep % 50 == 0 else state
+        if rep % 50 == 0:
+            ref = torch.multinomial(probs, 1).view(-1)
+        rng.copy_(state)
+        scratch.normal_()                                              # stale scratch content must not matter
+        fvk.alpamayo15_sample_tokens_bf16(logits.data_ptr(), V, n, V, lo, n_mask, 0.6, 0.98, rule, rng.data_ptr(), blocks,
+                                          scratch.data_ptr(), ws.data_ptr(), ws.numel(), tok.data_ptr(), 0, 0, 0, 0, 0, 0, s)
+        torch.cuda.synchronize()
+        if rep % 50 == 0:
+            mism += int((tok != ref).sum())
+            first = tok.clone()
+        assert torch.equal(tok, first), (rep, tok.tolist(), first.tolist())
+    assert mism <= 1, mism

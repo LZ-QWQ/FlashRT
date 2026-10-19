@@ -545,19 +545,21 @@ __global__ void __launch_bounds__(kSampleThreads) sample_tokens_kernel(SampleArg
     }
   } else {
     // more ties than the list holds: contiguous chunks in index order, ranks by scans of the chunks' tie counts
+    // (the chunks cover entries other blocks wrote: read them through L2)
     const int chunk = (V + G - 1) / G, i0 = min(V, g * chunk), i1 = min(V, i0 + chunk);
     int local_ties = 0;
-    for (int i = i0; i < i1; ++i) local_ties += (__float_as_uint(e[i]) == tau);
+    for (int i = i0; i < i1; ++i) local_ties += (__float_as_uint(__ldcg(&e[i])) == tau);
     unsigned long long block_ties;
     int tr = (int)block_exscan_u64((unsigned long long)local_ties, red_u, &block_ties);
     if (tid == 0) ws.tie_cnt[part] = (int)block_ties;
     barrier();
     for (int q = 0; q < part; ++q) tr += __ldcg(&ws.tie_cnt[q]);
     for (int i = i0; i < i1; ++i) {
-      const unsigned k = __float_as_uint(e[i]);
+      const float v = __ldcg(&e[i]);
+      const unsigned k = __float_as_uint(v);
       bool kept = k > tau || i == argmax_i;
       if (k == tau) kept = kept || rank_kept((unsigned long long)(tr++));
-      if (kept) draw(i, e[i]);
+      if (kept) draw(i, v);
     }
   }
   // block argmax of (best, besti): the larger ratio, the lower index among equal ratios; then the row's blocks
