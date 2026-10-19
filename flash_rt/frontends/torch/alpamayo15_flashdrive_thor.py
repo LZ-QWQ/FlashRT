@@ -69,7 +69,13 @@ def load_flashdrive(base: str, paro: str, dflash: str, *, torch_compile: str | N
     model.setup_streaming(extended_vision_ranges=extended)
     model.setup_paroquant(paro)
     model.setup_expert_fusion()
-    model.setup_dflash(dflash)
+    # DFlash grows the vocabulary by its mask token. The new embedding row comes from the draft checkpoint, but the
+    # LM head is not tied to the embeddings and keeps a randomly initialized row for that token, whose logit enters
+    # every softmax of the stream. Drawing it from a fixed seed (the caller's generators untouched) makes every process
+    # load the same model, so streams are reproducible across processes.
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+        torch.manual_seed(0)
+        model.setup_dflash(dflash)
     return model
 
 

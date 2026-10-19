@@ -102,7 +102,11 @@ def run(args):
     elif args.arm == "flashdrive":
         import flashdrive
         from flashdrive.streaming import convert_to_streaming_window
-        model = flashdrive.from_pretrained(args.base, torch_compile="max-autotune")
+        # FlashDrive's loader leaves the LM head row of its added mask token at a random initialization: a fixed seed
+        # makes the reference the same model in every process (the caller's generators untouched)
+        with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+            torch.manual_seed(0)
+            model = flashdrive.from_pretrained(args.base, torch_compile="max-autotune")
         from flashdrive import FlashDriveMixin
         if not isinstance(model, FlashDriveMixin):
             raise ValueError("author loader needs a z-lab repo ID; use its pinned offline HF cache")
