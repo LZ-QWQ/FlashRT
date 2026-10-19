@@ -254,6 +254,9 @@ __device__ __forceinline__ unsigned long long mass_of(float e, float scale) { re
 
 // Workspace of one row shared by its P cooperating blocks (all co-resident; the row's blocks meet at a counter barrier
 // after every pass and read each other's partial results in a fixed order, so the result does not depend on timing).
+// Every field is written once per launch and read by other SMs only through L2 (__ldcg): an SM's L1 is not coherent
+// with the other SMs' writes, so a re-read of an address it had cached could return a stale line. The four radix
+// passes therefore use four histogram buffers instead of reusing two.
 constexpr int kSampleMaxParts = 8;        // blocks per row
 constexpr int kSampleTieCap = 2048;       // ties at the threshold handled by rank (more fall back to the index-order path)
 struct SampleRowWs {
@@ -263,7 +266,7 @@ struct SampleRowWs {
   float best[kSampleMaxParts]; int besti[kSampleMaxParts];
   int tie_cnt[kSampleMaxParts];           // index-order fallback: ties per block
   int tie_idx[kSampleTieCap];
-  unsigned long long hist[2][kSampleMaxParts][256];
+  unsigned long long hist[4][kSampleMaxParts][256];
 };
 
 __device__ __forceinline__ void row_barrier(unsigned* ctr, unsigned target) {
@@ -348,7 +351,7 @@ __global__ void __launch_bounds__(kSampleThreads) sample_tokens_kernel(SampleArg
   barrier();
   float M = -INFINITY; int argmax_i = V;
   for (int q = 0; q < P; ++q) {                             // the row's maximum and its lowest index, in a fixed order
-    const float m = ws.fmax[q]; const int im = ws.imax[q];
+    const float m = __ldcg(&ws.fmax[q]); const int im = __ldcg(&ws.imax[q]);
     if (m > M || (m == M && im < argmax_i)) { M = m; argmax_i = im; }
   }
   if (a.temperature <= 0.0f) {
@@ -380,7 +383,7 @@ __global__ void __launch_bounds__(kSampleThreads) sample_tokens_kernel(SampleArg
   if (tid == 0) ws.fsum[part] = Sb;
   barrier();
   float S = 0.0f;
-  for (int q = 0; q < P; ++q) S += ws.fsum[q];
+  for (int q = 0; q < P; ++q) S += __ldcg(&ws.fsum[q]);
   const float mscale = __fdiv_rn(4611686018427387904.0f, S);           // S >= 1: the maximum's e is 1
   // rule 0: drop tokens whose ascending cumulative mass (incl. themselves) <= T, T = (1 - top_p) * total
   // rule 1: drop tokens whose descending cumulative mass before them > top_p, i.e. ascending cumulative < T,
@@ -412,7 +415,7 @@ __global__ void __launch_bounds__(kSampleThreads) sample_tokens_kernel(SampleArg
       }
     }
     __syncthreads();
-    unsigned long long* part_hist = ws.hist[d & 1][part];
+    unsigned long long* part_hist = ws.hist[d][part];
     for (int b = tid; b < 256; b += nt) {                   // the warps' bins summed, this block's partial published
       unsigned long long t = 0ull;
       for (int w = 0; w < nw; ++w) t += hist_w[w * 256 + b];
@@ -421,7 +424,7 @@ __global__ void __launch_bounds__(kSampleThreads) sample_tokens_kernel(SampleArg
     barrier();
     for (int b = tid; b < 256; b += nt) {                   // the row's bins: the blocks' partials in a fixed order
       unsigned long long t = 0ull;
-      for (int q = 0; q < P; ++q) t += ws.hist[d & 1][q][b];
+      for (int q = 0; q < P; ++q) t += __ldcg(&ws.hist[d][q][b]);
       hist_w[b] = t;
     }
     __syncthreads();
@@ -462,7 +465,7 @@ __global__ void __launch_bounds__(kSampleThreads) sample_tokens_kernel(SampleArg
   const float ab = block_sum_f(s_above, red_f);
   if (tid == 0) ws.fabove[part] = ab;
   barrier();
-  const int tie_total = (int)ws.tie_n;
+  const int tie_total = (int)__ldcg(&ws.tie_n);
   unsigned long long k_rem = 0ull;                          // ties removed (rule 0: the lowest indices, rule 1: the highest)
   if (tie_q > 0ull) {
     const unsigned long long room = T > below ? T - below : 0ull;
@@ -473,7 +476,7 @@ __global__ void __launch_bounds__(kSampleThreads) sample_tokens_kernel(SampleArg
   const bool ranked = tie_total <= kSampleTieCap;
   if (ranked) {                                             // the tie indices sorted ascending (bitonic, in every block)
     int n2 = 1; while (n2 < tie_total) n2 <<= 1;
-    for (int i = tid; i < n2; i += nt) tie_idx[i] = i < tie_total ? ws.tie_idx[i] : 0x7FFFFFFF;
+    for (int i = tid; i < n2; i += nt) tie_idx[i] = i < tie_total ? __ldcg(&ws.tie_idx[i]) : 0x7FFFFFFF;
     __syncthreads();
     if (tie_total > 1)
       for (int size = 2; size <= n2; size <<= 1)
@@ -501,7 +504,7 @@ __global__ void __launch_bounds__(kSampleThreads) sample_tokens_kernel(SampleArg
   float Sn = S;
   if (a.rule == 0) {                                        // the kept sum: tokens above tau plus the kept ties (equal values)
     Sn = 0.0f;
-    for (int q = 0; q < P; ++q) Sn += ws.fabove[q];
+    for (int q = 0; q < P; ++q) Sn += __ldcg(&ws.fabove[q]);
     Sn += (float)((unsigned long long)tie_total - k_rem) * __uint_as_float(tau);
   }
   // --- the draw: torch.multinomial(probs, 1) == argmax_i probs_i / q_i with q_i ~ Exp(1) drawn as torch's
@@ -549,7 +552,7 @@ __global__ void __launch_bounds__(kSampleThreads) sample_tokens_kernel(SampleArg
     int tr = (int)block_exscan_u64((unsigned long long)local_ties, red_u, &block_ties);
     if (tid == 0) ws.tie_cnt[part] = (int)block_ties;
     barrier();
-    for (int q = 0; q < part; ++q) tr += ws.tie_cnt[q];
+    for (int q = 0; q < part; ++q) tr += __ldcg(&ws.tie_cnt[q]);
     for (int i = i0; i < i1; ++i) {
       const unsigned k = __float_as_uint(e[i]);
       bool kept = k > tau || i == argmax_i;
@@ -580,7 +583,7 @@ __global__ void __launch_bounds__(kSampleThreads) sample_tokens_kernel(SampleArg
     if (part == 0) {
       float bv = -1.0f; int bi = V;
       for (int q = 0; q < P; ++q) {
-        const float ob = ws.best[q]; const int oi = ws.besti[q];
+        const float ob = __ldcg(&ws.best[q]); const int oi = __ldcg(&ws.besti[q]);
         if (ob > bv || (ob == bv && oi < bi)) { bv = ob; bi = oi; }
       }
       sample_finish(a, row, (int)(gridDim.x / P), (long long)bi, rng_inc);
