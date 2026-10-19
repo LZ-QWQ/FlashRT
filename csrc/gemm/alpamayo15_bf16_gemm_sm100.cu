@@ -4,7 +4,7 @@
 // accumulation, BF16 operands and output. A [M, K] row-major, B = weight [N, K] row-major (nn.Linear layout),
 // bias [N] (optional), C [M, N] row-major residual (optional, added after the activation; identity only),
 // D [M, N] row-major.
-//   act: 0 identity, 1 GELU (tanh approximation, gelu_pytorch_tanh), 2 GELU (erf)
+//   act: 0 identity, 1 GELU (tanh approximation, gelu_pytorch_tanh), 2 GELU (erf), 3 SiLU (tile 1 only)
 //   tile: 0 = 128 x 128 x 64 per SM, 2 = 256 x 128 x 64 and 3 = 256 x 256 x 64 on a 2-SM UMMA (2 x 1 cluster; the
 //         vision tower: every activation / residual form), 1 = 64 x 128 x 64 (few-row operands such as the action
 //         expert; identity, no residual)
@@ -220,6 +220,7 @@ typename G::Gemm::Arguments make_fp8_args(const void* A, const void* B, const fl
 }
 
 template <class T> using IdentityAct = cutlass::epilogue::thread::Identity<T>;
+template <class T> using SiluAct = cutlass::epilogue::thread::SiLu<T>;
 template <class T> using GeluTanhAct = cutlass::epilogue::thread::GELU_taylor<T>;
 template <class T> using GeluErfAct = cutlass::epilogue::thread::GELU<T>;
 
@@ -233,6 +234,7 @@ using G128Tanh = GemmDef<Tile128, NoResTree<Tile128, GeluTanhAct>>;
 using G128Erf = GemmDef<Tile128, NoResTree<Tile128, GeluErfAct>>;
 using G128Res = GemmDef<Tile128, ResTree<Tile128>>;
 using G64Id = GemmDef<Tile64, NoResTree<Tile64, IdentityAct>>;
+using G64Silu = GemmDef<Tile64, NoResTree<Tile64, SiluAct>>;                 // tile 1, act 3: the expert's input MLP
 using G256Id = GemmDef<Tile256, NoResTree<Tile256, IdentityAct>, true>;      // 2-SM UMMA, 2 x 1 cluster
 using G256Tanh = GemmDef<Tile256, NoResTree<Tile256, GeluTanhAct>, true>;
 using G256Erf = GemmDef<Tile256, NoResTree<Tile256, GeluErfAct>, true>;
@@ -335,9 +337,10 @@ int run_fp8(const void* A, const void* B, const float* a_s, const float* w_s, vo
 bool aligned16(const void* p) { return (reinterpret_cast<uintptr_t>(p) & 15u) == 0; }
 
 int check(int M, int N, int K, int act, int tile, bool res) {
-  if (M <= 0 || N <= 0 || K <= 0 || (N % kAlign) || (K % kAlign) || act < 0 || act > 2 || tile < 0 || tile > 3) return 2;
+  if (M <= 0 || N <= 0 || K <= 0 || (N % kAlign) || (K % kAlign) || act < 0 || act > 3 || tile < 0 || tile > 3) return 2;
   if (res && act != 0) return 2;
-  if (tile == 1 && (act != 0 || res)) return 2;
+  if (tile == 1 && ((act != 0 && act != 3) || res)) return 2;
+  if (act == 3 && tile != 1) return 2;
   return 0;
 }
 
@@ -363,7 +366,7 @@ int flashrt_a15_bf16_gemm_sm100_workspace(int M, int N, int K, int act, int tile
     return 0;
   }
   if (residual) *workspace_bytes = ws_size<G128Res, true>(M, N, K);
-  else if (tile == 1) *workspace_bytes = ws_size<G64Id, false>(M, N, K);
+  else if (tile == 1) *workspace_bytes = act == 3 ? ws_size<G64Silu, false>(M, N, K) : ws_size<G64Id, false>(M, N, K);
   else if (act == 0) *workspace_bytes = ws_size<G128Id, false>(M, N, K);
   else if (act == 1) *workspace_bytes = ws_size<G128Tanh, false>(M, N, K);
   else *workspace_bytes = ws_size<G128Erf, false>(M, N, K);
@@ -455,7 +458,10 @@ int flashrt_a15_bf16_gemm_sm100(const void* A, const void* B, const void* bias, 
     return run<G256Erf, false>(A, B, bias, nullptr, D, M, N, K, workspace, workspace_bytes, pdl, stream);
   }
   if (C) return run<G128Res, true>(A, B, bias, C, D, M, N, K, workspace, workspace_bytes, pdl, stream);
-  if (tile == 1) return run<G64Id, false>(A, B, bias, nullptr, D, M, N, K, workspace, workspace_bytes, pdl, stream);
+  if (tile == 1) {
+    if (act == 3) return run<G64Silu, false>(A, B, bias, nullptr, D, M, N, K, workspace, workspace_bytes, pdl, stream);
+    return run<G64Id, false>(A, B, bias, nullptr, D, M, N, K, workspace, workspace_bytes, pdl, stream);
+  }
   if (act == 0) return run<G128Id, false>(A, B, bias, nullptr, D, M, N, K, workspace, workspace_bytes, pdl, stream);
   if (act == 1) return run<G128Tanh, false>(A, B, bias, nullptr, D, M, N, K, workspace, workspace_bytes, pdl, stream);
   return run<G128Erf, false>(A, B, bias, nullptr, D, M, N, K, workspace, workspace_bytes, pdl, stream);

@@ -479,7 +479,7 @@ def test_bank_ordered_pair_tables_keep_the_rotation(K):
     """paro_pair_bank_order permutes the pairs of every (layer, group) only; the preparation on the reordered tables is
     bitwise that on the original ones, and each quarter-warp's eight first channels hit eight distinct bank groups
     whenever a residue class has at most eight members."""
-    from flash_rt.models.alpamayo15_flashdrive.pipeline_thor import paro_pair_bank_order
+    from flash_rt.models.alpamayo15_flashdrive.weights import paro_pair_bank_order
     fvk = _kernels()
     torch.manual_seed(31)
     theta = (torch.randn(8, K // 2, device="cuda") * 2).to(torch.float16)
@@ -562,6 +562,7 @@ def test_fa4_call_patterns_match_flashdrive_masks():
     S, Hq, Hk, D = 96, 32, 8, 128
     eng = SimpleNamespace(_fa4=fa4, n_heads=Hq, head_dim=D, scale=D ** -0.5,
                           _v_view=lambda st, li: st["v"][li].permute(0, 2, 1, 3))
+    eng._attend_runs = lambda *args: FlashDriveThor._attend_runs(eng, *args)
     kvlm = torch.randn(1, S, Hk, D, device="cuda").to(BF16)                      # rotated keys [S, Hk, D]
     v = torch.randn(1, Hk, S, D, device="cuda").to(BF16)                         # FlashDrive's value cache
     st = {"kvlm": kvlm, "v": [v], "S": S, "keep": {}}
@@ -631,7 +632,7 @@ def test_w4a8_int8_gemm_is_exact_and_matches_marlin(M, N, K):
     from vllm.model_executor.layers.quantization.utils.marlin_utils import (
         marlin_make_empty_g_idx, marlin_make_workspace_new)
     from vllm.scalar_type import scalar_types
-    from flash_rt.models.alpamayo15_flashdrive.pipeline_thor import marlin_w4a8_to_int8
+    from flash_rt.models.alpamayo15_flashdrive.weights import marlin_w4a8_to_int8
     w, z, s, qweight, scales, qzeros = _marlin_w4a8_buffers(K, N, seed=15)
     w8, sg = marlin_w4a8_to_int8(qweight, scales, qzeros, K, N)
     wd = w - z.repeat_interleave(128, 0)                                       # [K, N]
@@ -690,7 +691,7 @@ def test_w4a8_small_gemm_is_exact(M, N, K):
     """The few-row W4A8 GEMM computes Marlin's integers exactly (float64 reference) and agrees with the tcgen05
     kernel (checked against Marlin itself in the previous test) on the same activations."""
     fvk = _kernels()
-    from flash_rt.models.alpamayo15_flashdrive.pipeline_thor import pack_w4a8_small
+    from flash_rt.models.alpamayo15.marlin_w4a8 import pack_w4a8_small
     torch.manual_seed(17)
     G = K // 128
     w = torch.randint(0, 16, (K, N), device="cuda", dtype=torch.uint8)
@@ -735,7 +736,7 @@ def test_w4a8_small_gemm_is_exact(M, N, K):
 
 def test_pack_w4a8_small_layout():
     """Lane fragments: lane 4g+t, byte 4(2 half + rh) + j = w[16T + 8rh + g, 64C + 32ks + 16half + 4t + j], ks in the nibble."""
-    from flash_rt.models.alpamayo15_flashdrive.pipeline_thor import pack_w4a8_small
+    from flash_rt.models.alpamayo15.marlin_w4a8 import pack_w4a8_small
     K, N = 256, 32
     w = torch.randint(0, 16, (K, N), dtype=torch.uint8)
     p = pack_w4a8_small(w, K, N)
@@ -756,7 +757,7 @@ def test_int8_channel_gemm_and_requantization_match_reference(M, N, K, tile):
     """The per-channel INT8 prefill GEMM reproduces half(float(xq @ codes.T) * a_s[m] * c[n]) (int32 accumulation);
     w4a8_to_int8_channel keeps every channel's absmax at 127 and the integer weights within half a step."""
     fvk = _kernels()
-    from flash_rt.models.alpamayo15_flashdrive.pipeline_thor import w4a8_to_int8_channel
+    from flash_rt.models.alpamayo15_flashdrive.weights import w4a8_to_int8_channel
     torch.manual_seed(37)
     w8 = torch.randint(-15, 16, (N, K), device="cuda", dtype=torch.int8)
     s = torch.randint(1, 4097, (K // 128, N), device="cuda", dtype=torch.int32)
@@ -809,7 +810,9 @@ def test_new_kernels_are_bitwise_repeatable():
     """Every new kernel of the backend returns identical bits on a second call with identical inputs (fixed
     reduction orders, no races)."""
     fvk = _kernels()
-    from flash_rt.models.alpamayo15_flashdrive.pipeline_thor import _Gemm, bf16_fragment_layout, pack_w4a8_small
+    from flash_rt.models.alpamayo15.marlin_w4a8 import pack_w4a8_small
+    from flash_rt.models.alpamayo15.pipeline_thor import _Gemm
+    from flash_rt.models.alpamayo15_flashdrive.weights import bf16_fragment_layout
     torch.manual_seed(27)
     s_ = torch.cuda.current_stream().cuda_stream
     runs = []
@@ -864,7 +867,7 @@ def test_dense_rotation_matches_exact_rotation_and_paro_codes(rows, K):
     """The dense rotation equals the exact (float64) 8-layer rotation of the scaled FP16 input within FP16 GEMM
     error, and its INT8 codes agree with the layer-by-layer kernel on all but near-rounding elements."""
     fvk = _kernels()
-    from flash_rt.models.alpamayo15_flashdrive.pipeline_thor import paro_rotation_matrices
+    from flash_rt.models.alpamayo15_flashdrive.weights import paro_rotation_matrices
     torch.manual_seed(21)
     x = (torch.randn(rows, K, device="cuda") * 3).to(BF16)
     sets = []
@@ -929,7 +932,7 @@ def test_bf16_small_gemm_matches_float64(M, N, K, f32):
                                    torch.cuda.current_stream().cuda_stream)
     torch.cuda.synchronize()
     assert torch.equal(y2, y.contiguous())
-    from flash_rt.models.alpamayo15_flashdrive.pipeline_thor import bf16_fragment_layout
+    from flash_rt.models.alpamayo15_flashdrive.weights import bf16_fragment_layout
     frag = bf16_fragment_layout(w)
     y3 = torch.empty_like(y2)
     fvk.flashdrive_bf16_gemm_frag(x.data_ptr(), x.stride(0), frag.data_ptr(), y3.data_ptr(), N, f32, M, N, K,
@@ -995,7 +998,7 @@ def test_backend_primitives_are_repeatable(backends):
     _kernels()
     from alpamayo1_5 import helper
     from flashdrive.streaming import convert_to_streaming_window
-    from flash_rt.models.alpamayo15_flashdrive.pipeline_thor import load_flashdrive
+    from flash_rt.frontends.torch.alpamayo15_flashdrive_thor import load_flashdrive
 
     torch.set_float32_matmul_precision("high")
     root = _CKPT
@@ -1066,14 +1069,13 @@ def test_backend_primitives_are_repeatable(backends):
 
 @pytest.mark.parametrize("backends", [
     dict(expert="flashrt", vision="flashrt", prefill="flashrt", decode="flashrt", w4a8="fused"),
-    dict(expert="flashrt", vision="flashrt", prefill="flashrt", decode="flashrt", w4a8="fused", w4a8_gemm="marlin"),
     dict(expert="flashdrive", vision="flashdrive", prefill="flashrt", decode="flashrt", w4a8="flashdrive"),
-], ids=["all_flashrt", "all_flashrt_marlin", "mixed"])
+], ids=["all_flashrt", "mixed"])
 def test_backend_primitives_match_flashdrive_on_identical_state(backends):
     _kernels()
     from alpamayo1_5 import helper
     from flashdrive.streaming import convert_to_streaming_window
-    from flash_rt.models.alpamayo15_flashdrive.pipeline_thor import load_flashdrive
+    from flash_rt.frontends.torch.alpamayo15_flashdrive_thor import load_flashdrive
 
     torch.set_float32_matmul_precision("high")
     root = _CKPT
@@ -1108,8 +1110,12 @@ def test_backend_primitives_match_flashdrive_on_identical_state(backends):
             return [o.detach().clone()]
         return [t for x in (o or []) for t in tensors(x)] if isinstance(o, (list, tuple)) else []
 
+    cos = lambda a, b: float(torch.nn.functional.cosine_similarity(a.float().flatten(), b.float().flatten(), dim=0))
+
     def wrap(n):
         def f(*a, **k):
+            # Every comparison is reduced to scalars inside the call: three full cache snapshots per call would exhaust
+            # Thor's unified memory over the windows of two streams.
             pre, rng = snap(), gen.get_state()
             out = ref[n](*a, **k)                       # FlashDrive (kvlm is not touched: still the rotation of pre)
             r_out, post, rng_ref = tensors(out), snap(), gen.get_state()
@@ -1118,8 +1124,29 @@ def test_backend_primitives_match_flashdrive_on_identical_state(backends):
             gen.set_state(rng)
             f_out = tensors(frt[n](*a, **k))
             invariant = kvlm_is_rotated_cache()          # every FlashRT write keeps the rotated copy exact
-            seen[n].append((r_out, f_out, pre, post, snap(), torch.equal(gen.get_state(), rng_ref), invariant))
+            post_f = snap()
+            rec = {"rng_eq": torch.equal(gen.get_state(), rng_ref), "invariant": invariant, "out_cos": 1.0, "cache_ok": True,
+                   "proposal_eq": None}
+            if n == "_dflash_block_step":
+                rec["proposal_eq"] = torch.equal(r_out[0], f_out[0])
+            if rec["proposal_eq"] is not False:      # a round whose greedy proposals differ has no comparable context
+                for x, y in zip(r_out, f_out):
+                    if x.dtype in (torch.long, torch.int32):
+                        continue
+                    rec["out_cos"] = min(rec["out_cos"], cos(x, y))
+            if post is not None:
+                for li, ((kr, vr), (kf, vf)) in enumerate(zip(post, post_f)):
+                    if n == "_shift_streaming_kv_cache":
+                        rec["cache_ok"] &= torch.equal(kr, kf) and torch.equal(vr, vf)
+                        continue
+                    if pre is None:
+                        continue
+                    rows = ((kr != pre[li][0]) | (kf != pre[li][0])).any(dim=(0, 1, 3))    # rows either side wrote
+                    if rows.any():
+                        rec["cache_ok"] &= cos(kr[:, :, rows], kf[:, :, rows]) > 0.99 and cos(vr[:, :, rows], vf[:, :, rows]) > 0.99
+            seen[n].append(rec)
             restore(post); gen.set_state(rng_ref)
+            del pre, post_f
             eng._sync_kvlm_all(eng._stream())            # continue from FlashDrive's state
             return out
         return f
@@ -1146,25 +1173,15 @@ def test_backend_primitives_match_flashdrive_on_identical_state(backends):
     stream(4)
     eng.reset()                          # an unrelated second stream: FlashDrive's state and the stream graphs rebuilt
     stream(2)
-    cos = lambda a, b: float(torch.nn.functional.cosine_similarity(a.float().flatten(), b.float().flatten(), dim=0))
     for n in frt:
         assert seen[n], f"{n} was not exercised"
-        for r_out, f_out, pre, post_r, post_f, rng_eq, invariant in seen[n]:
-            assert rng_eq, f"{n}: random-number consumption differs from FlashDrive"
-            assert invariant, f"{n}: rotated cache copy is stale"
-            for a, b in zip(r_out, f_out):
-                if a.dtype in (torch.long, torch.int32):
-                    continue
-                assert cos(a, b) > 0.995, n
-            for li, ((kr, vr), (kf, vf)) in enumerate(zip(post_r, post_f)):
-                if n == "_shift_streaming_kv_cache":
-                    assert torch.equal(kr, kf) and torch.equal(vr, vf)
-                    continue
-                if pre is None:
-                    continue
-                rows = ((kr != pre[li][0]) | (kf != pre[li][0])).any(dim=(0, 1, 3))    # rows either side wrote
-                if rows.any():
-                    assert cos(kr[:, :, rows], kf[:, :, rows]) > 0.99 and cos(vr[:, :, rows], vf[:, :, rows]) > 0.99, n
+        for rec in seen[n]:
+            assert rec["rng_eq"], f"{n}: random-number consumption differs from FlashDrive"
+            assert rec["invariant"], f"{n}: rotated cache copy is stale"
+            assert rec["out_cos"] > 0.995, (n, rec["out_cos"])
+            assert rec["cache_ok"], n
     if "_dflash_block_step" in seen:
-        proposals = [torch.equal(r[0], f[0]) for r, f, *_ in seen["_dflash_block_step"]]
+        proposals = [rec["proposal_eq"] for rec in seen["_dflash_block_step"]]
         assert sum(proposals) >= 0.8 * len(proposals)      # greedy draft proposals from the same context
+    del eng, model
+    gc.collect(); torch.cuda.empty_cache()

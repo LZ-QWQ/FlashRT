@@ -529,11 +529,11 @@ void launch_w8a16(const void* wfrag, const float* scale, const void* x, void* y,
   const int T = (N + 15) / 16;
   const int blocks = (T + kWarps * RT - 1) / (kWarps * RT);
   if (fmt == 1)
-    a15_launch(w8a16_gemm_kernel<NT, RT, true>, dim3(blocks), dim3(kWarps * 32), (size_t)0, stream, 
+    a15_launch(w8a16_gemm_kernel<NT, RT, true>, dim3(blocks), dim3(kWarps * 32), (size_t)0, stream,
         reinterpret_cast<const uint4*>(wfrag), scale, reinterpret_cast<const __nv_bfloat16*>(x),
         reinterpret_cast<__nv_bfloat16*>(y), M, N, K, T);
   else
-    a15_launch(w8a16_gemm_kernel<NT, RT, false>, dim3(blocks), dim3(kWarps * 32), (size_t)0, stream, 
+    a15_launch(w8a16_gemm_kernel<NT, RT, false>, dim3(blocks), dim3(kWarps * 32), (size_t)0, stream,
         reinterpret_cast<const uint4*>(wfrag), scale, reinterpret_cast<const __nv_bfloat16*>(x),
         reinterpret_cast<__nv_bfloat16*>(y), M, N, K, T);
 }
@@ -858,7 +858,7 @@ int alpamayo15_rms_bf16(void* residual, const void* delta, const void* weight, v
                         int rows, int dim, float eps, cudaStream_t stream) {
   if (!residual || !weight || !out) return 1;
   if (rows <= 0 || dim <= 0) return 2;
-  a15_launch(rms_bf16_kernel, dim3(rows), dim3(256), (size_t)0, stream, 
+  a15_launch(rms_bf16_kernel, dim3(rows), dim3(256), (size_t)0, stream,
       reinterpret_cast<__nv_bfloat16*>(residual), reinterpret_cast<const __nv_bfloat16*>(delta),
       reinterpret_cast<const __nv_bfloat16*>(weight), reinterpret_cast<__nv_bfloat16*>(out), dim, eps);
   return cudaPeekAtLastError() == cudaSuccess ? 0 : 4;
@@ -869,7 +869,7 @@ int alpamayo15_rms_fp8_rows_bf16(void* residual, const void* delta, const void* 
   if (!residual || !weight || !q || !scale) return 1;
   if (rows <= 0 || dim <= 0 || dim > kFusedRowMax || (dim % 4) != 0) return 2;
   if (!aligned8(residual) || !aligned8(weight) || (delta && !aligned8(delta)) || (reinterpret_cast<uintptr_t>(q) & 3u) != 0) return 5;
-  a15_launch(rms_fp8_rows_kernel, dim3(rows), dim3(256), (size_t)0, stream, 
+  a15_launch(rms_fp8_rows_kernel, dim3(rows), dim3(256), (size_t)0, stream,
       reinterpret_cast<__nv_bfloat16*>(residual), reinterpret_cast<const __nv_bfloat16*>(delta),
       reinterpret_cast<const __nv_bfloat16*>(weight), static_cast<uint8_t*>(q), scale, dim, eps);
   return cudaPeekAtLastError() == cudaSuccess ? 0 : 4;
@@ -891,7 +891,7 @@ int alpamayo15_silu_mul_fp8_rows_bf16(const void* gate, const void* up, int ld, 
   if (!gate || !up || !q || !scale) return 1;
   if (rows <= 0 || F <= 0 || F > kFusedRowMax || (F % 4) != 0 || ld < F || (ld % 4) != 0) return 2;
   if (!aligned8(gate) || !aligned8(up) || (reinterpret_cast<uintptr_t>(q) & 3u) != 0) return 5;
-  a15_launch(silu_mul_fp8_rows_kernel, dim3(rows), dim3(256), (size_t)0, stream, 
+  a15_launch(silu_mul_fp8_rows_kernel, dim3(rows), dim3(256), (size_t)0, stream,
       reinterpret_cast<const __nv_bfloat16*>(gate), reinterpret_cast<const __nv_bfloat16*>(up), ld,
       static_cast<uint8_t*>(q), scale, F);
   return cudaPeekAtLastError() == cudaSuccess ? 0 : 4;
@@ -910,7 +910,7 @@ int alpamayo15_vlm_qk_prep_bf16(const void* qkv, const void* q_norm_w, const voi
   if (!aligned8(qkv) || !aligned8(q_norm_w) || !aligned8(k_norm_w) || !aligned8(q_out) ||
       !aligned8(k_cache) || !aligned8(v_cache) || (kv_row_stride % 4) != 0) return 5;
   const long long warps = (long long)rows * (Hq + 2 * Hk);
-  a15_launch(qk_prep_kernel<false>, dim3((unsigned)((warps + 7) / 8)), dim3(256), (size_t)0, stream, 
+  a15_launch(qk_prep_kernel<false>, dim3((unsigned)((warps + 7) / 8)), dim3(256), (size_t)0, stream,
       reinterpret_cast<const __nv_bfloat16*>(qkv), reinterpret_cast<const __nv_bfloat16*>(q_norm_w),
       reinterpret_cast<const __nv_bfloat16*>(k_norm_w), cos, sin, reinterpret_cast<__nv_bfloat16*>(q_out),
       reinterpret_cast<__nv_bfloat16*>(k_cache), reinterpret_cast<__nv_bfloat16*>(v_cache),
@@ -933,7 +933,7 @@ int alpamayo15_res_rms_f32_bf16(float* residual, const void* delta, const void* 
                                 void* out, int rows, int dim, float eps, cudaStream_t stream) {
   if (!residual || !weight || !out) return 1;
   if (rows <= 0 || dim <= 0) return 2;
-  a15_launch(res_rms_f32_bf16_kernel, dim3(rows), dim3(256), (size_t)0, stream, 
+  a15_launch(res_rms_f32_bf16_kernel, dim3(rows), dim3(256), (size_t)0, stream,
       residual, reinterpret_cast<const __nv_bfloat16*>(delta),
       reinterpret_cast<const __nv_bfloat16*>(weight),
       reinterpret_cast<__nv_bfloat16*>(out), dim, eps);
@@ -952,7 +952,7 @@ int alpamayo15_expert_qk_prep_bf16(const void* qkv, const void* q_norm_w, const 
   if (!aligned8(qkv) || !aligned8(q_norm_w) || !aligned8(k_norm_w) || !aligned8(q_out) ||
       !aligned8(k_out) || !aligned8(v_out) || (k_row_stride % 4) != 0) return 5;
   const long long warps = (long long)rows * (Hq + 2 * Hk);
-  a15_launch(qk_prep_kernel<true>, dim3((unsigned)((warps + 7) / 8)), dim3(256), (size_t)0, stream, 
+  a15_launch(qk_prep_kernel<true>, dim3((unsigned)((warps + 7) / 8)), dim3(256), (size_t)0, stream,
       reinterpret_cast<const __nv_bfloat16*>(qkv),
       reinterpret_cast<const __nv_bfloat16*>(q_norm_w),
       reinterpret_cast<const __nv_bfloat16*>(k_norm_w), cos, sin,

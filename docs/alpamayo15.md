@@ -44,10 +44,15 @@ Python 3.12.3, torch 2.12.0a0+5aff3928d8.nv26.05, CUDA 13.2, transformers
 | z-lab/flashdrive | not required | 2626517 |
 | vLLM | not required | v0.16.0, source-built SM110 W4A8 Marlin |
 | ParoQuant | not required | 0.1.15 |
+| FlashAttention 4 (`flash_attn/cute`, CuTe DSL forward) | vendored forward-only subset `csrc/attention/flash_attn_4_src` (snapshot 2025-07-04, BSD-3-Clause, `VENDOR.md`); runtime `nvidia-cutlass-dsl==4.5.1`, `quack-kernels==0.4.1` (`thor-fa4` extra) | the same |
 
 Keep the platform's torch, torchvision and Triton: the upstream pins of these
 projects target other builds. The model dependencies are optional and are not
-imported by the FlashRT package itself.
+imported by the FlashRT package itself. FA4 is the attention kernel of both
+forms (prefill, decode, expert and vision attention); it is a CuTe DSL kernel
+compiled at first use by `nvidia-cutlass-dsl`, loaded only through
+`flash_rt.hardware.thor.fa4_backend`, and the engines refuse to start without
+it.
 
 ## Installation
 
@@ -224,8 +229,7 @@ Single tiers override the preset's choice: `decode_weights` (`"bf16"`,
 `prefill_weights` (`"bf16"`, `"fp8"`, `"nvfp4"`), `vision_weights` (`"bf16"`,
 `"fp8"`), `lm_head_weights` (`"decode"`, `"int4"`); for example
 `engine_kwargs={"preset": "bf16", "decode_weights": "int8"}`. Other options:
-`vision_gemm` (`"cutlass"` default, `"cublaslt"`, `"torch"`), `expert_gemm`
-(`"cutlass"`, `"torch"`), `pdl` (off). Every tier other than `bf16` changes
+`pdl` (programmatic dependent launch, off). Every tier other than `bf16` changes
 numerics; the [results](#results-on-thor) give the measured effect of each
 preset and the [precision tiers](#precision-tiers) section describes them.
 
@@ -329,33 +333,39 @@ Nine clips x three seeds (1719 windows per arm):
 | Path | mean ms | median ms | p90 ms | vs official (mean / median) | peak GB | ADE m | paired ADE vs official | paired ADE vs `bf16` |
 |---|---|---|---|---|---|---|---|---|
 | Official Alpamayo 1.5 (BF16, SDPA) | 3322 | 3168 | 3755 | - | 21.6 | 2.845 | - | |
-| FlashRT `preset="bf16"` | 2122 | 1968 | 2514 | 1.57x / 1.61x | 22.3 | 2.853 | +0.008 [-0.011, +0.042] | - |
-| FlashRT `preset="balanced"` (default) | 967 | 916 | 1097 | 3.44x / 3.46x | 35.0 | 2.844 | -0.001 [-0.052, +0.053] | -0.009 [-0.052, +0.025] |
-| FlashRT `preset="fast"` | 841 | 790 | 962 | 3.95x / 4.01x | 32.0 | 2.826 | -0.019 [-0.080, +0.037] | -0.027 [-0.094, +0.038] |
+| FlashRT `preset="bf16"` | 2484 | 2323 | 2936 | 1.34x / 1.36x | 22.3 | 2.849 | +0.004 [-0.008, +0.019] | - |
+| FlashRT `preset="balanced"` (default) | 941 | 891 | 1063 | 3.53x / 3.56x | 35.0 | 2.830 | -0.015 [-0.045, +0.016] | -0.019 [-0.054, +0.011] |
+| FlashRT `preset="fast"` | 813 | 764 | 935 | 4.08x / 4.15x | 32.0 | 2.844 | -0.001 [-0.082, +0.089] | -0.005 [-0.087, +0.081] |
 
-`fast` against `balanced`: -126 ms [-134, -121], ADE -0.017 [-0.080, +0.040].
-FDE moves with ADE (`fast` vs official -0.080 [-0.357, +0.151]). Every
+`fast` against `balanced`: -127 ms [-137, -119], ADE +0.014 [-0.052, +0.077].
+FDE moves with ADE (`fast` vs official +0.012 [-0.313, +0.308]). Every
 interval includes zero: on this evaluation the presets are indistinguishable
 from the official model and from each other. The `bf16` engine generates the
-official model's token stream on 2 of 1719 windows (near-tie sampling steps
-differ at the reduction-order level, as between the official model's SDPA and
-FlashAttention-2 backends); `balanced` generates the `bf16` engine's tokens
-on 1428 of 1719, `fast` on 1106.
+official model's token stream on 2 of 1719 windows: BF16 logits carry many
+near-ties, and a near-tie step resolves differently once any kernel changes
+its reduction order (as between the official model's SDPA and
+FlashAttention-2 backends), even though the sampler draws exactly the
+official random numbers; `balanced` generates the `bf16` engine's tokens on
+1437 of 1719, `fast` on 1116.
 
 Stage times of the FlashRT engine on the example clip (117 steady windows,
 seed 0; CUDA-event means per request):
 
 | Preset | mean ms | median ms | p90 ms | vision | LM prefill | decode ms / token | expert | peak GB |
 |---|---|---|---|---|---|---|---|---|
-| `bf16` | 1873 | 1872 | 2138 | 121 | 541 | 66.6 | 212 | 22.3 |
-| `balanced` | 867 | 870 | 962 | 121 | 290 | 22.2 | 126 | 35.0 |
-| `fast` | 747 | 734 | 835 | 121 | 183 | 21.1 | 126 | 32.0 |
+| `bf16` | 2204 | 1864 | 2499 | 121 | 760 | 76.3 | 211 | 22.3 |
+| `balanced` | 873 | 849 | 932 | 120 | 287 | 22.1 | 125 | 35.0 |
+| `fast` | 735 | 744 | 828 | 121 | 180 | 20.9 | 125 | 32.0 |
 
 Reasoning length averages 16 tokens on this clip (19 over the nine clips), so
-decode is the largest stage of the `balanced` and `fast` presets. The nine-clip
-table was measured before the vision tower moved to its current 256 x 256
-GEMM tile; that change leaves every output identical and takes about 20 ms
-off each request, which the stage table includes.
+decode is the largest stage of the `balanced` and `fast` presets. The sampler
+kernel costs 0.12 ms per step. The `bf16` preset's prefill projections run on
+FlashRT's 2-SM BF16 tcgen05 GEMM and its decode projections on the few-row
+BF16 kernel; on Thor these are slower than the cuBLAS kernels an earlier
+version of this preset used (prefill 760 against 550 ms, decode 76 against 67
+ms per token, the GEMM drawing about four times the overcurrent throttling
+events), so `bf16` is the numerics reference rather than a speed setting. The
+`balanced` and `fast` presets do not use the BF16 GEMMs.
 
 ### Streaming
 
@@ -365,41 +375,34 @@ and settings (`scripts/infer.py`):
 | Path | mean ms | median ms | p90 ms | vs FlashDrive (mean / median) | peak GB | ADE m | paired ADE vs FlashDrive |
 |---|---|---|---|---|---|---|---|
 | FlashDrive (unmodified, `torch.compile` max-autotune) | 958 | 856 | 1057 | - | 13.3 | 2.763 | - |
-| FlashDrive + FlashRT backend (defaults) | 476 | 417 | 533 | 2.01x / 2.05x | 26.0 | 2.682 | -0.041 [-0.104, +0.011] |
-| + `decode_weights="int8"` | 452 | 399 | 520 | 2.12x / 2.15x | 25.0 | 2.692 | -0.023 [-0.102, +0.041] |
-| + `prefill_weights="int8"` | 453 | 392 | 507 | 2.11x / 2.18x | 26.0 | 2.659 | -0.054 [-0.162, +0.023] |
-| + `expert_weights="fp8"` | 440 | 383 | 499 | 2.18x / 2.24x | 28.1 | 2.689 | -0.034 [-0.098, +0.017] |
-| + all three tiers | 392 | 335 | 433 | 2.44x / 2.56x | 27.1 | 2.657 | -0.052 [-0.161, +0.024] |
+| FlashDrive + FlashRT backend (defaults) | 462 | 400 | 513 | 2.07x / 2.14x | 26.5 | 2.742 | +0.035 [-0.008, +0.067] |
+| + all three tiers (`decode_weights="int8"`, `prefill_weights="int8"`, `expert_weights="fp8"`) | 358 | 310 | 403 | 2.68x / 2.77x | 27.6 | 2.738 | +0.029 [-0.031, +0.090] |
 
-Paired against the default backend: INT8 decode weights ADE +0.010 [-0.030,
-+0.066], INT8 prefill weights -0.023 [-0.121, +0.074], FP8 expert weights
-+0.007 [-0.005, +0.028] (the expert tier leaves the reasoning tokens
-unchanged, hence the narrow interval), all three -0.025 [-0.124, +0.075].
-FlashDrive averages 4.64 DFlash rounds and 3.56 reasoning tokens per round,
-the backend 4.6 and 3.6. The default backend is reproducible (three processes
-with the same seed gave identical tokens and trajectories on all 117 windows
-of the example clip); FlashDrive's compiled stack is not. Cold costs:
-FlashDrive's first window of a stream takes 4.4 s and its second 148 s
-(`torch.compile`, warm compile cache, one clip per process); the backend ran
-each seed's nine clips in one process with `reset()` between them, first
-window 2.5 s, second 1.2 s (CUDA graph capture; 37 s for the first stream of
-a process, which also builds the FA4 kernels). The backend's peak memory
-includes the INT8 weight copy of its tcgen05 W4A8 GEMM.
+The FlashDrive rows pair on 1602 windows (its runs lack the example clip's
+seed 0); the backend rows cover 1719. The three tiers together against the
+default backend: -105 ms [-122, -90], ADE -0.004 [-0.064, +0.044]; the
+backend samples FlashDrive's token stream on 743 of 1602 windows. FlashDrive
+averages 4.7 DFlash rounds per window and 5.1 reasoning tokens per round, the
+backend 4.9 and 5.2. Cold costs: FlashDrive's first window of a stream takes
+4.3 s and its second 148 s (`torch.compile`, warm compile cache, one clip per
+process); the backend ran each seed's nine clips in one process with
+`reset()` between them, first window 0.7 s and second 1.1 s (CUDA graph
+capture; 17 s and 19 s for the first stream of a process, which also builds
+the FA4 kernels). The backend's peak memory includes the INT8 weight copy of
+its tcgen05 W4A8 GEMM.
 
 Stage times of the FlashRT backend on the example clip (117 steady windows,
 seed 0; CUDA-event means per window, the DFlash column per round):
 
 | Configuration | mean ms | median ms | p90 ms | vision | streaming prefill | DFlash round | expert | rounds / window |
 |---|---|---|---|---|---|---|---|---|
-| defaults | 493 | 404 | 519 | 27 | 145 | 37.3 | 87 | 5.4 |
-| all three tiers | 388 | 316 | 408 | 27 | 109 | 30.7 | 53 | 5.5 |
+| defaults | 458 | 402 | 512 | 27 | 144 | 36.2 | 87 | 4.6 |
+| all three tiers | 354 | 318 | 402 | 27 | 109 | 29.4 | 53 | 4.5 |
 
 Window latency follows the number of DFlash rounds, which varies with the
-sampled reasoning (5.4 per window in these runs against 4.6 in the nine-clip
-runs), so compare stage columns between rows. The nine-clip table was
-measured before the vision tower moved to its current 256 x 256 GEMM tile,
-which leaves every output identical and takes the vision stage from 40 to
-27 ms per window; the stage table includes it.
+sampled reasoning, so compare stage columns between rows. A round is 8
+verification rows through the language model plus the draft, the sampler
+(0.18 ms for the 8 rows) and the acceptance decisions, all in one graph.
 
 On identical cache and random state (12 windows, each FlashRT primitive
 against FlashDrive eager; FlashDrive's compiled primitives against eager for
@@ -451,13 +454,13 @@ validated by the nine-clip evaluation above.
   than the GEMMs save) and not part of any preset.
 - The prompt's last-token logits stay on the BF16 LM head in every preset
   (sampling the first token from a quantized head measured ADE +0.055
-  [+0.001, +0.161]), and `vision_gemm="cublaslt"` stays an option (about 3 ms
-  per request, last-bit differences that resample windows: ADE +0.047
-  [-0.007, +0.153]).
+  [+0.001, +0.161]). The vision blocks' fc1 on cuBLASLt measured about 3 ms
+  faster per request but its last-bit differences resample windows (ADE
+  +0.047 [-0.007, +0.153]); the tower stays on the FlashRT GEMMs.
 
 ### Streaming backend
 
-Off by default; each is a numerics change validated on nine clips x three
+Off by default; numerics changes validated together on nine clips x three
 seeds above: `decode_weights="int8"` (per-row symmetric INT8 copies of the LM
 head and draft linears on the W8A16 kernel; `"fp8"` exists, INT8 keeps more
 weight precision for the same bytes), `prefill_weights="int8"` (the
@@ -471,14 +474,45 @@ dependent launch (measured neutral on Thor).
 
 ## Execution contracts
 
+Hot path: in both forms every GPU operation of a request after host
+tokenization is a FlashRT kernel. GEMMs run on tcgen05 (CUTLASS instantiations
+with bias, activation, residual and quantization folded into the epilogues)
+or on FlashRT's few-row kernels, attention on FA4, and the rest on the
+model-local kernels of `csrc/kernels/alpamayo15_*.cu`: RMSNorm / LayerNorm /
+SiLU-mul producers, embedding and image-row gathers and scatters, the M-RoPE
+tables, the sampler with the decode bookkeeping, the action expert's input and
+output projections with the Euler step, the unicycle trajectory integration
+and, for streaming, the DFlash proposal and acceptance decisions. The only
+torch operation left on the GPU is the official noise draw of the diffusion
+expert (`torch.randn`), kept as the official draw point; memcpys move the
+sampled tokens to the host for the stop rule. Each frame grid's vision tower,
+each decode step (full request) or DFlash round (streaming), each streaming
+window's prefill and the whole expert are CUDA graphs. The host prepares a
+request (tokenization, trajectory-history tokens, M-RoPE positions and
+FlashDrive's stream bookkeeping) before the graphs run. The
+[kernel sources per phase](#kernel-sources-per-phase) below are the profiler's
+account of this.
+
+Code layout: `flash_rt/models/alpamayo15/pipeline_thor.py` is the full-request
+engine (buffers, graphs, the request path), `weights.py` its weight
+preparation (fused projections, the tiers' copies, the action modules'
+operands), `marlin_w4a8.py` the W4A8 layouts; `flash_rt/models/alpamayo15_flashdrive/`
+holds the streaming backend and its `weights.py`; the frontends under
+`flash_rt/frontends/torch/` do the official / FlashDrive preprocessing and
+model loading (`load_flashdrive`); kernels live in `csrc/kernels/alpamayo15_*`,
+`csrc/gemm/alpamayo15_*_sm100.cu`, `csrc/quantize/alpamayo15_nvfp4_rows.cu` and
+the `alpamayo15_nvfp4_*` sources of `flash_rt_fp4`, all behind
+`FLASHRT_ENABLE_ALPAMAYO15`.
+
 ### Full-request engine
 
 | Stage | Official (Hugging Face eager) | FlashRT Thor |
 |---|---|---|
 | Vision tower (27 layers, 16 frames) | per-frame attention calls, FP32 LayerNorm/RoPE round trips, CPU-built position tables | one CUDA graph per frame grid: patch embedding (+ position embedding), qkv / proj / fc1 / fc2 and the mergers on 2-SM 256 x 256 tcgen05 BF16 GEMMs with bias, GELU and residual fused into the epilogues, LayerNorm kernel, fused in-place FP32 RoPE, batched FA4 attention on the interleaved q/k/v, per-grid cached tables |
-| LM prefill (36 layers) | eager modules, `DynamicCache` | fused q/k/v GEMM, fused head RMSNorm + M-RoPE writing K/V straight into a static cache, FA4 causal attention, fused residual + RMSNorm, vectorized SiLU-mul; the tier's producers quantize their rows in place |
-| Reasoning decode | `generate()` | one CUDA graph per token: grouped few-row GEMMs, FA4 decode attention over the cache (one split), sampler on device |
-| Diffusion expert (10 Euler steps) | 10 eager expert calls (or bounded per-length graphs) | all 10 steps in one CUDA graph on tcgen05 GEMMs (64-row tiles, fused q/k/v and gate\|up weights, split SiLU-mul); one graph serves every reasoning length |
+| LM prefill (36 layers) | eager modules, `DynamicCache` | embedding and image rows gathered by kernels, the M-RoPE tables from host-computed positions, fused q/k/v GEMM, fused head RMSNorm + M-RoPE writing K/V straight into a static cache, FA4 causal attention, fused residual + RMSNorm, vectorized SiLU-mul; the tier's producers quantize their rows in place; the first token sampled by the sampler kernel |
+| Reasoning decode | `generate()` | one CUDA graph per token: embedding and table gathers, grouped few-row GEMMs, FA4 decode attention over the cache (one split), the sampler kernel (trajectory-token mask, temperature, top-p, torch's multinomial draw) and the step's counters |
+| Diffusion expert (10 Euler steps) | 10 eager expert calls (or bounded per-length graphs) | all 10 steps in one CUDA graph: the action input projection (Fourier features, SiLU MLP with the activation in the GEMM epilogue, LayerNorm), tcgen05 GEMMs (64-row tiles, fused q/k/v and gate\|up weights, split SiLU-mul), the output projection with the Euler step; one graph serves every reasoning length |
+| Trajectory | `action_to_traj` (unicycle integration, tensor ops) | one kernel from the expert's state and the host-computed t0 velocity |
 | `num_traj_samples = N` | prompt (images included) repeated N times through vision and prefill | vision and prefill once; the prompt K/V is shared by all samples |
 
 The static cache holds `[prompt | reasoning | action]` per sample. Each
@@ -505,6 +539,29 @@ are merged from BF16 partial outputs (one extra rounding) and the reasoning
 LM head runs as a vocab-major GEMM, so per-sample numerics are not
 bit-identical to a single-sample run.
 
+The sampler kernel reproduces `torch.multinomial(probs, 1)` on the CUDA
+generator: torch draws an exponential variate per vocabulary entry
+(Philox4x32-10 words assigned per element by its distribution kernel,
+curand's uniform, the fast `__logf`) and takes `argmax(probs / q)`; the kernel
+computes the same words for the tokens kept by top-p, the same ratios, and
+advances the generator's offset by torch's increment. The engine starts each
+request from the generator's current seed and offset and moves the offset
+forward after decode, so the official noise draw that follows reads the same
+random stream as in the official procedure. Given equal probabilities the
+token is identical; the probabilities differ at the float-rounding level, so
+only near-equal ratios can pick differently.
+
+Rotary tables: the official model computes the Qwen3-VL text rotary tables
+with a `(3, 1, D/2, 1) @ (3, 1, 1, P)` matmul that NVIDIA's Jetson torch build
+runs in TF32 by default (`torch.backends.cuda.matmul.allow_tf32 = True`),
+rounding positions above 2048 to even values and above 4096 to multiples of
+4. The engine computes the module's arithmetic exactly (fp32 products). This
+is a difference between the official model's Thor default and its own
+definition: on the example clip the official model with TF32 disabled samples
+the same tokens on 23 of 24 windows and moves every trajectory slightly (ADE
+by about 0.005; one window resamples); the engine's tables equal the exact
+form.
+
 ### Streaming backend
 
 What FlashDrive changes against the official procedure, kept as is:
@@ -516,19 +573,19 @@ What FlashDrive changes against the official procedure, kept as is:
 | Language model | BF16 | W4A8 (ParoQuant, Marlin) |
 | Action expert | official weights, 10 Euler steps | fine-tuned weights, 8 steps, velocity reused on steps 3-6, BF16 state |
 
-`FlashDriveThor(model, expert=..., vision=..., prefill=..., decode=..., w4a8=..., w4a8_gemm=...)`
+`FlashDriveThor(model, expert=..., vision=..., prefill=..., decode=..., w4a8=...)`
 installs FlashRT implementations of FlashDrive's primitives on a loaded
 FlashDrive model (every group by default; a group set to `"flashdrive"`
 keeps FlashDrive's execution, eager or compiled):
 
 | Group | FlashDrive primitives | FlashRT implementation |
 |---|---|---|
-| `expert` | `_action` | the 8-step Euler loop with cached velocities in one CUDA graph: FP32 residual stream, fused head RMSNorm + FP32 RoPE, FA4 attention with a device-side key length, FlashDrive's fused q/k/v and gate/up weights, tcgen05 GEMMs (`expert_gemm="cutlass"`) with a fused SiLU-mul |
-| `vision` | `_encode` | the full-request engine's vision tower (`vision_gemm="cutlass"`), one CUDA graph per frame grid |
-| `prefill` | `_dflash_prefill`, `_shift_streaming_kv_cache`, cache bookkeeping of `_first_prefill` | 36 decoder layers on FlashRT kernels (fused head norm + RoPE writing the cache, FA4, fused residual + RMSNorm, SiLU-mul) with FlashDrive's W4A8 projections; the window's rows attend by one FA4 varlen call; one CUDA graph per stream; one kernel moves every layer's frame blocks and rotates the moved keys |
-| `decode` (needs `prefill="flashrt"`) | `_dflash_block_step`, `_dflash_traj_forward` | draft proposal (two-layer draft on FlashRT kernels), 8-row verification, posterior sampling (FlashDrive's `sample_tokens`) and acceptance decisions in one CUDA graph per round; the trajectory-start forward as a one-row graph; the LM head on a few-row BF16 GEMM |
+| `expert` | `_action` | the 8-step Euler loop with cached velocities in one CUDA graph: FP32 residual stream, fused head RMSNorm + FP32 RoPE, FA4 attention with a device-side key length, FlashDrive's fused q/k/v and gate/up weights, tcgen05 GEMMs with a fused SiLU-mul; the action input projection (Fourier features, SiLU MLP, LayerNorm) and the output projection with the Euler step as kernels |
+| `vision` | `_encode` | the full-request engine's vision tower, one CUDA graph per frame grid |
+| `prefill` | `_first_prefill`, `_dflash_prefill`, `_shift_streaming_kv_cache` | the first window of a stream and every streaming window as 36 decoder layers on FlashRT kernels (fused head norm + RoPE writing the cache, FA4, fused residual + RMSNorm, SiLU-mul) with FlashDrive's W4A8 projections; the first window's bookkeeping (padded position table, frame ranges, shift indices) computed on the host from the token ids; the window's rows attend by one FA4 varlen call; one CUDA graph per stream for streaming windows; one kernel moves every layer's frame blocks and rotates the moved keys |
+| `decode` (needs `prefill="flashrt"`) | `_dflash_block_step`, `_dflash_traj_forward` | draft proposal (two-layer draft on FlashRT kernels, greedy by the sampler kernel), the proposal and acceptance rules as kernels, 8-row verification, posterior sampling by the sampler kernel (FlashDrive's top-p rule, torch's multinomial draw from the generator's state) in one CUDA graph per round; the trajectory-start forward as a one-row graph; the LM head on a few-row BF16 GEMM |
 | `w4a8="fused"` (default) | the W4A8 linears inside the above | one activation pass per shared input (FP16 cast, ParoQuant pairwise rotation, per-token INT8 quantization; over the streaming window as one kernel per row tile together with the producer), the FP16 GEMM outputs read directly by the next kernel |
-| `w4a8_gemm="tcgen05"` (default) | the W4A8 GEMMs | FlashRT GEMMs computing Marlin's integer arithmetic: an INT8 tcgen05 GEMM on the unpacked `w - z` weights for streaming-window prefill (groups of at least 256 rows) and a few-row `mma.sync` kernel on the packed nibbles, zero points and integer group scales for verification and trajectory-start rows; `"marlin"` keeps vLLM's kernel |
+| the W4A8 GEMMs of `w4a8="fused"` | vLLM's Marlin kernel | FlashRT GEMMs computing Marlin's integer arithmetic: an INT8 tcgen05 GEMM on the unpacked `w - z` weights for row tiles (first-window and streaming-window prefill) and a few-row `mma.sync` kernel on the packed nibbles, zero points and integer group scales for verification and trajectory-start rows; the unpacked layout is checked against Marlin once per shape when the backend is built |
 
 Cache contract: FlashDrive's `StaticCache` stays the store of record (keys
 un-rotated and values, `[1, Hk, S, 128]` per layer, one position table per
@@ -558,6 +615,43 @@ differ from FlashDrive eager at the reduction-order level, no more than
 FlashDrive's own eager and compiled executions differ from each other (the
 cosine table above).
 
+### Kernel sources per phase
+
+The profiler's account of the hot path on the example clip (windows 8-10,
+`torch.profiler`, every GPU kernel inside each phase annotation attributed to
+its source; kernel time per phase instance). Full request, `balanced` preset:
+
+| Phase | kernel ms | FlashRT kernels | FlashRT CUTLASS tcgen05 GEMMs | FA4 | other |
+|---|---|---|---|---|---|
+| vision tower (16 frames) | 121.3 | 86 launches, 25.9 ms | 117 launches, 78.5 ms | 27 launches, 16.4 ms | 1 memcpy (the pixel copy into the graph input), 0.55 ms |
+| LM prefill | 288.3 | 192 launches, 80.6 ms | 288 launches, 189.3 ms | 36 launches, 18.4 ms | none |
+| decode step (one token) | 21.8 | 438 launches, 19.9 ms | - | 36 launches, 2.0 ms | none |
+| diffusion expert (10 steps) | 125.9 | 1860 launches, 12.3 ms | 1470 launches, 93.5 ms | 360 launches, 20.1 ms | none |
+
+The `bf16` and `fast` presets have the same sources (`bf16`: prefill 763 ms of
+which 660 on the BF16 tcgen05 GEMM, decode step 76.3 ms on the few-row BF16
+kernel; `fast`: prefill 181 ms, decode step 20.7 ms). The trajectory
+integration is one kernel after the expert graph. No ATen or cuBLAS kernel
+runs in any full-request phase; the official noise draw runs between the
+decode and expert phases.
+
+Streaming backend, defaults:
+
+| Phase | kernel ms | FlashRT kernels | FlashRT CUTLASS tcgen05 GEMMs | FA4 | other |
+|---|---|---|---|---|---|
+| first window of a stream | 621.7 | 374 launches, 146.5 ms | 477 launches, 407.2 ms | 99 launches, 61.6 ms | FlashDrive's cache allocation and bookkeeping: 202 ATen launches, 3.2 ms (zero fills of the new cache layers, position-table and index-table construction), 157 memcpys, 3.4 ms |
+| vision (4 frames) | 26.8 | 86 launches, 3.9 ms | 117 launches, 19.1 ms | 27 launches, 3.8 ms | 1 memcpy, 0.07 ms |
+| streaming prefill | 144.9 | 188 launches, 49.1 ms | 252 launches, 87.7 ms | 36 launches, 6.8 ms | 5 ATen copies of the window's inputs, 0.01 ms; memcpys 0.17 ms |
+| DFlash round | 35.9 | 720 launches, 33.9 ms | - | 38 launches, 2.0 ms | 7 ATen launches, 0.01 ms (copies of FlashDrive's block tokens, context and cache position into the graph's inputs, one 1-element add); 43 memcpys, 0.05 ms |
+| trajectory start | 23.5 | 688 launches, 21.4 ms | - | 36 launches, 2.0 ms | 43 memcpys, 0.04 ms |
+| frame-block shift | 3.5 | 1 launch, 3.5 ms | - | - | 4 ATen launches, 0.02 ms (FlashDrive's bookkeeping) |
+| expert (8 steps) | 87.4 | 682 launches, 5.7 ms | 588 launches, 73.6 ms | 144 launches, 8.1 ms | the noise draw and 3 fills, 0.005 ms |
+
+The ATen entries of the streaming backend are the copies of the inputs that
+FlashDrive's orchestration hands to each primitive and its own cache
+initialization in the first window; no computation of a primitive runs
+outside FlashRT kernels.
+
 ## Tests
 
 ```bash
@@ -583,8 +677,8 @@ a skipped integration test is not a passing hardware test.
   `max_prompt + max_new_tokens + 64` rows per sample.
 - Streaming: one trajectory sample per window; Alpamayo 1.5 checkpoints
   only; streams are reset explicitly and the first window of a stream returns
-  no trajectory; `w4a8_gemm="tcgen05"` keeps an INT8 copy of the language
-  model's linear weights (about 7 GB) next to Marlin's INT4 buffers.
+  no trajectory; the backend keeps an INT8 copy of the language model's
+  linear weights (about 7 GB) next to Marlin's INT4 buffers.
 - The offline trajectory error on nine clips compares implementations of a
   procedure; it is not evidence of closed-loop driving quality.
 - Video frames are decoded by the official loader on the host CPU. With the

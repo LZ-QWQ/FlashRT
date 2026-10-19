@@ -1748,8 +1748,8 @@ if(FLASHRT_ENABLE_ALPAMAYO15)
     $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr -O3 ${GPU_GENCODE}>
   )
   target_sources(flash_rt_kernels PRIVATE csrc/kernels/alpamayo15_kernels.cu
+                                         csrc/kernels/alpamayo15_request_kernels.cu
                                          csrc/kernels/alpamayo15_flashdrive_kernels.cu
-                                         csrc/gemm/alpamayo15_cublaslt_bf16.cu
                                          $<TARGET_OBJECTS:alpamayo15_fd_w4a8_obj>
                                          $<TARGET_OBJECTS:alpamayo15_bf16_gemm_obj>)
   target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_ALPAMAYO15=1)
@@ -2229,8 +2229,6 @@ if(ENABLE_SM100_CUTLASS)
     csrc/fused_fp4/silu_mul_two_fp4_to_fp4.cu
     csrc/gemm/fp4/cutlass_fp4_gemm_fp4out.cu
     csrc/gemm/fp4/cutlass_fp4_gemm_bias_bf16_sm100.cu
-    csrc/gemm/fp4/alpamayo15_nvfp4_gemm_sm100.cu
-    csrc/quantize/alpamayo15_nvfp4_rows.cu
     csrc/quantize/quantize_fp4_sfa_bf16.cu
     csrc/fused_fp4/dit_norm_fp4_sfa.cu
     csrc/fused_fp4/silu_mul_fp4_sfa_bf16.cu
@@ -2245,6 +2243,12 @@ if(ENABLE_SM100_CUTLASS)
       csrc/fused_fp4/cosmos3_edge_fp4.cu
       csrc/gemm/fp4/cosmos3_edge_fp4_gemm_relu2_fp4out.cu)
     target_compile_definitions(fp4_kernels_obj PRIVATE FLASHRT_HAVE_COSMOS3_EDGE=1)
+  endif()
+  if(FLASHRT_ENABLE_ALPAMAYO15)
+    target_sources(fp4_kernels_obj PRIVATE
+      csrc/gemm/fp4/alpamayo15_nvfp4_gemm_sm100.cu
+      csrc/quantize/alpamayo15_nvfp4_rows.cu)
+    target_compile_definitions(fp4_kernels_obj PRIVATE FLASHRT_HAVE_ALPAMAYO15=1)
   endif()
   set_target_properties(fp4_kernels_obj PROPERTIES
     CUDA_STANDARD 17
@@ -2279,6 +2283,9 @@ if(ENABLE_SM100_CUTLASS)
   )
   if(FLASHRT_ENABLE_COSMOS3_EDGE)
     target_compile_definitions(flash_rt_fp4 PRIVATE FLASHRT_HAVE_COSMOS3_EDGE=1)
+  endif()
+  if(FLASHRT_ENABLE_ALPAMAYO15)
+    target_compile_definitions(flash_rt_fp4 PRIVATE FLASHRT_HAVE_ALPAMAYO15=1)
   endif()
   target_link_libraries(flash_rt_fp4 PRIVATE CUDA::cudart)
   install(TARGETS flash_rt_fp4 DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)

@@ -146,13 +146,5 @@ int alpamayo15_w4a8_gemm_grouped_q(int n_problems, const void* const* xr, const 
 // scale[row] = absmax / 127 (1 for an all-zero row). x rows ld_x elements apart (8-byte aligned); K % 4 == 0.
 int alpamayo15_quantize_int8_rows_bf16(const void* x, int ld_x, void* q, float* scale, int rows, int K, cudaStream_t stream);
 
-// cuBLASLt BF16 GEMM with a fused epilogue (csrc/gemm/alpamayo15_cublaslt_bf16.cu):
-//   D[M, N] = act(A[M, K] @ W[N, K]^T + bias[N]) + C[M, N]     (act 0 identity, 1 GELU tanh; bias and C optional)
-// row-major operands (16-byte aligned), D and C rows ldd / ldc elements apart (multiples of 8), FP32 accumulation
-// and one BF16 rounding. alpamayo15_cublaslt_init() creates the handle and the workspace (not inside graph capture).
-int alpamayo15_cublaslt_init();
-int alpamayo15_cublaslt_gemm_bf16(const void* A, const void* W, const void* bias, const void* C, void* D, int M, int N,
-                                  int K, int ldc, int ldd, int act, cudaStream_t stream);
-
 }  // namespace kernels
 }  // namespace flash_rt

@@ -352,16 +352,16 @@ error against its reference (paired ADE intervals include zero). Guide:
 | Full request (official procedure) | Jetson Thor |
 |---|---:|
 | Alpamayo 1.5 (ms) | 3322 |
-| + FlashRT, `balanced` preset, the default (ms) | **967** |
-| + FlashRT, `fast` preset (ms) | **841** |
-| Speedup | **3.4x / 4.0x** |
+| + FlashRT, `balanced` preset, the default (ms) | **941** |
+| + FlashRT, `fast` preset (ms) | **813** |
+| Speedup | **3.5x / 4.1x** |
 
 | Streaming (FlashDrive procedure) | Jetson Thor |
 |---|---:|
 | FlashDrive (ms per window) | 958 |
-| + FlashRT backend (ms) | **476** |
-| + FlashRT backend with its INT8 / INT8 / FP8 tiers (ms) | **392** |
-| Speedup | **2.0x / 2.4x** |
+| + FlashRT backend (ms) | **462** |
+| + FlashRT backend with its INT8 / INT8 / FP8 tiers (ms) | **358** |
+| Speedup | **2.1x / 2.7x** |
 
 Acknowledgment: the streaming path keeps the procedure, checkpoints and
 orchestration of z-lab's [FlashDrive](https://github.com/z-lab/flashdrive)

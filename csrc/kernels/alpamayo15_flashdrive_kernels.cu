@@ -1776,7 +1776,7 @@ int flashdrive_silu_mul_f16in_bf16(const void* gate, const void* up, void* out, 
   if (!gate || !up || !out) return 1;
   if (n <= 0) return 2;
   const long long blocks = (n + 255) / 256;
-  fd_launch(fd_silu_mul_f16in_kernel, dim3((unsigned)(blocks > 4096 ? 4096 : blocks)), dim3(256), (size_t)(0), stream, 
+  fd_launch(fd_silu_mul_f16in_kernel, dim3((unsigned)(blocks > 4096 ? 4096 : blocks)), dim3(256), (size_t)(0), stream,
       static_cast<const __half*>(gate), static_cast<const __half*>(up), static_cast<__nv_bfloat16*>(out), n);
   return cudaPeekAtLastError() == cudaSuccess ? 0 : 4;
 }
@@ -1794,11 +1794,11 @@ int flashdrive_rope_rows(const void* src, long long s_rs, long long s_hs,
   const long long warps = (long long)rows * Hk;
   const unsigned blocks = (unsigned)((warps + 7) / 8);
   if (fp32_rule) {
-    fd_launch(fd_rope_rows_kernel<true>, dim3(blocks), dim3(256), (size_t)(0), stream, 
+    fd_launch(fd_rope_rows_kernel<true>, dim3(blocks), dim3(256), (size_t)(0), stream,
         static_cast<const __nv_bfloat16*>(src), s_rs, s_hs, static_cast<__nv_bfloat16*>(dst), d_rs, d_hs, cos, sin,
         row_map, row0, slot_ptr, n_ptr, rows, Hk);
   } else {
-    fd_launch(fd_rope_rows_kernel<false>, dim3(blocks), dim3(256), (size_t)(0), stream, 
+    fd_launch(fd_rope_rows_kernel<false>, dim3(blocks), dim3(256), (size_t)(0), stream,
         static_cast<const __nv_bfloat16*>(src), s_rs, s_hs, static_cast<__nv_bfloat16*>(dst), d_rs, d_hs, cos, sin,
         row_map, row0, slot_ptr, n_ptr, rows, Hk);
   }
@@ -1828,7 +1828,7 @@ int flashdrive_w4a8_act_prep(const void* x, int ld_x, int rows, int K, int n_set
   } else if (rows <= 8) {
     fd_launch(fd_w4a8_rotate_kernel<4>, dim3(dim3((rows + 3) / 4, K / kRotGroup, n_sets)), dim3(64), (size_t)(0), stream, xb, ld_x, sets, rows, K);
   } else {
-    fd_launch(fd_w4a8_rotate_kernel<kRotRows>, dim3(dim3((rows + kRotRows - 1) / kRotRows, K / kRotGroup, n_sets)), dim3(64), (size_t)(0), stream, 
+    fd_launch(fd_w4a8_rotate_kernel<kRotRows>, dim3(dim3((rows + kRotRows - 1) / kRotRows, K / kRotGroup, n_sets)), dim3(64), (size_t)(0), stream,
         xb, ld_x, sets, rows, K);
   }
   fd_launch(fd_w4a8_quant_kernel, dim3(dim3(rows, n_sets)), dim3(256), (size_t)(0), stream, sets, K);
@@ -1856,7 +1856,7 @@ int flashdrive_w4a8_rotate(const void* x, int ld_x, int rows, int K, int n_sets,
   } else if (rows <= 8) {
     fd_launch(fd_w4a8_rotate_kernel<4>, dim3(dim3((rows + 3) / 4, K / kRotGroup, n_sets)), dim3(64), (size_t)(0), stream, xb, ld_x, sets, rows, K);
   } else {
-    fd_launch(fd_w4a8_rotate_kernel<kRotRows>, dim3(dim3((rows + kRotRows - 1) / kRotRows, K / kRotGroup, n_sets)), dim3(64), (size_t)(0), stream, 
+    fd_launch(fd_w4a8_rotate_kernel<kRotRows>, dim3(dim3((rows + kRotRows - 1) / kRotRows, K / kRotGroup, n_sets)), dim3(64), (size_t)(0), stream,
         xb, ld_x, sets, rows, K);
   }
   return cudaPeekAtLastError() == cudaSuccess ? 0 : 4;
@@ -1896,11 +1896,11 @@ int flashdrive_w4a8_gemm_small(const void* xq, const float* a_scale, const void*
     configured = true;
   }
   if (M <= 8) {
-    fd_launch(fd_w4a8_small_kernel<1>, dim3(grid), dim3(kSmWarps * 32), (size_t)(kRingBytes), stream, 
+    fd_launch(fd_w4a8_small_kernel<1>, dim3(grid), dim3(kSmWarps * 32), (size_t)(kRingBytes), stream,
         static_cast<const int8_t*>(xq), a_scale, static_cast<const uint4*>(w_pack),
         static_cast<const unsigned char*>(zp), sg, out, ld_out, out_bf16, M, N, K);
   } else {
-    fd_launch(fd_w4a8_small_kernel<2>, dim3(grid), dim3(kSmWarps * 32), (size_t)(kRingBytes), stream, 
+    fd_launch(fd_w4a8_small_kernel<2>, dim3(grid), dim3(kSmWarps * 32), (size_t)(kRingBytes), stream,
         static_cast<const int8_t*>(xq), a_scale, static_cast<const uint4*>(w_pack),
         static_cast<const unsigned char*>(zp), sg, out, ld_out, out_bf16, M, N, K);
   }
@@ -1941,7 +1941,7 @@ int flashdrive_draft_qkv_prep_bf16(const void* q, const void* k, const void* v, 
       !aligned8(k_out) || !aligned8(v_out) || (q_ld % 4) || (k_ld % 4) || (v_ld % 4))
     return 5;
   const long long warps = (long long)nq * Hq + 2LL * (ctx + nq) * Hk;
-  fd_launch(fd_draft_qkv_prep_kernel, dim3((unsigned)((warps + 7) / 8)), dim3(256), (size_t)(0), stream, 
+  fd_launch(fd_draft_qkv_prep_kernel, dim3((unsigned)((warps + 7) / 8)), dim3(256), (size_t)(0), stream,
       static_cast<const __nv_bfloat16*>(q), static_cast<const __nv_bfloat16*>(k), static_cast<const __nv_bfloat16*>(v),
       q_ld, k_ld, v_ld, static_cast<const __nv_bfloat16*>(q_norm_w), static_cast<const __nv_bfloat16*>(k_norm_w),
       static_cast<const __nv_bfloat16*>(cos), static_cast<const __nv_bfloat16*>(sin), static_cast<__nv_bfloat16*>(q_out),
@@ -1967,7 +1967,7 @@ int flashdrive_w4a8_rotate_dense(const void* x, int ld_x, int rows, int K, int n
   if (rows <= 16) {
     fd_launch(fd_w4a8_rotate_dense_kernel<true>, dim3(dim3(1, K / kRotGroup, n_sets)), dim3(256), (size_t)(0), stream, xb, ld_x, sets, rows, K);
   } else {
-    fd_launch(fd_w4a8_rotate_dense_kernel<false>, dim3(dim3((rows + 127) / 128, K / kRotGroup, n_sets)), dim3(256), (size_t)(0), stream, 
+    fd_launch(fd_w4a8_rotate_dense_kernel<false>, dim3(dim3((rows + 127) / 128, K / kRotGroup, n_sets)), dim3(256), (size_t)(0), stream,
         xb, ld_x, sets, rows, K);
   }
   return cudaPeekAtLastError() == cudaSuccess ? 0 : 4;

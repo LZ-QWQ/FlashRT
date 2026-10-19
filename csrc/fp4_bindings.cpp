@@ -29,8 +29,10 @@
 #include "quantize/quantize_fp4_sfa.cuh"
 #include "quantize/quantize_e0m3_sfa.cuh"
 #include "gemm/fp4/cutlass_fp4_gemm_e0m3w_sm100.cuh"
+#ifdef FLASHRT_HAVE_ALPAMAYO15
 #include "gemm/fp4/alpamayo15_nvfp4_gemm_sm100.cuh"
 #include "quantize/alpamayo15_nvfp4_rows.cuh"
+#endif
 #include "fused_fp4/pi05_e0m3_act.cuh"
 #include "fused_fp4/siglip_ln_vec.cuh"
 #include "quantize/reshape_scales_sfa.cuh"
@@ -1139,6 +1141,7 @@ same contract as cutlass_fp4_gemm_geglu_il_hw.
         "Fused: bf16 [N, D] -> NVFP4 packed [N, D/2] + tile-interleaved "
         "SFA/SFB (vectorized).");
 
+#ifdef FLASHRT_HAVE_ALPAMAYO15
   m.def("alpamayo15_nvfp4_gemm_workspace",
         [](int M, int N, int K, int tile) -> size_t { return flash_rt::fp4::alpamayo15_nvfp4_gemm_workspace(M, N, K, tile); },
         py::arg("M"), py::arg("N"), py::arg("K"), py::arg("tile"));
@@ -1220,6 +1223,7 @@ same contract as cutlass_fp4_gemm_geglu_il_hw.
         py::arg("gate"), py::arg("up"), py::arg("ld"), py::arg("rows"), py::arg("F"), py::arg("packed"), py::arg("sf"),
         py::arg("gs_other") = 0, py::arg("n_alpha") = 0, py::arg("alpha_rows") = 0, py::arg("alpha_ld") = 0, py::arg("stream") = 0,
         "bf16(silu(gate)) * up -> per-row-scaled NVFP4 rows + the rows' GEMM alphas.");
+#endif  // FLASHRT_HAVE_ALPAMAYO15
 
   m.def("cutlass_fp4_gemm_bias_bf16",
         [](uintptr_t A, uintptr_t SFA, uintptr_t B, uintptr_t SFB,

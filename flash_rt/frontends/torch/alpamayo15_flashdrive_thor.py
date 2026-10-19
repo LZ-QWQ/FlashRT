@@ -36,7 +36,41 @@ from typing import Any
 
 import torch
 
-from flash_rt.models.alpamayo15_flashdrive.pipeline_thor import FlashDriveThor, euler_cache_schedule, load_flashdrive
+from flash_rt.models.alpamayo15_flashdrive.pipeline_thor import BF16, DEV, FlashDriveThor, euler_cache_schedule
+
+
+def load_flashdrive(base: str, paro: str, dflash: str, *, torch_compile: str | None = None) -> torch.nn.Module:
+    """Load the full FlashDrive stack from explicit checkpoint locations.
+
+    Mirrors ``flashdrive.from_pretrained`` for an optimized checkpoint (setup
+    order: rollout, compile, streaming, ParoQuant, expert fusion, DFlash) but
+    takes the W4A8 and draft companions explicitly instead of deriving them from
+    a ``z-lab/`` path prefix, so local directories load the optimized stack too.
+    ``torch_compile`` is FlashDrive's compile mode for the primitives FlashRT
+    does not replace (``None`` = eager). The model is placed on the current CUDA device.
+    """
+    try:
+        import flashdrive
+        from flashdrive import FlashDriveMixin, resolve_model_class
+    except ImportError as exc:
+        raise ImportError("the FlashDrive backend needs the flashdrive package "
+                          "(https://github.com/z-lab/flashdrive)") from exc
+    model_cls = resolve_model_class(base)
+    extended = getattr(flashdrive, "_EXTENDED_VISION_RANGES", {}).get(model_cls)
+    if extended is None:
+        raise ValueError(f"FlashDrive does not define streaming ranges for {model_cls.__name__}")
+    model_cls._supports_sdpa = True
+    config = model_cls.config_class.from_pretrained(base)
+    config.attn_implementation = config._attn_implementation = "sdpa"
+    model = model_cls.from_pretrained(base, config=config, dtype=BF16).to(DEV).eval()
+    model.__class__ = type(f"FlashDrive{model_cls.__name__}", (FlashDriveMixin, model_cls), {})
+    model.setup_rollout()
+    model.setup_torch_compile(torch_compile)
+    model.setup_streaming(extended_vision_ranges=extended)
+    model.setup_paroquant(paro)
+    model.setup_expert_fusion()
+    model.setup_dflash(dflash)
+    return model
 
 
 @dataclass(frozen=True)

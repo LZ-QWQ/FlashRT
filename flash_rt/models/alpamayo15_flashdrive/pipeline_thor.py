@@ -18,10 +18,11 @@ expert   ``_action``: the Euler loop with cached velocities (``euler_with_cache`
 vision   ``_encode``: the Qwen3-VL vision tower of the FlashRT Alpamayo 1.5 engine
          (one GEMM patch embedding, FP32 RoPE kernel, batched FA4 attention), one
          CUDA graph per frame grid.
-prefill  ``_dflash_prefill`` (streaming windows), ``_shift_streaming_kv_cache``
-         and the cache bookkeeping of ``_first_prefill``: the 36-layer language
-         model on FlashRT kernels with FlashDrive's W4A8 projections, FA4 causal
-         attention by cache position, one CUDA graph per stream.
+prefill  ``_first_prefill`` (the stream's first window; its bookkeeping computed
+         on the host from the token ids), ``_dflash_prefill`` (streaming windows)
+         and ``_shift_streaming_kv_cache``: the 36-layer language model on
+         FlashRT kernels with FlashDrive's W4A8 projections, FA4 causal attention
+         by cache position, one CUDA graph per stream for streaming windows.
 decode   ``_dflash_block_step`` (draft proposal, 8-row verification, sampling and
          acceptance decisions in one CUDA graph) and ``_dflash_traj_forward``.
          Requires ``prefill="flashrt"``.
@@ -44,8 +45,8 @@ in place through strided views. Masks become FA4 lengths:
 
 Other semantics kept from FlashDrive under ``autocast(bfloat16)``: the expert's
 Euler state, time grid and noise are BF16 (noise drawn with ``normal_`` at
-FlashDrive's draw point); draft proposals are greedy, posterior sampling uses
-FlashDrive's ``sample_tokens``; every cache row FlashDrive writes (including
+FlashDrive's draw point); draft proposals are greedy, posterior sampling follows
+FlashDrive's ``sample_tokens`` rule on the FlashRT sampler; every cache row FlashDrive writes (including
 rejected draft rows and the expert's action rows) is written with the same
 contents, so later reads of stale rows see what FlashDrive would.
 """
@@ -54,11 +55,15 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import numpy as np
 import torch
-import torch.nn.functional as F
 
-from flash_rt.models.alpamayo15.marlin_w4a8 import marlin_w4a8_unpack, pack_w4a8_small  # noqa: F401  (shared Marlin layout)
-from flash_rt.models.alpamayo15.pipeline_thor import _Gemm, _capture  # noqa: F401  (shared tcgen05 GEMM / graph capture)
+from flash_rt.models.alpamayo15.marlin_w4a8 import marlin_w4a8_unpack, pack_w4a8_small
+from flash_rt.models.alpamayo15.pipeline_thor import (_Gemm, _capture, mrope_positions, torch_philox_blocks, torch_philox_increment,
+                                                     torch_rng_state)
+from flash_rt.models.alpamayo15.weights import pack_action_modules
+from flash_rt.models.alpamayo15_flashdrive.weights import (Bf16Fragment, Fp8Fragment, marlin_w4a8_to_int8, paro_pair_bank_order,
+                                                         paro_rotation_matrices, w4a8_to_int8_channel)
 
 BF16 = torch.bfloat16
 DEV = "cuda"
@@ -78,16 +83,22 @@ FLASHDRIVE_KERNEL_SYMBOLS = ("flashdrive_qk_prep_bf16", "flashdrive_rope_rows", 
                              "flashdrive_w4a8_quant", "flashdrive_w4a8_gemm_tile",
                              "flashdrive_bf16_gemm_frag", "flashdrive_w4a8_act_prep_tile")
 TILE_MIN_N = 2048           # few-row W4A8 GEMMs with at least this many output channels stream one warp per 16-row tile
-ENGINE_GEMMS = ("cutlass", "torch")    # BF16 GEMMs of the vision tower and the action expert
 DECODE_WEIGHTS = ("bf16", "int8", "fp8")   # LM head and DFlash draft linears of the decode graphs
 PREFILL_WEIGHTS = ("w4a8", "int8")         # streaming-window GEMM operands: Marlin's group-scaled integers, or per-channel INT8
 EXPERT_WEIGHTS = ("bf16", "fp8")       # action expert projections (FP8 = W8A8 with per-row activation scales)
 W4A8_BACKENDS = ("flashdrive", "fused")
-W4A8_GEMMS = ("tcgen05", "marlin")
 ACT_ROTS = ("paro", "dense")
-TCGEN05_MIN_ROWS = 256      # W4A8 GEMMs with at least this many rows (streaming-window prefill) run on tcgen05
+TCGEN05_MIN_ROWS = 256      # rows of the construction-time check of the unpacked W4A8 layout against Marlin
 INT8_PREFILL_TILE = 2       # per-channel INT8 prefill GEMM: 256 x 128 x 128 on a 2-SM UMMA (0: 128 x 128, 1: 64 x 128; identical integers)
 SMALL_MAX_ROWS = 16         # ... and with at most this many (verification, trajectory start) on the few-row mma kernel
+
+
+def _mrope_sections(rot) -> tuple[int, int]:
+    """(height, width) section widths of a rotary module for the table kernel: Qwen3-VL's interleaved M-RoPE, or
+    (0, 0) for a one-dimensional rotary (``Qwen3RotaryEmbedding``, the DFlash draft), where every frequency takes
+    the first position row."""
+    sec = getattr(rot, "mrope_section", None)
+    return (int(sec[1]), int(sec[2])) if sec is not None else (0, 0)
 
 
 def euler_cache_schedule(inference_step: int, cache_steps) -> list[bool]:
@@ -150,119 +161,18 @@ def _require_autocast() -> None:
                          "call it inside that context (as FlashDrive's scripts/infer.py does)")
 
 
-def load_flashdrive(base: str, paro: str, dflash: str, *, torch_compile: str | None = None) -> torch.nn.Module:
-    """Load the full FlashDrive stack from explicit checkpoint locations.
-
-    Mirrors ``flashdrive.from_pretrained`` for an optimized checkpoint (setup
-    order: rollout, compile, streaming, ParoQuant, expert fusion, DFlash) but
-    takes the W4A8 and draft companions explicitly instead of deriving them from
-    a ``z-lab/`` path prefix, so local directories load the optimized stack too.
-    ``torch_compile`` is FlashDrive's compile mode for the primitives FlashRT
-    does not replace (``None`` = eager). The model is placed on the current CUDA device.
-    """
-    try:
-        import flashdrive
-        from flashdrive import FlashDriveMixin, resolve_model_class
-    except ImportError as exc:
-        raise ImportError("the FlashDrive backend needs the flashdrive package "
-                          "(https://github.com/z-lab/flashdrive)") from exc
-    model_cls = resolve_model_class(base)
-    extended = getattr(flashdrive, "_EXTENDED_VISION_RANGES", {}).get(model_cls)
-    if extended is None:
-        raise ValueError(f"FlashDrive does not define streaming ranges for {model_cls.__name__}")
-    model_cls._supports_sdpa = True
-    config = model_cls.config_class.from_pretrained(base)
-    config.attn_implementation = config._attn_implementation = "sdpa"
-    model = model_cls.from_pretrained(base, config=config, dtype=BF16).to(DEV).eval()
-    model.__class__ = type(f"FlashDrive{model_cls.__name__}", (FlashDriveMixin, model_cls), {})
-    model.setup_rollout()
-    model.setup_torch_compile(torch_compile)
-    model.setup_streaming(extended_vision_ranges=extended)
-    model.setup_paroquant(paro)
-    model.setup_expert_fusion()
-    model.setup_dflash(dflash)
-    return model
-
-
-def marlin_w4a8_to_int8(qweight: torch.Tensor, scales: torch.Tensor, qzeros: torch.Tensor, K: int, N: int,
-                        maps: dict | None = None) -> tuple[torch.Tensor, torch.Tensor]:
-    """``(w8, s)``: ``w8 [N, K]`` int8 = ``w - z`` and ``s [K/128, N]`` int32 (the tcgen05 prefill GEMM operands)."""
-    w, z, s = marlin_w4a8_unpack(qweight, scales, qzeros, K, N, maps)
-    G = K // 128
-    w8 = (w.to(torch.int16) - z.to(torch.int16).repeat_interleave(128, 0)).to(torch.int8).t().contiguous()
-    return w8, s
-
-
-def w4a8_to_int8_channel(w8: torch.Tensor, s: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-channel INT8 requantization of Marlin's group-scaled integers: ``w8 [N, K]`` int8 (w - z) and ``s [K/128, N]``
-    int32 group scales give the exact integer weight ``w8 * s[group]``; its per-channel symmetric INT8 codes
-    (``round(v / c)``, ``c = absmax / 127``) and the fp32 channel scale ``c`` (1 for an all-zero channel) are returned
-    for the per-channel INT8 prefill GEMM (``D = half(acc * a_scale[m] * c[n])``). A precision tier: the codes carry the
-    group-scale ratios of a channel with at most half a step of error."""
-    N, K = w8.shape
-    v = w8.to(torch.int32) * s.t().repeat_interleave(128, 1)           # [N, K] exact integers (|w8| <= 15, s <= 4096)
-    amax = v.abs().amax(dim=1).to(torch.float32)
-    c = torch.where(amax > 0, amax / 127.0, torch.ones_like(amax))
-    codes = torch.round(v.to(torch.float32) / c[:, None]).clamp_(-127.0, 127.0).to(torch.int8).contiguous()
-    return codes, c.contiguous()
-
-
-def paro_pair_bank_order(theta: torch.Tensor, pairs: torch.Tensor, K: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reorder the 64 pairs of every (layer, channel group) of a ParoQuant rotation so that the eight pairs a
-    quarter-warp of the tile kernel handles together touch eight distinct shared-memory bank groups with their first
-    channel (bank group = 16-byte chunk index ``c + c // 8`` mod 8 of the 8-row tile layout). The pairs of a layer are
-    disjoint, so their order does not change the rotation; returns (theta, pairs) in the new order."""
-    G = K // 128
-    pr = pairs.view(8, G, 64, 2).to(torch.int64)
-    th = theta.view(8, G, 64)
-    i = pr[..., 0]
-    res = (i + (i >> 3)) & 7
-    ar = torch.arange(64, device=pairs.device)
-    order = torch.argsort(res * 64 + ar, dim=-1)                       # pairs sorted by bank residue (stable)
-    res_s = torch.gather(res, -1, order)
-    counts = torch.nn.functional.one_hot(res, 8).sum(-2)                # [8, G, 8]
-    starts = counts.cumsum(-1) - counts
-    rank = ar - torch.gather(starts, -1, res_s)                         # rank within the residue class
-    main = rank < 8
-    pos = torch.where(main, rank * 8 + res_s, torch.zeros_like(rank))   # bucket = rank, lane-in-bucket = residue
-    taken = torch.zeros_like(rank).scatter_add(-1, pos, main.long()) > 0
-    free_order = torch.argsort(taken.long() * 64 + ar, dim=-1)           # free positions first, ascending
-    ovf = (~main).long().cumsum(-1) - 1
-    pos = torch.where(main, pos, torch.gather(free_order, -1, ovf.clamp(min=0)))
-    new_pr = torch.empty_like(pr).scatter_(-2, pos.unsqueeze(-1).expand(-1, -1, -1, 2),
-                                           torch.gather(pr, -2, order.unsqueeze(-1).expand(-1, -1, -1, 2)))
-    new_th = torch.empty_like(th).scatter_(-1, pos, torch.gather(th, -1, order))
-    return new_th.reshape(8, K // 2).contiguous(), new_pr.reshape(8, K).to(pairs.dtype).contiguous()
-
-
-def paro_rotation_matrices(theta: torch.Tensor, pairs: torch.Tensor, K: int) -> torch.Tensor:
-    """The 128 x 128 matrix of every channel group of a ParoQuant rotation: ``R[g][c][k]`` such that
-    ``y[g*128 + c] = sum_k R[g][c][k] x[g*128 + k]`` equals the 8 Givens layers applied in order (FP32 products of
-    the layer cosines/sines, returned as FP16 for the tensor-core kernel)."""
-    G = K // 128
-    R = torch.eye(128, device=theta.device, dtype=torch.float32).repeat(G, 1, 1)         # [G, 128, 128]
-    th = theta.float().view(8, G, 64)
-    pr = pairs.view(8, G, 64, 2).long()
-    gidx = torch.arange(G, device=theta.device).unsqueeze(1)
-    for r in range(8):
-        c, s_ = torch.cos(th[r]).unsqueeze(-1), torch.sin(th[r]).unsqueeze(-1)       # [G, 64, 1]
-        i, j = pr[r, :, :, 0], pr[r, :, :, 1]                                        # [G, 64]
-        Ri, Rj = R[gidx, i], R[gidx, j]                                              # rows i, j: [G, 64, 128]
-        R[gidx, i] = c * Ri + s_ * Rj
-        R[gidx, j] = c * Rj - s_ * Ri
-    return R.to(torch.float16).contiguous()
-
-
 class _W4A8Group:
     """FlashDrive ParoQuant linears that share one input (q|k|v, o, gate|up, down) executed as one fused
     activation pass (``flashdrive_w4a8_act_prep``: FP16 cast, pairwise rotation, per-token INT8 quantization,
-    bit-exact with paroquant + vLLM) and the W4A8 GEMM of each linear: vLLM's Marlin kernel, or (``gemm="tcgen05"``,
-    groups of at least ``TCGEN05_MIN_ROWS`` rows) FlashRT's INT8 tensor-core GEMM on the unpacked weights, which
-    computes Marlin's integer group-scaled sums exactly. Returns the FP16 GEMM outputs; FlashDrive's cast back to
+    bit-exact with paroquant + vLLM) and the W4A8 GEMM of each linear on FlashRT kernels computing Marlin's integer
+    group-scaled sums exactly: the INT8 tcgen05 GEMM on the unpacked ``w - z`` weights for row tiles (streaming-window
+    and first-window prefill), the few-row ``mma.sync`` kernel on the packed nibbles for at most ``SMALL_MAX_ROWS``
+    rows (verification, trajectory start). The unpacked layout is checked against vLLM's Marlin kernel once per shape
+    when the backend is built (``check_against_marlin``). Returns the FP16 GEMM outputs; FlashDrive's cast back to
     BF16 is applied by the consumer kernels on load."""
 
-    def __init__(self, fvk, wrappers, scratch: dict, gemm: str = "marlin", maps: dict | None = None,
-                 act_rot: str = "paro", ktile: int = 256, prefill_weights: str = "w4a8") -> None:
+    def __init__(self, fvk, wrappers, scratch: dict, maps: dict | None = None, act_rot: str = "paro", ktile: int = 256,
+                 prefill_weights: str = "w4a8") -> None:
         from flashdrive.quantization import BF16RotateLinearWrapper
         from vllm.scalar_type import scalar_types
         mods = []
@@ -289,23 +199,20 @@ class _W4A8Group:
         self.rot = [paro_rotation_matrices(m.rotation.theta, m.rotation.pairs, self.K) for m in mods] if act_rot == "dense" else None
         tabs = [paro_pair_bank_order(m.rotation.theta, m.rotation.pairs, self.K) for m in mods]   # bank-ordered pair tables
         self.theta, self.pairs = [t for t, _ in tabs], [p for _, p in tabs]
-        self.int8 = None
-        self.int8pc = None
-        self.small = None
-        if gemm == "tcgen05":       # FlashRT GEMMs: tcgen05 INT8 ((w - z) int8 [N, K]) for prefill-size groups,
-            self.int8, self.small = [], []   # mma.sync on packed nibbles + zero points for a few rows
-            if prefill_weights == "int8":    # ... or per-channel INT8 codes on the plain INT8 GEMM (precision tier)
-                self.int8pc = []
-            for m, N in zip(mods, self.N):
-                w, z, sg = marlin_w4a8_unpack(m.qlinear.qweight, m.qlinear.scales, m.qlinear.qzeros, self.K, N, maps)
-                w8 = (w.to(torch.int16) - z.to(torch.int16).repeat_interleave(128, 0)).to(torch.int8).t().contiguous()
-                if self.int8pc is not None:
-                    self.int8pc.append(w4a8_to_int8_channel(w8, sg))
-                    del w8
-                else:
-                    self.int8.append((w8, sg))
-                self.small.append((pack_w4a8_small(w, self.K, N), z.contiguous(), sg))
-                del w, z
+        # tcgen05 INT8 ((w - z) int8 [N, K], or per-channel INT8 codes with prefill_weights="int8") for row tiles,
+        # mma.sync on packed nibbles + zero points for a few rows
+        self.int8, self.small = [], []
+        self.int8pc = [] if prefill_weights == "int8" else None
+        for m, N in zip(mods, self.N):
+            w, z, sg = marlin_w4a8_unpack(m.qlinear.qweight, m.qlinear.scales, m.qlinear.qzeros, self.K, N, maps)
+            w8 = (w.to(torch.int16) - z.to(torch.int16).repeat_interleave(128, 0)).to(torch.int8).t().contiguous()
+            if self.int8pc is not None:
+                self.int8pc.append(w4a8_to_int8_channel(w8, sg))
+                del w8
+            else:
+                self.int8.append((w8, sg))
+            self.small.append((pack_w4a8_small(w, self.K, N), z.contiguous(), sg))
+            del w, z
 
     def _buffers(self, M: int) -> dict:
         n = len(self.mods)
@@ -335,20 +242,11 @@ class _W4A8Group:
             ptrs(b["xq"]), ptrs(b["as"]), 0, 0, torch.cuda.current_stream().cuda_stream)
 
     def gemm(self, fvk, M: int) -> list[torch.Tensor]:
-        """The GEMMs of the group on the prepared INT8 activations of ``M`` rows."""
-        from vllm import _custom_ops as ops
-        from vllm.model_executor.layers.quantization.utils.marlin_utils import should_use_atomic_add_reduce
+        """The GEMMs of the group on the prepared INT8 activations of ``M`` rows: the few-row kernel up to
+        ``SMALL_MAX_ROWS`` rows, the tcgen05 GEMM otherwise."""
         b = self._buffers(M)
         outs = []
-        if self.int8pc is not None and M >= TCGEN05_MIN_ROWS:
-            for (codes, c), xq, a_s, N in zip(self.int8pc, b["xq"], b["as"], self.N):
-                outs.append(self._gemm_int8pc(fvk, xq, codes, c, a_s, M, N))
-            return outs
-        if self.int8 is not None and M >= TCGEN05_MIN_ROWS:
-            for (w8, sg), xq, a_s, N in zip(self.int8, b["xq"], b["as"], self.N):
-                outs.append(self._gemm_int8(fvk, xq, w8, sg, a_s, M, N))
-            return outs
-        if self.small is not None and M <= SMALL_MAX_ROWS:
+        if M <= SMALL_MAX_ROWS:
             for (wp, z, sg), xq, a_s, N in zip(self.small, b["xq"], b["as"], self.N):
                 out = torch.empty(M, N, dtype=torch.float16, device=DEV)
                 gemm = fvk.flashdrive_w4a8_gemm_tile if N >= TILE_MIN_N else fvk.flashdrive_w4a8_gemm_small
@@ -356,13 +254,12 @@ class _W4A8Group:
                      torch.cuda.current_stream().cuda_stream)
                 outs.append(out)
             return outs
-        for m, xq, a_s, N in zip(self.mods, b["xq"], b["as"], self.N):
-            q = m.qlinear
-            out = ops.marlin_gemm(xq[:M], None, q.qweight, q.bias, q.scales, a_s, None, q.qzeros, q.g_idx,
-                                  q.g_idx_sort_indices, q.workspace, q.quant_type, size_m=M, size_n=N, size_k=self.K,
-                                  use_atomic_add=should_use_atomic_add_reduce(M, N, self.K, xq.device, torch.float16),
-                                  use_fp32_reduce=True, is_zp_float=False)
-            outs.append(out)
+        if self.int8pc is not None:
+            for (codes, c), xq, a_s, N in zip(self.int8pc, b["xq"], b["as"], self.N):
+                outs.append(self._gemm_int8pc(fvk, xq, codes, c, a_s, M, N))
+            return outs
+        for (w8, sg), xq, a_s, N in zip(self.int8, b["xq"], b["as"], self.N):
+            outs.append(self._gemm_int8(fvk, xq, w8, sg, a_s, M, N))
         return outs
 
     def __call__(self, fvk, x: torch.Tensor) -> list[torch.Tensor]:
@@ -449,55 +346,18 @@ class _W4A8Group:
         return worst
 
 
-def bf16_fragment_layout(w: torch.Tensor) -> torch.Tensor:
-    """Reorder a [N, K] bf16 weight into the ``flashdrive_bf16_gemm_frag`` operand: ``[ceil(N/16)][K/16][32 lanes][16 B]``,
-    lane ``4g + c`` holding the four ``mma.m16n8k16`` A registers of one 16-wide k step (rows g, g+8; k 2c and 8+2c).
-    Rows are zero-padded to a multiple of 16."""
-    N, K = w.shape
-    if K % 16:
-        raise ValueError(f"K={K} must be a multiple of 16")
-    T = (N + 15) // 16
-    if T * 16 != N:
-        w = torch.cat([w, w.new_zeros(T * 16 - N, K)])
-    # n = 16T + 8rh + g ; k = 16kc + 8half + 2c + e  ->  [T, kc, g, c, half, rh, e]  (register a = 2half + rh)
-    frag = w.view(T, 2, 8, K // 16, 2, 4, 2).permute(0, 3, 2, 5, 4, 1, 6).contiguous()
-    return frag.view(-1)
-
-
-class _Bf16Frag:
-    """Fragment-ordered BF16 copy of a [N, K] linear weight for the streaming few-row GEMM."""
-
-    def __init__(self, w: torch.Tensor) -> None:
-        with torch.no_grad():
-            self.frag = bf16_fragment_layout(w.detach())
-        self.shape = tuple(w.shape)
-
-
-class _Fp8Weight:
-    """Per-row one-byte copy of a [N, K] linear weight (``fmt`` "fp8": E4M3 codes, "int8": symmetric INT8 codes; both
-    with per-row FP32 scales) in the ``alpamayo15_w8a16_gemm_bf16`` fragment order."""
-
-    def __init__(self, w: torch.Tensor, fmt: str = "fp8") -> None:
-        from flash_rt.models.alpamayo15.pipeline_thor import fp8_fragment_layout, quantize_fp8_rows, quantize_int8_rows
-        with torch.no_grad():
-            codes, scale = (quantize_int8_rows if fmt == "int8" else quantize_fp8_rows)(w.detach())
-            self.frag, self.scale = fp8_fragment_layout(codes, scale)
-        self.shape = tuple(w.shape)
-        self.fmt = 1 if fmt == "int8" else 0
-
-
 def _gemm_small(fvk, x: torch.Tensor, w, y: torch.Tensor) -> torch.Tensor:
     """``y = x @ w.T`` for at most 16 rows: ``flashdrive_bf16_gemm_small`` on a BF16 weight, or the W8A16 kernel on
-    an ``_Fp8Weight`` (``x`` must come from a buffer with whole 8-row tiles readable past its rows; ``y`` row-major,
+    an ``Fp8Fragment`` (``x`` must come from a buffer with whole 8-row tiles readable past its rows; ``y`` row-major,
     bf16, or fp32 for the BF16 path only)."""
-    if isinstance(w, _Fp8Weight):
+    if isinstance(w, Fp8Fragment):
         N, K = w.shape
         if y.dtype != BF16 or y.stride(0) != N or x.stride(0) != K:
             raise ValueError("the W8A16 path needs contiguous bf16 operands")
         fvk.alpamayo15_w8a16_gemm_bf16(w.frag.data_ptr(), w.scale.data_ptr(), x.data_ptr(), y.data_ptr(), x.shape[0], N, K,
                                        torch.cuda.current_stream().cuda_stream, w.fmt)
         return y
-    if isinstance(w, _Bf16Frag):
+    if isinstance(w, Bf16Fragment):
         N, K = w.shape
         fvk.flashdrive_bf16_gemm_frag(x.data_ptr(), x.stride(0), w.frag.data_ptr(), y.data_ptr(), y.stride(0),
                                       int(y.dtype == torch.float32), x.shape[0], N, K, torch.cuda.current_stream().cuda_stream)
@@ -520,19 +380,11 @@ class FlashDriveThor:
             ``"fused"`` (default with ``prefill="flashrt"``; one activation pass
             per shared input and Marlin outputs consumed by the next kernel) or
             ``"flashdrive"`` (FlashDrive's ParoQuant modules).
-        w4a8_gemm: GEMM of fused W4A8 groups with at least ``TCGEN05_MIN_ROWS``
-            rows (streaming-window prefill): ``"tcgen05"`` (default; INT8 tensor
-            cores on unpacked ``w - z`` weights, about 7 GB more memory) or
-            ``"marlin"``. Smaller groups always use Marlin. Only with
-            ``w4a8="fused"``.
         act_rot: rotation of the W4A8 activations (``w4a8="fused"``): ``"paro"``
             (default; layer by layer, bit-exact with ParoQuant's kernel) or
             ``"dense"`` (one 128 x 128 FP16 matrix per channel group on tensor
             cores, FP32 accumulation, one FP16 rounding: a numerics change
             that can move INT8 codes by one step).
-        vision_gemm, expert_gemm: ``"cutlass"`` (default; FlashRT's tcgen05 BF16
-            GEMMs with fused bias / GELU / residual epilogues) or ``"torch"``
-            (cuBLAS through torch) for the vision tower and the action expert.
         decode_weights: ``"bf16"`` (default; fragment-ordered BF16 copies of the LM
             head and the DFlash draft linears for the streaming few-row GEMM),
             ``"int8"`` (per-row symmetric INT8 copies on the W8A16 kernel) or
@@ -559,16 +411,16 @@ class FlashDriveThor:
     # The vision tower of the FlashRT Alpamayo 1.5 engine (same Qwen3-VL tower and numerics).
     from flash_rt.models.alpamayo15.pipeline_thor import Alpamayo15Thor as _Engine
     _vision_tables = _Engine._vision_tables
-    _vision = _Engine._vision
     _vision_cutlass = _Engine._vision_cutlass
     _merger = _Engine._merger
     _check_vision_modules = _Engine._check_vision_modules
+    # The action expert's input projection (Fourier features, SiLU MLP, LayerNorm) as the engine runs it.
+    _action_in = _Engine._action_in
     del _Engine
 
     def __init__(self, model, *, expert: str = "flashrt", vision: str = "flashrt", prefill: str = "flashrt",
-                 decode: str = "flashrt", w4a8: str | None = None, w4a8_gemm: str | None = None,
-                 act_rot: str = "paro", vision_gemm: str = "cutlass", expert_gemm: str = "cutlass",
-                 decode_weights: str = "bf16", expert_weights: str = "bf16", pdl: bool = False, w4a8_ktile: int = 256,
+                 decode: str = "flashrt", w4a8: str | None = None,
+                 act_rot: str = "paro", decode_weights: str = "bf16", expert_weights: str = "bf16", pdl: bool = False, w4a8_ktile: int = 256,
                  expert_splits: int = 1, prefill_weights: str = "w4a8") -> None:
         if w4a8_ktile not in (128, 256):
             raise ValueError("w4a8_ktile must be 128 or 256")
@@ -577,15 +429,11 @@ class FlashDriveThor:
         backends = {"expert": expert, "vision": vision, "prefill": prefill, "decode": decode}
         if act_rot not in ACT_ROTS:
             raise ValueError(f"unknown act_rot {act_rot!r}; choose from {ACT_ROTS}")
-        if vision_gemm not in ENGINE_GEMMS or expert_gemm not in ENGINE_GEMMS:
-            raise ValueError(f"vision_gemm / expert_gemm must be one of {ENGINE_GEMMS}")
         if decode_weights not in DECODE_WEIGHTS:
             raise ValueError(f"unknown decode_weights {decode_weights!r}; choose from {DECODE_WEIGHTS}")
         if expert_weights not in EXPERT_WEIGHTS:
             raise ValueError(f"unknown expert_weights {expert_weights!r}; choose from {EXPERT_WEIGHTS}")
-        if expert_weights == "fp8" and expert_gemm != "cutlass":
-            raise ValueError("expert_weights='fp8' runs on the FlashRT GEMMs (expert_gemm='cutlass')")
-        self.vision_gemm, self.expert_gemm, self.decode_weights = vision_gemm, expert_gemm, decode_weights
+        self.decode_weights = decode_weights
         self.expert_weights = expert_weights
         if w4a8 is None:
             w4a8 = "fused" if prefill == "flashrt" else "flashdrive"
@@ -596,15 +444,8 @@ class FlashDriveThor:
             raise ValueError(f"unknown w4a8 execution {w4a8!r}; choose from {W4A8_BACKENDS}")
         if w4a8 == "fused" and prefill != "flashrt":
             raise ValueError("w4a8='fused' applies to the FlashRT language model (prefill='flashrt')")
-        if w4a8_gemm is not None and w4a8 != "fused":
-            raise ValueError("w4a8_gemm applies to w4a8='fused'")
-        if w4a8 == "fused" and w4a8_gemm is None:
-            w4a8_gemm = "tcgen05"
-        if w4a8 == "fused" and w4a8_gemm not in W4A8_GEMMS:
-            raise ValueError(f"unknown w4a8_gemm {w4a8_gemm!r}; choose from {W4A8_GEMMS}")
         backends["w4a8"] = w4a8
         if w4a8 == "fused":
-            backends["w4a8_gemm"] = w4a8_gemm
             backends["act_rot"] = act_rot
         if decode == "flashrt" and prefill != "flashrt":
             raise ValueError("decode='flashrt' needs prefill='flashrt' (the rotated cache copy is kept by FlashRT writes)")
@@ -613,7 +454,7 @@ class FlashDriveThor:
         except ImportError as exc:
             raise ImportError("the FlashDrive backend needs the flashdrive package") from exc
         if not isinstance(model, FlashDriveMixin):
-            raise TypeError("FlashDriveThor needs a FlashDrive model (see load_flashdrive)")
+            raise TypeError("FlashDriveThor needs a FlashDrive model (see flash_rt.frontends.torch.alpamayo15_flashdrive_thor.load_flashdrive)")
         if model.training:
             raise ValueError("FlashDriveThor requires an eval-mode model")
         self.m = model
@@ -636,6 +477,7 @@ class FlashDriveThor:
         fvk.alpamayo15_set_pdl(bool(pdl))      # process-wide: programmatic dependent launch of the backend's kernels
         backends["pdl"] = bool(pdl)
         self._gemm = _Gemm(fvk)
+        self._rng_blocks = torch_philox_blocks()
         self._fa4 = fa4_backend.fa4_fwd()
         if self._fa4 is None:
             raise RuntimeError(f"FA4 unavailable: {fa4_backend.status()}")
@@ -648,16 +490,13 @@ class FlashDriveThor:
             self.vision_attention = "fa4"
             self._vis_tables: dict = {}
             self._vis_graphs: dict = {}
-            backends["vision_gemm"] = vision_gemm
-            if vision_gemm == "cutlass":
-                self._check_vision_modules()
+            self._check_vision_modules()
             model._encode = self._encode
         if expert == "flashrt":
-            backends["expert_gemm"] = expert_gemm
             backends["expert_weights"] = expert_weights
         if w4a8 == "fused":
             self._w4, scratch, maps = [], {}, {}
-            grp = lambda mods: _W4A8Group(fvk, mods, scratch, w4a8_gemm, maps, act_rot, w4a8_ktile, prefill_weights)
+            grp = lambda mods: _W4A8Group(fvk, mods, scratch, maps, act_rot, w4a8_ktile, prefill_weights)
             backends["w4a8_ktile"] = w4a8_ktile
             backends["prefill_weights"] = prefill_weights
             for layer in model.vlm.model.language_model.layers:
@@ -666,8 +505,8 @@ class FlashDriveThor:
                                  "gu": grp([mlp.gate_proj, mlp.up_proj]), "down": grp([mlp.down_proj])})
             del maps, grp
             torch.cuda.empty_cache()        # index maps of the weight unpacking (about 1 GB, transient)
-            if w4a8_gemm == "tcgen05":      # unpacked layout checked against Marlin itself, once per shape
-                self.w4a8_gemm_agreement = min(g.check_against_marlin(fvk) for g in self._w4[0].values())
+            # the unpacked layout checked against Marlin itself, once per shape
+            self.w4a8_gemm_agreement = min(g.check_against_marlin(fvk) for g in self._w4[0].values())
         if prefill == "flashrt" and expert == "flashdrive":
             fd_action = model._action
 
@@ -680,7 +519,6 @@ class FlashDriveThor:
                 return out
             model._action = action_then_sync
         if prefill == "flashrt":
-            self._orig_first_prefill = model._first_prefill
             model._first_prefill = self._first_prefill
             model._dflash_prefill = self._dflash_prefill
             model._shift_streaming_kv_cache = self._shift
@@ -731,14 +569,25 @@ class FlashDriveThor:
                 raise ValueError("FlashDriveThor expects an initialized single-sample FlashDrive cache")
         st = {"pkv": pkv, "pos": pos, "S": S, "graphs": {}, "keep": {},
               "k": [layer.keys for layer in pkv.layers], "v": [layer.values for layer in pkv.layers]}
+        D = self.head_dim
+        pos3 = pos[:, 0, :].to(torch.int32).contiguous()       # the stream's fixed (temporal, height, width) positions
+        s = torch.cuda.current_stream().cuda_stream
         if self.backends["prefill"] == "flashrt":
             # VLM rotary tables over the stream's fixed position table (BF16, as FlashDrive's BF16 forward computes).
-            cos, sin = m.vlm.model.language_model.rotary_emb(torch.zeros(1, device=DEV, dtype=BF16), pos)
-            st["cos"], st["sin"] = cos[0].contiguous(), sin[0].contiguous()
+            rot = m.vlm.model.language_model.rotary_emb
+            st["cos"], st["sin"] = torch.empty(S, D, device=DEV, dtype=BF16), torch.empty(S, D, device=DEV, dtype=BF16)
+            self._fvk.alpamayo15_mrope_tables(pos3.data_ptr(), rot.inv_freq.detach().float().contiguous().data_ptr(),
+                                              *_mrope_sections(rot), float(rot.attention_scaling),
+                                              st["cos"].data_ptr(), st["sin"].data_ptr(), S, D, 0, s)
             st["kvlm"] = torch.empty(self.n_layers, S, self.n_kv, self.head_dim, device=DEV, dtype=BF16)
+            st["rng"] = torch.tensor([torch.cuda.initial_seed() & 0x7FFFFFFFFFFFFFFF, 0, 0], dtype=torch.int64, device=DEV)
         if self.backends["expert"] == "flashrt":
-            cos, sin = m.expert.rotary_emb(torch.zeros(1, device=DEV, dtype=torch.float32), pos)
-            st["e_cos_tab"], st["e_sin_tab"] = cos[0].contiguous(), sin[0].contiguous()
+            rot = m.expert.rotary_emb
+            st["e_cos_tab"] = torch.empty(S, D, device=DEV, dtype=torch.float32)
+            st["e_sin_tab"] = torch.empty(S, D, device=DEV, dtype=torch.float32)
+            self._fvk.alpamayo15_mrope_tables(pos3.data_ptr(), rot.inv_freq.detach().float().contiguous().data_ptr(),
+                                              *_mrope_sections(rot), float(rot.attention_scaling),
+                                              st["e_cos_tab"].data_ptr(), st["e_sin_tab"].data_ptr(), S, D, 1, s)
             st["ke"] = torch.empty(self.n_layers, S, self.n_kv, self.head_dim, device=DEV, dtype=BF16)
         self._st = st
         if "kvlm" in st:
@@ -789,7 +638,7 @@ class FlashDriveThor:
                     "e_cos": mk(A, D, dt=torch.float32), "e_sin": mk(A, D, dt=torch.float32)}
         self._e8 = None
         if self.expert_weights == "fp8":
-            from flash_rt.models.alpamayo15.pipeline_thor import quantize_fp8_rows
+            from flash_rt.models.alpamayo15.weights import quantize_fp8_rows
             self._e8 = []
             with torch.no_grad():
                 for layer in m.expert.layers:
@@ -807,6 +656,10 @@ class FlashDriveThor:
         self.noise = mk(1, A, self.act_dim)            # FlashDrive's BF16 action noise buffer
         self.x_out = mk(1, A, self.act_dim)
         self.v_cache = mk(1, A, self.act_dim)
+        self.act = pack_action_modules(m, self.act_dim, self.n_act)
+        self._eb.update({"af": mk(A, self.act.k0), "ah0": mk(A, self.act.mlp[0][0].shape[0]), "ah1": mk(A, self.act.mlp[0][0].shape[0]),
+                         "ae": mk(A, E), "v": mk(A, self.act_dim)})
+        self.e_idx = torch.arange(A, dtype=torch.long, device=DEV)   # action rows: e_idx + d_slot
         self.d_slot = torch.zeros(1, dtype=torch.long, device=DEV)    # action_start (first action cache row)
         self.d_seqk = torch.zeros(1, dtype=torch.int32, device=DEV)   # action_start + n_act keys attended
         self.d_ke_rows = torch.zeros(1, dtype=torch.int32, device=DEV)  # rows [0, action_start) to rotate
@@ -820,12 +673,10 @@ class FlashDriveThor:
         res, hn, qkv, q, o, d = b["res"], b["hn"], b["qkv"], b["q"], b["o"], b["d"]
         eps = self.e_eps
         layers = m.expert.layers
-        emb = m.action_in_proj(x, t)
-        res.copy_(emb.reshape(A, E))                                             # FP32 residual stream
+        self._action_in(x.view(A, self.act_dim), t, A, res, s)                  # FP32 residual stream (action_in_proj)
         fvk.alpamayo15_res_rms_f32_bf16(res.data_ptr(), 0, layers[0].input_layernorm.weight.data_ptr(),
                                         hn.data_ptr(), A, E, eps, s)
         ld = qkv.shape[1]
-        cut = self.expert_gemm == "cutlass"
         e8 = self._e8
 
         def lin8(x, name, li, y):          # W8A8: per-row FP8 activations x per-row FP8 weights, scales in the epilogue
@@ -839,10 +690,8 @@ class FlashDriveThor:
             a = layer.self_attn
             if e8 is not None:
                 lin8("hn", "qkv", li, qkv)
-            elif cut:
-                self._gemm(hn, a.qkv_proj.weight, qkv, tile=1)
             else:
-                torch.mm(hn, a.qkv_proj.weight.t(), out=qkv)
+                self._gemm(hn, a.qkv_proj.weight, qkv, tile=1)
             # q rotated (FP32 rule); action-row K (normalized, un-rotated) and V written into FlashDrive's cache
             # at action_start, as FlashDrive's expert forward does, and K's rotation into the expert view.
             fvk.flashdrive_qk_prep_bf16(
@@ -856,56 +705,51 @@ class FlashDriveThor:
             if e8 is not None:
                 b["q"].copy_(out.view(A, HQ * D))        # attention output rows (q buffer reused as the FP8 source)
                 lin8("att", "o", li, o)
-            elif cut:
-                self._gemm(out.view(A, HQ * D), a.o_proj.weight, o, tile=1)
             else:
-                torch.mm(out.view(A, HQ * D), a.o_proj.weight.t(), out=o)
+                self._gemm(out.view(A, HQ * D), a.o_proj.weight, o, tile=1)
             fvk.alpamayo15_res_rms_f32_bf16(res.data_ptr(), o.data_ptr(), layer.post_attention_layernorm.weight.data_ptr(),
                                             hn.data_ptr(), A, E, eps, s)
-            if cut:
-                gu, act = b["gu"], b["act"]
-                if e8 is not None:
-                    lin8("hn", "gu", li, gu)
-                else:
-                    self._gemm(hn, layer.mlp.gate_up_proj.weight, gu, tile=1)
-                # gate | up are the halves of one row-major [A, 2F] GEMM output: split them for the SiLU-mul kernel
-                fvk.alpamayo15_silu_mul_split_bf16(gu.data_ptr(), gu[:, F_:].data_ptr(), 2 * F_, act.data_ptr(), A, F_, s)
-                if e8 is not None:
-                    lin8("act", "down", li, d)
-                else:
-                    self._gemm(act, layer.mlp.down_proj.weight, d, tile=1)
+            gu, act = b["gu"], b["act"]
+            if e8 is not None:
+                lin8("hn", "gu", li, gu)
             else:
-                gu = torch.mm(hn, layer.mlp.gate_up_proj.weight.t())
-                act = F.silu(gu[:, :F_]) * gu[:, F_:]
-                torch.mm(act, layer.mlp.down_proj.weight.t(), out=d)
+                self._gemm(hn, layer.mlp.gate_up_proj.weight, gu, tile=1)
+            # gate | up are the halves of one row-major [A, 2F] GEMM output: split them for the SiLU-mul kernel
+            fvk.alpamayo15_silu_mul_split_bf16(gu.data_ptr(), gu[:, F_:].data_ptr(), 2 * F_, act.data_ptr(), A, F_, s)
+            if e8 is not None:
+                lin8("act", "down", li, d)
+            else:
+                self._gemm(act, layer.mlp.down_proj.weight, d, tile=1)
             nxt = layers[li + 1].input_layernorm.weight if li + 1 < len(layers) else m.expert.norm.weight
             fvk.alpamayo15_res_rms_f32_bf16(res.data_ptr(), d.data_ptr(), nxt.data_ptr(), hn.data_ptr(), A, E, eps, s)
-        v = F.linear(hn, m.action_out_proj.weight, m.action_out_proj.bias).view(1, A, self.act_dim)
+        fvk.alpamayo15_action_out_euler(hn.data_ptr(), self.act.out_w.data_ptr(), self.act.out_b.data_ptr(), 0.0, 0, b["v"].data_ptr(), A, E,
+                                        self.act_dim, s)
+        v = b["v"].view(1, A, self.act_dim)
         if rec is not None:
             rec.append(v.clone())
         return v
 
-    def _denoise(self, st: dict, schedule: list[bool], time_steps: torch.Tensor, rec: dict | None) -> None:
+    def _denoise(self, st: dict, schedule: list[bool], time_steps: torch.Tensor, step_dt: list[float], rec: dict | None) -> None:
         # Expert view of every cached prompt/reasoning row (FP32 rule); the action rows are written per step.
+        fvk = self._fvk
+        s = torch.cuda.current_stream().cuda_stream
         for li in range(self.n_layers):
             self._rope_rows(st, li, st["ke"][li], st["e_cos_tab"], st["e_sin_tab"], 1, st["S"], n_dev=self.d_ke_rows)
-        b = self._eb
-        idx = torch.arange(self.n_act, device=DEV) + self.d_slot
-        torch.index_select(st["e_cos_tab"], 0, idx, out=b["e_cos"])
-        torch.index_select(st["e_sin_tab"], 0, idx, out=b["e_sin"])
-        x = self.noise
+        b, D, A = self._eb, self.head_dim, self.n_act
+        for name in ("e_cos", "e_sin"):
+            fvk.alpamayo15_gather_rows_bytes(st[name + "_tab"].data_ptr(), 4 * D, self.e_idx.data_ptr(), self.d_slot.data_ptr(),
+                                             b[name].data_ptr(), 4 * D, A, 4 * D, s)
+        x = self.x_out
+        x.copy_(self.noise)
         for i, cached in enumerate(schedule):
-            dt = time_steps[i + 1] - time_steps[i]
-            t = time_steps[i].view(1, 1, 1).expand(1, 1, 1)
             if cached:
                 v = self.v_cache
             else:
-                v = self._velocity(x, t, st, None if rec is None else rec["v"])
+                v = self._velocity(x, time_steps[i:i + 1], st, None if rec is None else rec["v"])
                 self.v_cache.copy_(v)
-            x = x + dt * v
+            fvk.alpamayo15_euler_bf16(x.data_ptr(), v.data_ptr(), step_dt[i], A * self.act_dim, s)   # x = x + dt * v (BF16)
             if rec is not None:
                 rec["x"].append(x.clone())
-        self.x_out.copy_(x)
         if "kvlm" in st:  # keep the VLM view of the action rows FlashDrive's cache now holds
             for li in range(self.n_layers):
                 self._rope_rows(st, li, st["kvlm"][li], st["cos"], st["sin"], 0, self.n_act, slot=self.d_slot)
@@ -933,6 +777,8 @@ class FlashDriveThor:
         g = st["graphs"].get(key)
         if g is None:
             time_steps = torch.linspace(0.0, 1.0, n_steps + 1, device=DEV, dtype=BF16)   # FlashDrive's BF16 grid
+            ts_host = torch.linspace(0.0, 1.0, n_steps + 1, dtype=BF16)
+            step_dt = [float((ts_host[i + 1] - ts_host[i]).float()) for i in range(n_steps)]   # BF16 differences
             st["keep"][key] = time_steps                   # captured by address: keep alive with the graph
             rec = {"v": [], "x": []} if self.record_steps else None
             # Warm up / capture on scratch rows past every live row; the touched cache rows are restored.
@@ -942,7 +788,7 @@ class FlashDriveThor:
             kvlm_rows = st["kvlm"][:, scratch:].clone() if "kvlm" in st else None
             self.d_slot.fill_(scratch); self.d_seqk.fill_(st["S"]); self.d_ke_rows.fill_(scratch)
             self.noise.zero_()
-            g = _capture(lambda: self._denoise(st, list(schedule), time_steps, rec))
+            g = _capture(lambda: self._denoise(st, list(schedule), time_steps, step_dt, rec))
             for t, sv in zip((self.noise, self.d_slot, self.d_seqk, self.d_ke_rows, self.v_cache), saved):
                 t.copy_(sv)
             for (k, v), (ks, vs) in zip(zip(st["k"], st["v"]), rows):
@@ -974,16 +820,17 @@ class FlashDriveThor:
         if ent is None:
             px = torch.empty_like(pixel_values)
             px.copy_(pixel_values)
-            vision = self._vision_cutlass if self.vision_gemm == "cutlass" else self._vision
+            px16 = torch.empty(pixel_values.shape, device=DEV, dtype=BF16) if pixel_values.dtype != BF16 else None
+            vision = self._vision_cutlass
             with torch.autocast("cuda", dtype=BF16):
-                vision(px, image_grid_thw)                  # builds the per-grid tables outside capture
+                vision(px, image_grid_thw, px16)            # builds the per-grid tables outside capture
             grid_host = image_grid_thw.cpu()                # table lookup key only: no device sync while capturing
             tables = self._vis_tables[tuple(grid_host.flatten().tolist())]   # captured by address: keep alive
             out = {}
 
             def run():
-                out["img"], out["deep"] = vision(px, grid_host)
-            ent = {"px": px, "out": out, "tables": tables, "graph": _capture(run)}
+                out["img"], out["deep"] = vision(px, grid_host, px16)
+            ent = {"px": px, "px16": px16, "out": out, "tables": tables, "graph": _capture(run)}
             self._vis_graphs[key] = ent
         ent["px"].copy_(pixel_values)
         ent["graph"].replay()
@@ -1000,6 +847,7 @@ class FlashDriveThor:
             mk = lambda *shape, dt=BF16: torch.empty(*shape, device=DEV, dtype=dt)
             ncap = len(self.m.vlm.model.language_model._capture_layer_ids)
             b = {"x": mk(n, H), "h": torch.zeros(n + 8, H, device=DEV, dtype=BF16)[:n],   # few-row GEMMs read 8-row tiles of h
+                 "d16": mk(n, H),
                  "q": mk(n, NH * D), "attn": mk(n, NH * D), "act": mk(n, F_),
                  "cos": mk(n, D), "sin": mk(n, D), "rows": torch.zeros(n, dtype=torch.long, device=DEV),
                  "ctx": mk(ctx_rows, ncap * H)}
@@ -1053,9 +901,11 @@ class FlashDriveThor:
                 w4["down"].prep(fvk, 2, g, n, src2=u)
                 d = w4["down"].gemm(fvk, n)[0]
                 if deep is not None and li < len(deep):   # residual += down, DeepStack injection, next input norm
-                    d16 = d.to(BF16)
+                    d16 = b["d16"]
+                    fvk.alpamayo15_cast_f16_bf16(d.data_ptr(), d16.data_ptr(), n * H, s)
                     fvk.residual_add(x.data_ptr(), d16.data_ptr(), n * H, s)
-                    x.index_add_(0, vis_idx, deep[li])
+                    fvk.alpamayo15_scatter_rows_bf16(x.data_ptr(), H, vis_idx.data_ptr(), deep[li].data_ptr(), deep[li].stride(0),
+                                                     deep[li].shape[0], H, 1, s)
                     if li + 1 < len(layers):
                         self._w4[li + 1]["qkv"].prep(fvk, 1, None, n, residual=x, norm_w=nxt, eps=eps)
                     else:
@@ -1085,9 +935,11 @@ class FlashDriveThor:
             nxt = layers[li + 1].input_layernorm.weight if li + 1 < len(layers) else lm.norm.weight
             if deep is not None and li < len(deep):
                 if w4 is not None:
-                    d = d.to(BF16)
+                    fvk.alpamayo15_cast_f16_bf16(d.data_ptr(), b["d16"].data_ptr(), n * H, s)
+                    d = b["d16"]
                 fvk.residual_add(x.data_ptr(), d.data_ptr(), n * H, s)
-                x.index_add_(0, vis_idx, deep[li])                      # FlashDrive's DeepStack injection
+                fvk.alpamayo15_scatter_rows_bf16(x.data_ptr(), H, vis_idx.data_ptr(), deep[li].data_ptr(), deep[li].stride(0),
+                                                 deep[li].shape[0], H, 1, s)                      # FlashDrive's DeepStack injection
                 fvk.alpamayo15_rms_bf16(x.data_ptr(), 0, nxt.data_ptr(), h.data_ptr(), n, H, eps, s)
             elif w4 is not None:
                 fvk.flashdrive_rms_f16delta_bf16(x.data_ptr(), d.data_ptr(), nxt.data_ptr(), h.data_ptr(), n, H, eps, s)
@@ -1098,13 +950,73 @@ class FlashDriveThor:
                 b["ctx"][:, j * H:(j + 1) * H].copy_(x[cap_from:])
 
     # streaming prefill ---------------------------------------------------
+    @torch.no_grad()
     def _first_prefill(self, input_ids, attention_mask, pixel_values, image_grid_thw) -> None:
-        """FlashDrive's full first-window prefill; the stream state created next rotates every row it wrote."""
-        self._orig_first_prefill(input_ids, attention_mask, pixel_values, image_grid_thw)
-        self._stream()
+        """Drop-in for FlashDrive's full first-window prefill: the stream's bookkeeping (padded position table, per-view
+        frame ranges, shift indices, streaming cache positions) from the token ids on the host, the cache layers
+        allocated as FlashDrive's lazy initialization does, then the 36 layers over the prompt on FlashRT kernels
+        writing cache rows [0, P) and their rotated views."""
+        _require_autocast()
+        m, fvk = self.m, self._fvk
+        s = torch.cuda.current_stream().cuda_stream
+        if attention_mask is not None and not bool(attention_mask.all()):
+            raise ValueError("FlashDriveThor's first-window prefill takes an unpadded prompt")
+        ids_host = input_ids[0].tolist()
+        P, S, H, D = len(ids_host), int(m.max_cache_len), self.hidden, self.head_dim
+        # FlashDrive's stream bookkeeping (streaming.py, _first_prefill), computed on the host
+        cfg = m.vlm.config
+        grids = [tuple(int(v) for v in row) for row in image_grid_thw.tolist()]
+        pos_h, _ = mrope_positions(ids_host, grids, image_token_id=int(cfg.image_token_id), vision_start_id=int(cfg.vision_start_token_id),
+                                   spatial_merge=int(cfg.vision_config.spatial_merge_size))
+        if S > P:
+            pos_h = np.concatenate([pos_h, pos_h[:, -1:] + np.arange(1, S - P + 1, dtype=np.int32)[None]], axis=1)
+        m.streaming_position_ids = torch.from_numpy(pos_h.astype(np.int64)).unsqueeze(1).to(DEV)
+        m._frame_ranges, m._traj_text_range = m._locate_prompt_ranges(input_ids.cpu())
+        src_index, dst_index = [], []
+        for view_frames in m._frame_ranges:
+            for (dst_start, dst_end), (src_start, src_end) in zip(view_frames[:-1], view_frames[1:], strict=True):
+                dst_index.append(torch.arange(dst_start, dst_end))
+                src_index.append(torch.arange(src_start, src_end))
+        m._shift_src_index = torch.cat(src_index).to(DEV)
+        m._shift_dst_index = torch.cat(dst_index).to(DEV)
+        m.streaming_cache_position = m._create_cache_position().to(DEV)
+        proto = torch.zeros(1, self.n_kv, 1, D, device=DEV, dtype=BF16)
+        for layer in m._past_key_values.layers:
+            if not layer.is_initialized:
+                layer.lazy_initialization(proto)
+        st = self._stream()
+        # the vision tower as FlashDrive's first prefill runs it (its streaming ``_encode`` is a compiled step whose
+        # buffers take the streaming window's shape): the FlashRT tower, or FlashDrive's module when vision stays with it
+        if self.backends["vision"] == "flashrt":
+            img, deep = self._encode(pixel_values, image_grid_thw)
+        else:
+            img, deep = m.vlm.model.visual(pixel_values, grid_thw=image_grid_thw)
+        # the prompt rows through the language model, cache rows [0, P)
+        b = self._lm_buffers(st, P, m._dflash_context_len)
+        vis_idx = torch.tensor([i for i, t in enumerate(ids_host) if t == int(cfg.image_token_id)], dtype=torch.long, device=DEV)
+        if vis_idx.numel() != img.shape[0]:
+            raise ValueError(f"image tokens {vis_idx.numel()} != image features {img.shape[0]}")
+        lm = m.vlm.model.language_model
+        ids_dev = input_ids.to(DEV).reshape(-1)
+        fvk.alpamayo15_gather_rows_bf16(lm.embed_tokens.weight.data_ptr(), H, ids_dev.data_ptr(), b["x"].data_ptr(), H, P, H, s)
+        fvk.alpamayo15_scatter_rows_bf16(b["x"].data_ptr(), H, vis_idx.data_ptr(), img.data_ptr(), img.stride(0), img.shape[0], H, 0, s)
+        rows = torch.arange(P, dtype=torch.long, device=DEV)
+        fvk.alpamayo15_gather_rows_bf16(st["cos"].data_ptr(), D, rows.data_ptr(), b["cos"].data_ptr(), D, P, D, s)
+        fvk.alpamayo15_gather_rows_bf16(st["sin"].data_ptr(), D, rows.data_ptr(), b["sin"].data_ptr(), D, P, D, s)
+        st["keep"]["first_meta"] = {"cu_q": torch.tensor([0, P], dtype=torch.int32, device=DEV),
+                                   "cu_k": torch.zeros(2, dtype=torch.int32, device=DEV),
+                                   "used": torch.tensor([P], dtype=torch.int32, device=DEV), "max_q": P}
+        self._lm_layers(st, b, P, self._attend_first, None, None, list(deep), vis_idx, cap_from=P - m._dflash_context_len)
+        m.vlm.model.visual.reset_shape_caches()
+        lm.reset_shape_caches()
+
+    def _attend_first(self, st: dict, li: int, q: torch.Tensor, out: torch.Tensor) -> None:
+        self._attend_runs(st, li, q, out, st["keep"]["first_meta"])
 
     def _attend_prefill(self, st: dict, li: int, q: torch.Tensor, out: torch.Tensor) -> None:
-        p = st["keep"]["prefill_meta"]
+        self._attend_runs(st, li, q, out, st["keep"]["prefill_meta"])
+
+    def _attend_runs(self, st: dict, li: int, q: torch.Tensor, out: torch.Tensor, p: dict) -> None:
         o, _ = self._fa4(q.view(-1, self.n_heads, self.head_dim), st["kvlm"][li], self._v_view(st, li)[0],
                          cu_seqlens_q=p["cu_q"], cu_seqlens_k=p["cu_k"], seqused_k=p["used"],
                          max_seqlen_q=p["max_q"], max_seqlen_k=st["S"], softmax_scale=self.scale, causal=True,
@@ -1145,8 +1057,10 @@ class FlashDriveThor:
             b["emb"].copy_(inputs_embeds[0])
             for dst, src in zip(b["deep"], deepstack_image_embeds):
                 dst.copy_(src)
-            torch.index_select(st["cos"], 0, b["rows"], out=b["cos"])
-            torch.index_select(st["sin"], 0, b["rows"], out=b["sin"])
+            D = self.head_dim
+            s = torch.cuda.current_stream().cuda_stream
+            self._fvk.alpamayo15_gather_rows_bf16(st["cos"].data_ptr(), D, b["rows"].data_ptr(), b["cos"].data_ptr(), D, n, D, s)
+            self._fvk.alpamayo15_gather_rows_bf16(st["sin"].data_ptr(), D, b["rows"].data_ptr(), b["sin"].data_ptr(), D, n, D, s)
             saved = [(k.clone(), v.clone()) for k, v in zip(st["k"], st["v"])]   # capture writes the window rows
             kvlm = st["kvlm"].clone()
             out = {}
@@ -1237,13 +1151,23 @@ class FlashDriveThor:
             if B > 8 or C > 8:
                 raise ValueError("FlashDriveThor's draft kernels take at most 8 block and 8 context rows")
             mk = lambda *shape, dt=BF16: torch.zeros(*shape, device=DEV, dtype=dt)
-            cos, sin = dm.rotary_emb(torch.zeros(1, device=DEV, dtype=BF16), torch.arange(C + B, device=DEV).unsqueeze(0))
+            rot = dm.rotary_emb
+            cos = torch.empty(C + B, D, device=DEV, dtype=BF16); sin = torch.empty(C + B, D, device=DEV, dtype=BF16)
+            dpos = torch.arange(C + B, dtype=torch.int32, device=DEV).repeat(3, 1).contiguous()
+            self._fvk.alpamayo15_mrope_tables(dpos.data_ptr(), rot.inv_freq.detach().float().contiguous().data_ptr(),
+                                              *_mrope_sections(rot), float(rot.attention_scaling),
+                                              cos.data_ptr(), sin.data_ptr(), C + B, D, 0, torch.cuda.current_stream().cuda_stream)
+            cos, sin = cos.unsqueeze(0), sin.unsqueeze(0)
             d = {"slot": torch.zeros(1, dtype=torch.long, device=DEV), "used": torch.zeros(1, dtype=torch.int32, device=DEV),
                  "block_ids": torch.zeros(1, B, dtype=torch.long, device=DEV),
                  "th": torch.zeros(1, C, len(dm.target_layer_ids) * H, device=DEV, dtype=BF16),
-                 "traj_id": torch.full((1,), m.traj_start_token_id, dtype=torch.long, device=DEV),
-                 "neg1": torch.full((), -1, dtype=torch.long, device=DEV),
+                 "proposed": torch.zeros(B, dtype=torch.long, device=DEV), "block": torch.zeros(B, dtype=torch.long, device=DEV),
+                 "posterior": torch.zeros(B, dtype=torch.long, device=DEV), "stats": torch.zeros(3, dtype=torch.long, device=DEV),
+                 "b_idx": torch.arange(B, dtype=torch.long, device=DEV), "one_idx": torch.zeros(1, dtype=torch.long, device=DEV),
                  "draft_pos": torch.arange(C + B, device=DEV).unsqueeze(0),
+                 # the sampler's exp scratch and the exchange area of its cooperating blocks (B verification rows)
+                 "sscratch": torch.empty(B, m.vlm.lm_head.weight.shape[0], device=DEV, dtype=torch.float32),
+                 "sws": torch.zeros(int(self._fvk.alpamayo15_sample_workspace_bytes(B)), device=DEV, dtype=torch.uint8),
                  # draft model on FlashRT kernels (rows padded to whole 8-row tiles for the few-row GEMMs)
                  "d_cos": cos[0].contiguous(), "d_sin": sin[0].contiguous(),
                  "dx": mk(8, H), "dh": mk(8, H), "dthn": mk(8, H), "dkin": mk(16, H), "dq": mk(8, self.n_heads * D),
@@ -1265,7 +1189,7 @@ class FlashDriveThor:
                 lin[(li, name)] = getattr(layer.self_attn, name).weight
             for name in ("gate_proj", "up_proj", "down_proj"):
                 lin[(li, name)] = getattr(layer.mlp, name).weight
-        lin = {k: (_Fp8Weight(w, decode_weights) if decode_weights in ("fp8", "int8") else _Bf16Frag(w))
+        lin = {k: (Fp8Fragment(w, decode_weights) if decode_weights in ("fp8", "int8") else Bf16Fragment(w))
                for k, w in lin.items()}
         torch.cuda.empty_cache()
         return lin
@@ -1281,7 +1205,7 @@ class FlashDriveThor:
         H, D, NH, KV, F_, C = self.hidden, self.head_dim, self.n_heads, self.n_kv, self.ffn, m._dflash_context_len
         eps = dm.config.rms_norm_eps
         x, h, kin, thn = d["dx"][:B], d["dh"], d["dkin"], d["dthn"]
-        torch.index_select(lm.embed_tokens.weight, 0, d["block_ids"][0], out=x)
+        fvk.alpamayo15_gather_rows_bf16(lm.embed_tokens.weight.data_ptr(), H, d["block_ids"].data_ptr(), x.data_ptr(), H, B, H, s)
         dw = self._dw
         _gemm_small(fvk, d["th"][0], dw["fc"], thn[:C])
         fvk.alpamayo15_rms_bf16(thn.data_ptr(), 0, dm.hidden_norm.weight.data_ptr(), kin.data_ptr(), C, H, eps, s)
@@ -1317,7 +1241,6 @@ class FlashDriveThor:
     def _block_step(self, block_output_ids, target_hidden, position_ids, cache_position, temperature, top_p):
         """Drop-in for FlashDrive's ``_dflash_block_step``: (block, posterior, context, stats) in one graph."""
         _require_autocast()
-        from flashdrive.dflash import sample_tokens
         m = self.m
         st = self._stream()
         d = self._dec_state(st)
@@ -1327,42 +1250,45 @@ class FlashDriveThor:
         if g is None:
             b = self._lm_buffers(st, B, B)
             out = {}
-            stop_id, period_id = m._dflash_stop_token_id, m._dflash_period_token_id
+            stop_id, period_id = int(m._dflash_stop_token_id), int(m._dflash_period_token_id)
+            mask_lo, mask_n = (int(v) for v in m._dflash_traj_mask)
+            fvk, H, D = self._fvk, self.hidden, self.head_dim
+            V = m.vlm.lm_head.weight.shape[0]
+            block, posterior, stats = d["block"], d["posterior"], d["stats"]
 
             def run():
+                s = torch.cuda.current_stream().cuda_stream
                 lm = m.vlm.model.language_model
-                draft_logits = self._draft(d, B)
-                proposed = sample_tokens(draft_logits, m._dflash_traj_mask, 0.0)
-                follows_stop = F.pad(proposed[:, :-1] == stop_id, (1, 0))
-                proposed = torch.where(follows_stop, d["traj_id"], proposed)
-                block = torch.cat([d["block_ids"][:, :1], proposed], dim=1)
-                torch.index_select(lm.embed_tokens.weight, 0, block[0], out=b["x"])
-                rows = torch.arange(B, device=DEV) + d["slot"]
-                torch.index_select(st["cos"], 0, rows, out=b["cos"])
-                torch.index_select(st["sin"], 0, rows, out=b["sin"])
+                draft_logits = self._draft(d, B)[0]                            # [B - 1, V]: greedy proposals
+                fvk.alpamayo15_sample_tokens_bf16(draft_logits.data_ptr(), draft_logits.stride(0), B - 1, V, mask_lo, mask_n, 0.0, 1.0, 1,
+                                                  st["rng"].data_ptr(), self._rng_blocks, 0, d["sws"].data_ptr(), d["sws"].numel(),
+                                                  d["proposed"].data_ptr(), 0, 0, 0, 0, 0, 0, s)
+                fvk.alpamayo15_dflash_propose(d["proposed"].data_ptr(), d["block_ids"].data_ptr(), stop_id, int(m.traj_start_token_id),
+                                              block.data_ptr(), B, s)
+                fvk.alpamayo15_gather_rows_bf16(lm.embed_tokens.weight.data_ptr(), H, block.data_ptr(), b["x"].data_ptr(), H, B, H, s)
+                fvk.alpamayo15_gather_rows_bytes(st["cos"].data_ptr(), 2 * D, d["b_idx"].data_ptr(), d["slot"].data_ptr(),
+                                                 b["cos"].data_ptr(), 2 * D, B, 2 * D, s)
+                fvk.alpamayo15_gather_rows_bytes(st["sin"].data_ptr(), 2 * D, d["b_idx"].data_ptr(), d["slot"].data_ptr(),
+                                                 b["sin"].data_ptr(), 2 * D, B, 2 * D, s)
                 self._lm_layers(st, b, B, self._attend_verify, None, d["slot"], cap_from=0)
-                verify_logits = _gemm_small(self._fvk, b["h"], self._dw["lm_head"], d["vlogits"][:B]).unsqueeze(0)
-                posterior = sample_tokens(verify_logits, m._dflash_traj_mask, temperature, top_p)
-                # FlashDrive's round decisions (dflash.py, block_step_fn), verbatim.
-                matches = block[:, 1:] == posterior[:, :-1]
-                acceptance = matches.cumprod(dim=1).sum(dim=1)[0]
-                slot = acceptance.unsqueeze(0)
-                bonus = posterior[0].gather(0, slot)
-                emission = torch.cat([block[0], bonus]).scatter(0, slot + 1, bonus)
-                slots = torch.arange(emission.shape[0], device=DEV)
-                stop_hits = (emission == stop_id) & (slots <= acceptance + 1)
-                first_stop = torch.where(stop_hits.any(), stop_hits.int().argmax(), d["neg1"])
-                period_hit = (bonus[0] == period_id).long()
-                out["block"], out["posterior"] = block, posterior
+                verify_logits = _gemm_small(self._fvk, b["h"], self._dw["lm_head"], d["vlogits"][:B])
+                # FlashDrive's sampler (mask, temperature, its top-p rule, multinomial) and its round decisions
+                fvk.alpamayo15_sample_tokens_bf16(verify_logits.data_ptr(), verify_logits.stride(0), B, V, mask_lo, mask_n,
+                                                  float(temperature), float(top_p), 1, st["rng"].data_ptr(), self._rng_blocks,
+                                                  d["sscratch"].data_ptr(), d["sws"].data_ptr(), d["sws"].numel(), posterior.data_ptr(),
+                                                  0, 0, 0, 0, 0, 0, s)
+                fvk.alpamayo15_dflash_decide(block.data_ptr(), posterior.data_ptr(), stop_id, period_id, B, stats.data_ptr(), s)
+                out["block"], out["posterior"] = block.unsqueeze(0), posterior.unsqueeze(0)
                 out["ctx"] = b["ctx"].unsqueeze(0)
-                out["stats"] = torch.stack([acceptance, first_stop, period_hit])
+                out["stats"] = stats
             saved = self._snapshot_rows(st, cache_position)
             d["block_ids"].copy_(block_output_ids); d["th"].copy_(target_hidden)
             d["slot"].copy_(cache_position[:1]); d["used"].copy_((cache_position[:1] + B).int())
             gen = torch.cuda.default_generators[torch.cuda.current_device()]
-            rng = gen.get_state()
+            rng, rng_dev = gen.get_state(), st["rng"].clone()
             g = _capture(run)
             gen.set_state(rng)                      # warm-up / capture draws must not consume the caller's stream
+            st["rng"].copy_(rng_dev)
             self._restore_rows(st, cache_position, saved)
             st["graphs"][key] = g
             st["keep"][("block_out",) + key] = out
@@ -1371,7 +1297,14 @@ class FlashDriveThor:
         d["th"].copy_(target_hidden)
         d["slot"].copy_(cache_position[:1])
         d["used"].copy_((cache_position[:1] + B).int())
+        # FlashDrive samples the posterior from torch's generator: the kernel reads the generator's (seed, offset) at
+        # every round and the host advances torch's offset by the draw's increment, so the round is exactly
+        # torch.multinomial's draw from the generator's current state (restoring the generator restores the round)
+        gen = torch.cuda.default_generators[torch.cuda.current_device()]
+        st["rng"].copy_(torch_rng_state(gen))
         g.replay()
+        if temperature > 0:
+            gen.set_offset(int(gen.get_offset()) + torch_philox_increment(B * m.vlm.lm_head.weight.shape[0], self._rng_blocks))
         return out["block"], out["posterior"], out["ctx"], out["stats"]
 
     @torch.no_grad()
@@ -1388,10 +1321,12 @@ class FlashDriveThor:
             st["keep"]["traj_ids"] = ids
 
             def run():
+                s = torch.cuda.current_stream().cuda_stream
+                fvk, H, D = self._fvk, self.hidden, self.head_dim
                 lm = m.vlm.model.language_model
-                torch.index_select(lm.embed_tokens.weight, 0, ids, out=b["x"])
-                torch.index_select(st["cos"], 0, d["slot"], out=b["cos"])
-                torch.index_select(st["sin"], 0, d["slot"], out=b["sin"])
+                fvk.alpamayo15_gather_rows_bf16(lm.embed_tokens.weight.data_ptr(), H, ids.data_ptr(), b["x"].data_ptr(), H, 1, H, s)
+                fvk.alpamayo15_gather_rows_bf16(st["cos"].data_ptr(), D, d["slot"].data_ptr(), b["cos"].data_ptr(), D, 1, D, s)
+                fvk.alpamayo15_gather_rows_bf16(st["sin"].data_ptr(), D, d["slot"].data_ptr(), b["sin"].data_ptr(), D, 1, D, s)
                 self._lm_layers(st, b, 1, self._attend_all_rows, None, d["slot"], cap_from=0)
             saved = self._snapshot_rows(st, cache_position)
             ids.copy_(input_ids.view(-1)); d["slot"].copy_(cache_position[:1])
