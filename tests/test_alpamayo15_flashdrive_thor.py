@@ -1134,7 +1134,7 @@ def test_backend_primitives_match_flashdrive_on_identical_state(backends):
                     if x.dtype in (torch.long, torch.int32):
                         continue
                     rec["out_cos"] = min(rec["out_cos"], cos(x, y))
-            if post is not None:
+            if post is not None and rec["proposal_eq"] is not False:   # different block tokens write different rows
                 for li, ((kr, vr), (kf, vf)) in enumerate(zip(post, post_f)):
                     if n == "_shift_streaming_kv_cache":
                         rec["cache_ok"] &= torch.equal(kr, kf) and torch.equal(vr, vf)
