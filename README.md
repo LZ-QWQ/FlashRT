@@ -7,7 +7,7 @@
 **FlashRT is a high-performance realtime inference engine for small-batch, latency-sensitive AI workloads.**
 
 <p align="center">
-  | <a href="https://arxiv.org/abs/2606.20537"><b>Paper</b></a>
+  | <a href="https://arxiv.org/abs/2610.24349"><b>Paper</b></a>
   | <a href="https://github.com/flashrt-project/FlashRT-HF-kernels"><b>HF Kernels</b></a>
   | <a href="https://github.com/LiangSu8899/FlashRT-Nexus"><b>Nexus</b></a>
   | <a href="docs/demos.md"><b>Demos</b></a> |
@@ -967,16 +967,20 @@ driver/CUDA/PyTorch versions, and `nvidia-smi` output. For new cards, start with
 
 ## Citation
 
-If FlashRT is useful in your project or research, please cite it and link to
+If FlashRT is useful in your project or research, please cite the paper and link to
 [this repository](https://github.com/flashrt-project/FlashRT)
 ([`CITATION.cff`](CITATION.cff)):
 
 ```bibtex
-@software{su2026flashrt,
-  title={FlashRT},
-  author={Liang Su},
+@misc{su2026flashrtpai,
+  title={FlashRT-PAI: Fast Kernels Are Not Fast Pipelines for Physical AI Inference},
+  author={Liang Su and David Chen and Jason Li and Kevin Guo and Teresa Lv},
   year={2026},
-  url={https://github.com/flashrt-project/FlashRT},
+  eprint={2610.24349},
+  archivePrefix={arXiv},
+  primaryClass={cs.AI},
+  doi={10.48550/arXiv.2610.24349},
+  url={https://arxiv.org/abs/2610.24349},
 }
 ```
 

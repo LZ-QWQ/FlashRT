@@ -1,8 +1,8 @@
 cff-version: 1.2.0
 title: "FlashRT"
 message: >-
-  If FlashRT is useful in your project or research, please cite and credit
-  the software and link to the repository. For work involving execution-state
+  If FlashRT is useful in your project or research, please cite the paper
+  below and link to the repository. For work involving execution-state
   capsules, please also cite the paper listed in references.
 type: software
 authors:
@@ -11,6 +11,23 @@ authors:
 repository-code: "https://github.com/flashrt-project/FlashRT"
 url: "https://github.com/flashrt-project/FlashRT"
 license: "Apache-2.0"
+preferred-citation:
+  type: article
+  authors:
+    - family-names: "Su"
+      given-names: "Liang"
+    - family-names: "Chen"
+      given-names: "David"
+    - family-names: "Li"
+      given-names: "Jason"
+    - family-names: "Guo"
+      given-names: "Kevin"
+    - family-names: "Lv"
+      given-names: "Teresa"
+  title: "FlashRT-PAI: Fast Kernels Are Not Fast Pipelines for Physical AI Inference"
+  year: 2026
+  doi: "10.48550/arXiv.2610.24349"
+  url: "https://arxiv.org/abs/2610.24349"
 references:
 - type: article
   authors:
