@@ -1003,13 +1003,11 @@ Work on execution-state checkpoint and restore should also cite:
 
 ## Acknowledgment
 
-FlashRT builds on [CUTLASS](https://github.com/NVIDIA/cutlass) (GEMM and FMHA
-templates), [FlashAttention](https://github.com/Dao-AILab/flash-attention)
-(the vendored FlashAttention 2 and FlashAttention 4 forward kernels),
-[FlashInfer](https://github.com/flashinfer-ai/flashinfer) (XQA-derived attention
-sources) and [vLLM](https://github.com/vllm-project/vllm) (the Marlin W4A8
-kernel FlashRT's W4A8 layouts are checked against). Sources, licenses and
-local changes are recorded in file headers and directory-local `VENDOR.md`
+FlashRT builds on [CUTLASS](https://github.com/NVIDIA/cutlass) (GEMM
+templates), [FlashAttention](https://github.com/Dao-AILab/flash-attention) and
+[FlashInfer](https://github.com/flashinfer-ai/flashinfer) (attention kernels),
+and [vLLM](https://github.com/vllm-project/vllm) (Marlin). Sources, licenses
+and local changes are recorded in file headers and directory-local `VENDOR.md`
 files.
 
 FlashRT accelerates models released by their authors. Thank you to:
@@ -1018,7 +1016,7 @@ FlashRT accelerates models released by their authors. Thank you to:
 |---|---|
 | π0, π0.5, π0-FAST | [Physical Intelligence](https://github.com/Physical-Intelligence/openpi) |
 | GR00T N1.6, N1.7 | [NVIDIA Isaac GR00T](https://github.com/NVIDIA/Isaac-GR00T) |
-| Alpamayo 1.5 | [NVIDIA](https://github.com/NVlabs/alpamayo1.5); the streaming form runs [FlashDrive](https://github.com/z-lab/flashdrive)'s checkpoints and procedure (z-lab) on FlashRT kernels |
+| Alpamayo 1.5 | [NVIDIA](https://github.com/NVlabs/alpamayo1.5); streaming: [FlashDrive](https://github.com/z-lab/flashdrive) (z-lab) |
 | Cosmos3 | [NVIDIA Cosmos](https://github.com/NVIDIA/cosmos) |
 | LingBot-VLA | [Robbyant](https://github.com/Robbyant/lingbot-vla) |
 | Hy-Embodied-0.5-VLA | [Tencent Hunyuan](https://github.com/Tencent-Hunyuan/HY-Embodied) |
@@ -1030,7 +1028,7 @@ FlashRT accelerates models released by their authors. Thank you to:
 | MiniMax-Remover | [MiniMax-Remover authors](https://github.com/zibojia/MiniMax-Remover) |
 | Higgs Audio v3 | [Boson AI](https://huggingface.co/bosonai/higgs-audio-v3-tts-4b) |
 | OmniVoice | [k2-fsa](https://github.com/k2-fsa/OmniVoice) |
-| Mel-Band RoFormer | ByteDance SAMI ([paper](https://arxiv.org/abs/2310.01809)), run through [melband-roformer-infer](https://github.com/openmirlab/melband-roformer-infer) |
+| Mel-Band RoFormer | ByteDance SAMI ([paper](https://arxiv.org/abs/2310.01809)); [melband-roformer-infer](https://github.com/openmirlab/melband-roformer-infer) |
 
 Community contributions are credited in [News](#news) and
 [Community Hardware Benchmarks](#community-hardware-benchmarks).
