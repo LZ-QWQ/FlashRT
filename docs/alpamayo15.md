@@ -333,9 +333,9 @@ Nine clips x three seeds (1719 windows per arm):
 | Path | mean ms | median ms | p90 ms | vs official (mean / median) | peak GB | ADE m | paired ADE vs official | paired ADE vs `bf16` |
 |---|---|---|---|---|---|---|---|---|
 | Official Alpamayo 1.5 (BF16, SDPA) | 3322 | 3168 | 3755 | - | 21.6 | 2.845 | - | |
-| FlashRT `preset="bf16"` | 2097 | 1952 | 2495 | 1.58x / 1.62x | 22.3 | 2.852 | +0.008 [-0.009, +0.032] | - |
-| FlashRT `preset="balanced"` (default) | 899 | 847 | 1021 | 3.70x / 3.74x | 35.0 | 2.830 | -0.015 [-0.045, +0.016] | -0.022 [-0.064, +0.009] |
-| FlashRT `preset="fast"` | 812 | 761 | 925 | 4.09x / 4.16x | 32.0 | 2.844 | -0.001 [-0.082, +0.089] | -0.008 [-0.098, +0.079] |
+| FlashRT `preset="bf16"` | 2079 | 1935 | 2475 | 1.60x / 1.64x | 22.3 | 2.852 | +0.008 [-0.009, +0.032] | - |
+| FlashRT `preset="balanced"` (default) | 897 | 844 | 1026 | 3.70x / 3.75x | 35.0 | 2.830 | -0.015 [-0.045, +0.016] | -0.022 [-0.064, +0.009] |
+| FlashRT `preset="fast"` | 811 | 759 | 924 | 4.10x / 4.17x | 32.0 | 2.844 | -0.001 [-0.082, +0.089] | -0.008 [-0.098, +0.079] |
 
 `fast` against `balanced`: -87 ms [-95, -80], ADE +0.014 [-0.048, +0.074].
 FDE moves with ADE (`fast` vs official +0.012 [-0.313, +0.308]). Every
@@ -375,21 +375,35 @@ and settings (`scripts/infer.py`):
 | Path | mean ms | median ms | p90 ms | vs FlashDrive (mean / median) | peak GB | ADE m | paired ADE vs FlashDrive |
 |---|---|---|---|---|---|---|---|
 | FlashDrive (unmodified, `torch.compile` max-autotune) | 958 | 856 | 1057 | - | 13.3 | 2.763 | - |
-| FlashDrive + FlashRT backend (defaults) | 462 | 400 | 513 | 2.07x / 2.14x | 26.5 | 2.742 | +0.035 [-0.008, +0.067] |
-| + all three tiers (`decode_weights="int8"`, `prefill_weights="int8"`, `expert_weights="fp8"`) | 342 | 296 | 389 | 2.80x / 2.89x | 27.6 | 2.744 | +0.024 [-0.038, +0.087] |
+| FlashDrive + FlashRT backend (defaults) | 458 | 398 | 513 | 2.09x / 2.15x | 26.5 | 2.745 | +0.038 [-0.003, +0.070] |
+| + all three tiers (`decode_weights="int8"`, `prefill_weights="int8"`, `expert_weights="fp8"`) | 345 | 295 | 387 | 2.77x / 2.90x | 27.6 | 2.739 | +0.030 [-0.030, +0.090] |
 
 The FlashDrive rows pair on 1602 windows (its runs lack the example clip's
 seed 0); the backend rows cover 1719. The three tiers together against the
-default backend: -120 ms [-146, -103], ADE +0.002 [-0.071, +0.061]; the
-backend samples FlashDrive's token stream on 743 of 1602 windows. FlashDrive
-averages 4.7 DFlash rounds per window and 5.1 reasoning tokens per round, the
-backend 4.9 and 5.2. Cold costs: FlashDrive's first window of a stream takes
-4.3 s and its second 148 s (`torch.compile`, warm compile cache, one clip per
+default backend: -113 ms [-122, -104], ADE -0.007 [-0.068, +0.042]; the
+backend samples FlashDrive's token stream on 744 of 1602 windows. FlashDrive
+averages 4.7 DFlash rounds and 16.8 reasoning tokens per window, the backend
+4.8 and 16.9 (all three tiers 4.9 and 17.1). Cold costs: FlashDrive's first
+window of a stream takes 4.3 s and its second 148 s (`torch.compile`, warm compile cache, one clip per
 process); the backend ran each seed's nine clips in one process with
 `reset()` between them, first window 0.7 s and second 1.1 s (CUDA graph
-capture; 17 s and 19 s for the first stream of a process, which also builds
+capture; 17 s and 20 s for the first stream of a process, which also builds
 the FA4 kernels). The backend's peak memory includes the INT8 weight copy of
 its tcgen05 W4A8 GEMM.
+
+Reproducibility: for a given seed the outputs do not depend on the run. Two
+or three separate processes of the same configuration (seed 0, nine clips)
+produced identical tokens and trajectories on all 600 windows, for the
+`balanced` preset and for the streaming backend with and without its tiers;
+the full-request presets also matched an earlier build of the same kernels on
+every window of all three seeds. FlashDrive's loader adds the DFlash mask token
+to the vocabulary, loads its embedding row from the draft checkpoint and
+leaves the corresponding row of the (untied) LM head at a random
+initialization from the unseeded generator; that row's logit enters every
+softmax, so streams loaded in different processes could differ. `load_flashdrive`
+draws the row from a fixed seed, and the runner loads FlashDrive's reference
+the same way. The FlashDrive row in the table above was measured with its
+loader unmodified.
 
 Stage times of the FlashRT backend on the example clip (117 steady windows,
 seed 0; CUDA-event means per window, the DFlash column per round):

@@ -355,15 +355,15 @@ error against its reference (paired ADE intervals include zero). Guide:
 | Full request (official procedure) | Jetson Thor |
 |---|---:|
 | Alpamayo 1.5 (ms) | 3322 |
-| + FlashRT, `balanced` preset, the default (ms) | **899** |
-| + FlashRT, `fast` preset (ms) | **812** |
+| + FlashRT, `balanced` preset, the default (ms) | **897** |
+| + FlashRT, `fast` preset (ms) | **811** |
 | Speedup | **3.7x / 4.1x** |
 
 | Streaming (FlashDrive procedure) | Jetson Thor |
 |---|---:|
 | FlashDrive (ms per window) | 958 |
-| + FlashRT backend (ms) | **462** |
-| + FlashRT backend with its INT8 / INT8 / FP8 tiers (ms) | **342** |
+| + FlashRT backend (ms) | **458** |
+| + FlashRT backend with its INT8 / INT8 / FP8 tiers (ms) | **345** |
 | Speedup | **2.1x / 2.8x** |
 
 #### Cosmos3-Nano text-to-video
