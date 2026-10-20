@@ -495,26 +495,46 @@ dependent launch (measured neutral on Thor).
 
 ## Execution contracts
 
-Hot path: in both forms every GPU operation of a request after host
-tokenization is launched from FlashRT's C++ code. GEMMs run on tcgen05 (CUTLASS
+Model computation: in both forms every computation of the model runs on
+kernels launched from FlashRT's C++ code. That covers the vision tower, the
+language model in prefill, decode and DFlash verification, the draft, sampling,
+the action expert and the trajectory. GEMMs run on tcgen05 (CUTLASS
 instantiations with bias, activation, residual and quantization folded into
 the epilogues), on FlashRT's few-row kernels or, where it is faster at the
 shape (`bf16` preset prefill gate / up / down and decode projections, the
-one-row LM head), on cuBLASLt called from C++; attention runs on FA4, and the rest on the
-model-local kernels of `csrc/kernels/alpamayo15_*.cu`: RMSNorm / LayerNorm /
-SiLU-mul producers, embedding and image-row gathers and scatters, the M-RoPE
-tables, the sampler with the decode bookkeeping, the action expert's input and
-output projections with the Euler step, the unicycle trajectory integration
-and, for streaming, the DFlash proposal and acceptance decisions. The only
-torch operation left on the GPU is the official noise draw of the diffusion
-expert (`torch.randn`), kept as the official draw point; memcpys move the
-sampled tokens to the host for the stop rule. Each frame grid's vision tower,
-each decode step (full request) or DFlash round (streaming), each streaming
-window's prefill and the whole expert are CUDA graphs. The host prepares a
-request (tokenization, trajectory-history tokens, M-RoPE positions and
-FlashDrive's stream bookkeeping) before the graphs run. The
-[kernel sources per phase](#kernel-sources-per-phase) below are the profiler's
-account of this.
+one-row LM head), on cuBLASLt called from C++. Attention runs on FA4. The rest
+runs on the model-local kernels of `csrc/kernels/alpamayo15_*.cu`:
+RMSNorm / LayerNorm / SiLU-mul producers, embedding and image-row gathers and
+scatters, the M-RoPE tables, the sampler with the decode bookkeeping, the
+action expert's input and output projections with the Euler step, the unicycle
+trajectory integration and, for streaming, the DFlash proposal and acceptance
+decisions. Each frame grid's vision tower, each decode step (full request) or
+DFlash round (streaming), each streaming window's prefill and the whole expert
+are CUDA graphs.
+
+The model computation excludes a few auxiliary steps, which use torch (ATen)
+operations and memcpys:
+
+- Inputs: each request's pixels, token ids and host-computed indices and
+  positions (image-token rows, M-RoPE positions, trajectory-history tokens,
+  the t0 velocity) are copied into the static buffers the graphs read. In
+  streaming these are also FlashDrive's block tokens, context and cache
+  positions handed to each primitive.
+- Per-request state: the decode and expert state is reset before the graphs
+  replay (cache slot, lengths, unfinished flags, action rows). The sampled
+  tokens are copied to the host for the stop rule.
+- Noise: the official noise draw of the diffusion expert (`torch.randn`), and
+  FlashDrive's (`normal_`), at the official draw point.
+- First window of a stream: FlashDrive's cache allocation (zero fills of the
+  new cache layers) and its position-table and index-table construction.
+- Streaming bookkeeping: FlashDrive's orchestration between primitives, such
+  as the output-token buffer, the draft context window and the trajectory
+  extraction.
+- Several trajectory samples: the log-sum-exp merge of the shared-prompt and
+  per-sample attention passes.
+
+The [kernel sources per phase](#kernel-sources-per-phase) below are the
+profiler's account of this.
 
 Two phases are launched kernel by kernel from C++ instead of being captured:
 the full-request LM prefill and the first window of a stream. Their length
@@ -525,16 +545,33 @@ host: the profiler finds 0.4 ms of idle time between those kernels in total.
 A graph could save at most that 0.4 ms per request, about 0.05%. The first
 window of a stream runs once per stream and is not on the steady-state path.
 
-Code layout: `flash_rt/models/alpamayo15/pipeline_thor.py` is the full-request
-engine (buffers, graphs, the request path), `weights.py` its weight
-preparation (fused projections, the tiers' copies, the action modules'
-operands), `marlin_w4a8.py` the W4A8 layouts; `flash_rt/models/alpamayo15_flashdrive/`
-holds the streaming backend and its `weights.py`; the frontends under
-`flash_rt/frontends/torch/` do the official / FlashDrive preprocessing and
-model loading (`load_flashdrive`); kernels live in `csrc/kernels/alpamayo15_*`,
-`csrc/gemm/alpamayo15_*_sm100.cu`, `csrc/quantize/alpamayo15_nvfp4_rows.cu` and
-the `alpamayo15_nvfp4_*` sources of `flash_rt_fp4`, all behind
-`FLASHRT_ENABLE_ALPAMAYO15`.
+Code layout: each form has a runtime module (initialization and resources)
+and a pipeline module (the computation):
+
+- `flash_rt/models/alpamayo15/runtime_thor.py` does the following for the
+  full request: validates the options and tiers, sets up the kernel handles
+  and prepares the weights. It allocates the persistent buffers (KV cache,
+  decode and expert state, rotary tables, sampler workspace) and the
+  shape-sized work buffers, and captures the CUDA graphs.
+- `flash_rt/models/alpamayo15/pipeline_thor.py` holds the request computation
+  that runs on them. `weights.py` prepares the weights (fused projections,
+  the tiers' copies, the action modules' operands). `marlin_w4a8.py` holds the
+  W4A8 layouts.
+- `flash_rt/models/alpamayo15_flashdrive/runtime_thor.py` is the streaming
+  backend's runtime. It handles the backend choices, the weights and the
+  expert's buffers. Per stream, it does the stream's start (FlashDrive's
+  bookkeeping and cache allocation), the rotated cache views and the
+  primitives' work buffers, and captures their graphs.
+- `flash_rt/models/alpamayo15_flashdrive/pipeline_thor.py` holds the
+  primitives' computation. `install` routes FlashDrive's calls to it.
+- The frontends under `flash_rt/frontends/torch/` do the official / FlashDrive
+  preprocessing and model loading (`load_flashdrive`). They build each form's
+  runtime and pipeline: `build_engine` for the full request,
+  `attach_flashdrive_backend` for streaming.
+
+Kernels live in `csrc/kernels/alpamayo15_*`, `csrc/gemm/alpamayo15_*_sm100.cu`,
+`csrc/quantize/alpamayo15_nvfp4_rows.cu` and the `alpamayo15_nvfp4_*` sources
+of `flash_rt_fp4`, all behind `FLASHRT_ENABLE_ALPAMAYO15`.
 
 ### Full-request engine
 
@@ -605,9 +642,9 @@ What FlashDrive changes against the official procedure, kept as is:
 | Language model | BF16 | W4A8 (ParoQuant, Marlin) |
 | Action expert | official weights, 10 Euler steps | fine-tuned weights, 8 steps, velocity reused on steps 3-6, BF16 state |
 
-`FlashDriveThor(model, expert=..., vision=..., prefill=..., decode=..., w4a8=...)`
-installs FlashRT implementations of FlashDrive's primitives on a loaded
-FlashDrive model (every group by default; a group set to `"flashdrive"`
+`attach_flashdrive_backend(model, expert=..., vision=..., prefill=..., decode=..., w4a8=...)`
+(in `flash_rt.frontends.torch.alpamayo15_flashdrive_thor`) installs FlashRT
+implementations of FlashDrive's primitives on a loaded FlashDrive model (every group by default; a group set to `"flashdrive"`
 keeps FlashDrive's execution, eager or compiled):
 
 | Group | FlashDrive primitives | FlashRT implementation |
@@ -665,8 +702,9 @@ the prefill (539.7 ms) runs 72 cuBLASLt GEMMs for gate / up (203.8 ms) and 144
 for the down projection's column blocks (112.8 ms) next to 72 tcgen05 GEMMs
 for q|k|v and o (119.9 ms), and each decode step (67.6 ms) runs its
 projections on cuBLASLt (65.0 ms). The trajectory integration is one kernel
-after the expert graph. No ATen kernel runs in any full-request phase; the
-official noise draw runs between the decode and expert phases.
+after the expert graph. No ATen kernel runs inside these four full-request
+phases. The per-request input copies, the state resets and the official noise
+draw run between them (see [execution contracts](#execution-contracts)).
 
 Streaming backend, defaults:
 
@@ -680,10 +718,11 @@ Streaming backend, defaults:
 | frame-block shift | 3.5 | 1 launch, 3.5 ms | - | - | 4 ATen launches, 0.02 ms (FlashDrive's bookkeeping) |
 | expert (8 steps) | 87.4 | 682 launches, 5.7 ms | 588 launches, 73.6 ms | 144 launches, 8.1 ms | the noise draw and 3 fills, 0.005 ms |
 
-The ATen entries of the streaming backend are the copies of the inputs that
-FlashDrive's orchestration hands to each primitive and its own cache
-initialization in the first window; no computation of a primitive runs
-outside FlashRT kernels.
+The ATen entries of the streaming backend are of two kinds. Most are copies
+of the inputs that FlashDrive's orchestration hands to each primitive, plus
+the noise draw and the expert's state fills. The rest are FlashDrive's own
+cache initialization and bookkeeping in the first window. The model
+computation of every primitive runs on FlashRT kernels.
 
 ## Tests
 

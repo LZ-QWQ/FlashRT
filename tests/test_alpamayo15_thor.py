@@ -12,15 +12,17 @@ import torch
 pytest.importorskip("transformers")
 
 from flash_rt.models.alpamayo15.pipeline_thor import (  # noqa: E402
-    ALPAMAYO15_KERNEL_SYMBOLS,
     Alpamayo15Thor,
     _Gemm,
-    check_generation_config,
     expert_attention_spans,
     merge_attention,
+    update_stop_state,
+)
+from flash_rt.models.alpamayo15.runtime_thor import (  # noqa: E402
+    ALPAMAYO15_KERNEL_SYMBOLS,
+    check_generation_config,
     require_alpamayo15_kernels,
     resolve_preset,
-    update_stop_state,
 )
 from flash_rt.models.alpamayo15.weights import (  # noqa: E402
     FP8_E4M3_MAX,
@@ -540,20 +542,24 @@ def test_vision_tower_cutlass_and_graph_match_official_module():
     grid = torch.tensor([[1, 4, 4], [1, 4, 4]], device="cuda")
     S = int((grid[:, 0] * grid[:, 1] * grid[:, 2]).sum())
     px = torch.randn(S, 3 * 2 * 4 * 4, device="cuda")
-    eng = SimpleNamespace(vlm=SimpleNamespace(model=SimpleNamespace(visual=V)), _fvk=fvk, _fa4=fa4, _gemm=_Gemm(fvk),
-                          _vis_tables={}, _vis_graphs={}, spatial_merge=2, hidden=48)
-    for name in ("_vision_tables", "_vision_cutlass", "_merger", "_check_vision_modules", "_encode", "_encode_groups"):
+    from flash_rt.models.alpamayo15.pipeline_thor import vision_tower
+    from flash_rt.models.alpamayo15.runtime_thor import VisionGraphs, VisionTables, check_vision_modules
+    check_vision_modules(V)
+    tables = VisionTables(V, max_entries=4)
+    rt = SimpleNamespace(vlm=SimpleNamespace(model=SimpleNamespace(visual=V)), fvk=fvk, fa4=fa4, gemm=_Gemm(fvk), vision_fp8=None,
+                         vision_tables=tables, vision_graphs=VisionGraphs(tables, max_entries=2), spatial_merge=2, hidden=48)
+    eng = SimpleNamespace(rt=rt)
+    for name in ("_encode", "_encode_groups"):
         setattr(eng, name, getattr(Alpamayo15Thor, name).__get__(eng))
-    eng._check_vision_modules()
     with torch.no_grad(), torch.autocast("cuda", dtype=BF16):
         ref_img, ref_deep = V(px.to(BF16), grid_thw=grid)                        # the official module
-        img, deep = Alpamayo15Thor._vision_cutlass(eng, px, grid)
-        g_img, g_deep = Alpamayo15Thor._encode(eng, px, grid)
+        img, deep = vision_tower(rt, px, grid)
+        g_img, g_deep = eng._encode(px, grid)
         g_img, g_deep = g_img.clone(), g_deep[0].clone()
         px2 = torch.randn_like(px)
-        g2_img, g2_deep = Alpamayo15Thor._encode(eng, px2, grid)
+        g2_img, g2_deep = eng._encode(px2, grid)
         g2_img, g2_deep = g2_img.clone(), g2_deep[0].clone()
-        ref2_img, ref2_deep = Alpamayo15Thor._vision_cutlass(eng, px2, grid)
+        ref2_img, ref2_deep = vision_tower(rt, px2, grid)
     torch.cuda.synchronize()
 
     def close(a, e):
@@ -566,7 +572,22 @@ def test_vision_tower_cutlass_and_graph_match_official_module():
     close(deep[0], ref_deep[0])
     assert torch.equal(g_img, img) and torch.equal(g_deep, deep[0])              # the graph replays the eager path
     assert torch.equal(g2_img, ref2_img) and torch.equal(g2_deep, ref2_deep[0])  # new pixels through the same graph
-    assert len(eng._vis_graphs) == 1
+    assert len(rt.vision_graphs) == 1
+    # the graph cache holds at most two (pixel shape, grid) entries, each with the per-grid tables it reads by
+    # address; an evicted shape is captured again on its next use and replays the eager path
+    grid_b, grid_c = (torch.tensor([g, g], device="cuda") for g in ([1, 4, 8], [1, 8, 4]))
+    px_b, px_c = torch.randn(2 * S, px.shape[1], device="cuda"), torch.randn(2 * S, px.shape[1], device="cuda")
+    with torch.no_grad(), torch.autocast("cuda", dtype=BF16):
+        eng._encode(px_b, grid_b)
+        eng._encode(px_c, grid_c)
+        keys = list(rt.vision_graphs.graphs)
+        for (shape, key_grid), ent in rt.vision_graphs.graphs.items():
+            assert ent["tables"] is tables.tables[key_grid]
+        g3_img = eng._encode(px, grid)[0].clone()
+        e3_img = vision_tower(rt, px, grid)[0]
+    torch.cuda.synchronize()
+    assert len(keys) == 2 and keys[0][1] == (1, 4, 8, 1, 4, 8) and keys[1][1] == (1, 8, 4, 1, 8, 4)
+    assert len(rt.vision_graphs) == 2 and torch.equal(g3_img, e3_img)
 @pytest.mark.parametrize("rows,dim,with_delta", [(3086, 4096, True), (37, 4096, False), (300, 12288, True)])
 def test_fused_fp8_row_producers_match_separate_kernels(rows, dim, with_delta):
     """RMSNorm -> FP8 rows and SiLU-mul -> FP8 rows give the codes, scales and residual of the separate kernels."""
@@ -787,7 +808,8 @@ def test_sampler_matches_the_decoding_rules(rule):
     filtered probabilities of the official rule (0, transformers' top-p) or FlashDrive's (1) from the same generator
     state, and advances the offset as torch does; the bookkeeping advances the counters."""
     fvk = _kernels()
-    from flash_rt.models.alpamayo15.pipeline_thor import torch_philox_blocks, torch_philox_increment, torch_rng_state
+    from flash_rt.models.alpamayo15.pipeline_thor import torch_philox_increment, torch_rng_state
+    from flash_rt.models.alpamayo15.runtime_thor import torch_philox_blocks
     s = _stream()
     gen = torch.cuda.default_generators[torch.cuda.current_device()]
     blocks = torch_philox_blocks()
@@ -866,7 +888,7 @@ def test_action_expert_projection_kernels_match_official_modules():
     pytest.importorskip("alpamayo1_5")
     from alpamayo1_5.models.action_in_proj import PerWaypointActionInProjV2
     from alpamayo1_5.action_space import UnicycleAccelCurvatureActionSpace
-    from flash_rt.models.alpamayo15.pipeline_thor import Alpamayo15Thor, _Gemm
+    from flash_rt.models.alpamayo15.pipeline_thor import _Gemm, action_in
     from flash_rt.models.alpamayo15.weights import pack_action_modules
     from types import SimpleNamespace
     torch.manual_seed(8)
@@ -881,11 +903,12 @@ def test_action_expert_projection_kernels_match_official_modules():
     ap = ap.to("cuda", BF16).eval(); out_proj = out_proj.to("cuda", BF16).eval()
     sp = UnicycleAccelCurvatureActionSpace(dt=0.1, n_waypoints=A, accel_mean=0.029, accel_std=0.681, curvature_mean=0.00027, curvature_std=0.0261)
     model = SimpleNamespace(action_in_proj=ap, action_out_proj=out_proj, action_space=sp)
-    eng = SimpleNamespace(act_dim=act_dim, n_act=A, e_hidden=E, _fvk=fvk, _gemm=_Gemm(fvk))
-    eng._action_in = Alpamayo15Thor._action_in.__get__(eng)
+    eng = SimpleNamespace(act_dim=act_dim, n_act=A, e_hidden=E, fvk=fvk, gemm=_Gemm(fvk))
     eng.act = pack_action_modules(model, act_dim, A)
     mk = lambda *shape, dt=BF16: torch.zeros(*shape, device="cuda", dtype=dt)
-    eng._eb = {"af": mk(rows, eng.act.k0), "ah0": mk(rows, 512), "ah1": mk(rows, 512), "ae": mk(rows, E)}
+    eb = {"af": mk(rows, eng.act.k0), "ah0": mk(rows, 512), "ah1": mk(rows, 512), "ae": mk(rows, E)}
+    eng.expert_buffers = lambda: eb
+    eng._action_in = lambda *args: action_in(eng, *args)
     x = torch.randn(n, A, act_dim, device="cuda")
     t = torch.tensor([0.3], device="cuda")
     res = torch.zeros(rows, E, device="cuda")
@@ -993,7 +1016,8 @@ def test_sampler_tie_plateau_matches_multinomial_and_repeats(rule):
     sampler's index-order path must still return torch.multinomial's token and the same token on every repeat,
     with the row split over several cooperating blocks."""
     fvk = _kernels()
-    from flash_rt.models.alpamayo15.pipeline_thor import torch_philox_blocks, torch_rng_state
+    from flash_rt.models.alpamayo15.pipeline_thor import torch_rng_state
+    from flash_rt.models.alpamayo15.runtime_thor import torch_philox_blocks
     s = _stream()
     gen = torch.cuda.default_generators[torch.cuda.current_device()]
     blocks = torch_philox_blocks()
@@ -1022,3 +1046,96 @@ def test_sampler_tie_plateau_matches_multinomial_and_repeats(rule):
             first = tok.clone()
         assert torch.equal(tok, first), (rep, tok.tolist(), first.tolist())
     assert mism <= 1, mism
+
+
+def test_vision_fp8_tier_runs_the_fp8_blocks():
+    """``vision_weights="fp8"``: the tower reads the runtime's FP8 block weights (per-row FP8 activations and weights,
+    bias / GELU / residual in the epilogue) and stays close to the BF16 tower; Qwen3-VL vision geometry."""
+    fvk = _kernels()
+    from flash_rt.hardware.thor import fa4_backend
+    fa4 = fa4_backend.fa4_fwd()
+    if fa4 is None:
+        pytest.skip(f"FA4 unavailable: {fa4_backend.status()}")
+    from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLVisionConfig
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
+    from flash_rt.models.alpamayo15.pipeline_thor import vision_tower
+    from flash_rt.models.alpamayo15.runtime_thor import VisionTables
+    from flash_rt.models.alpamayo15.weights import quantize_fp8_vision
+    torch.manual_seed(6)
+    cfg = Qwen3VLVisionConfig(depth=2, hidden_size=1152, intermediate_size=4304, num_heads=16, patch_size=16,
+                              spatial_merge_size=2, temporal_patch_size=2, out_hidden_size=2048,
+                              num_position_embeddings=2304, deepstack_visual_indexes=[0])
+    V = Qwen3VLVisionModel(cfg).eval()
+    with torch.no_grad():
+        for p in V.parameters():
+            p.normal_(0.0, 0.02)
+    V = V.to("cuda", BF16)
+    grid = torch.tensor([[1, 16, 16], [1, 16, 16]], device="cuda")
+    px = torch.randn(512, 3 * 2 * 16 * 16, device="cuda")
+    rt = SimpleNamespace(vlm=SimpleNamespace(model=SimpleNamespace(visual=V)), fvk=fvk, fa4=fa4, gemm=_Gemm(fvk), vision_fp8=None,
+                         vision_tables=VisionTables(V))
+    with torch.no_grad(), torch.autocast("cuda", dtype=BF16):
+        img, deep = vision_tower(rt, px, grid)
+        img, deep = img.clone(), deep[0].clone()
+        rt.vision_fp8 = quantize_fp8_vision(V.blocks)
+        img8, deep8 = vision_tower(rt, px, grid)
+    torch.cuda.synchronize()
+    for a, e in ((img8, img), (deep8[0], deep)):
+        cos = float(torch.nn.functional.cosine_similarity(a.float().flatten(), e.float().flatten(), dim=0))
+        assert not torch.equal(a, e) and cos > 0.98, cos
+
+
+_FULL_CKPT = os.environ.get("FLASHRT_ALPAMAYO15_CKPT")   # official Alpamayo 1.5 checkpoint (Hugging Face id or directory)
+
+
+@pytest.mark.skipif(not _FULL_CKPT, reason="set FLASHRT_ALPAMAYO15_CKPT to the official Alpamayo 1.5 checkpoint")
+def test_engine_lifecycle_buffers_graphs_and_input_updates():
+    """The runtime's buffers and CUDA graphs across requests: the decode and expert graphs captured once (by
+    ``capture``), the work buffers sized by the first request; later requests replay the same graphs on the same
+    buffers. Each request's inputs reach the graphs (other frames, other outputs) and the per-request state is reset
+    (a request repeated with its seed repeats bit for bit, also after a two-sample request in between)."""
+    _kernels()
+    pytest.importorskip("alpamayo1_5")
+    from alpamayo1_5 import helper
+    from alpamayo1_5.models.alpamayo1_5 import Alpamayo1_5
+    from flash_rt.frontends.torch.alpamayo15_thor import build_engine
+    model = Alpamayo1_5.from_pretrained(_FULL_CKPT, dtype=BF16, attn_implementation="sdpa").to("cuda").eval()
+    eng = build_engine(model, preset="bf16", max_samples=2, max_new_tokens=48)
+    rt = eng.rt
+    eng.capture((1, 2))
+    graphs = {("decode", n): id(g) for n, g in rt.decode_graphs.items()} | {("expert", n): id(g) for n, g in rt.expert_graphs.items()}
+    assert set(graphs) == {("decode", 1), ("decode", 2), ("expert", 1), ("expert", 2)}
+    persistent = ("k_cache", "v_cache", "d_tok", "d_unfinished", "d_slot", "d_len", "d_glen", "d_plen", "d_cuk", "d_rpos", "rng",
+                  "samp_scratch", "samp_ws", "x", "e_cos", "e_sin", "d_eseq", "d_esuf", "d_aslot", "pred_xyz", "pred_rot",
+                  "cos_table", "sin_table")
+    ptrs = {n: getattr(rt, n).data_ptr() for n in persistent}
+    proc = helper.get_processor(model.tokenizer)
+
+    def request(frames_seed, seed, n=1):
+        frames = torch.randint(0, 256, (4, 4, 3, 1080, 1920), dtype=torch.uint8,
+                               generator=torch.Generator().manual_seed(frames_seed))
+        msgs = helper.create_message(frames.flatten(0, 1), camera_indices=torch.tensor([0, 1, 2, 6]))
+        t = proc.apply_chat_template(msgs, tokenize=True, add_generation_prompt=False, continue_final_message=True,
+                                     return_dict=True, return_tensors="pt")
+        data = helper.to_device({"tokenized_data": t, "ego_history_xyz": torch.zeros(1, 1, 16, 3),
+                                 "ego_history_rot": torch.eye(3).expand(1, 1, 16, 3, 3).contiguous()}, "cuda")
+        torch.cuda.manual_seed_all(seed)
+        xyz, _, extra = eng.sample_trajectories(data, num_traj_samples=n)
+        return xyz.clone(), extra["generated_tokens"]
+
+    def work_buffers():
+        return {(name, k): v.data_ptr() for name, d in (("prefill", rt.prefill_buffers(1)), ("decode", rt.decode_buffers()),
+                                                        ("expert", rt.expert_buffers())) for k, v in d.items() if torch.is_tensor(v)}
+
+    a1 = request(0, 1)
+    work = work_buffers()
+    vision = {k: id(v) for k, v in rt.vision_graphs.graphs.items()}
+    b = request(1, 2)
+    m2 = request(0, 1, n=2)
+    a2 = request(0, 1)
+    assert torch.equal(a1[0], a2[0]) and a1[1] == a2[1]                    # per-request state fully reset
+    assert not torch.equal(a1[0], b[0])                                    # new frames reach the graphs
+    assert m2[0].shape[2] == 2
+    assert {("decode", n): id(g) for n, g in rt.decode_graphs.items()} | {("expert", n): id(g) for n, g in rt.expert_graphs.items()} == graphs
+    assert {n: getattr(rt, n).data_ptr() for n in persistent} == ptrs and work_buffers() == work
+    assert {k: id(v) for k, v in rt.vision_graphs.graphs.items()} == vision and len(vision) == 1   # one tower graph, replayed

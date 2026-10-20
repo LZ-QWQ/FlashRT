@@ -2,7 +2,9 @@
 
 Inputs are prepared exactly as NVIDIA's ``alpamayo1_5`` package does (chat
 message, Qwen3-VL processor, trajectory-history tokens); the request then runs
-on :class:`flash_rt.models.alpamayo15.pipeline_thor.Alpamayo15Thor`.
+on :class:`flash_rt.models.alpamayo15.pipeline_thor.Alpamayo15Thor` (the request computation) over an
+:class:`flash_rt.models.alpamayo15.runtime_thor.Alpamayo15ThorRuntime` (options, prepared weights, persistent
+buffers and CUDA graphs), both built by :func:`build_engine`.
 
 The official package is required (it owns the checkpoint classes, tokenizer
 extensions, trajectory tokenizer and action space). The model is loaded in
@@ -24,6 +26,14 @@ from typing import Any
 import torch
 
 from flash_rt.models.alpamayo15.pipeline_thor import Alpamayo15Thor
+from flash_rt.models.alpamayo15.runtime_thor import Alpamayo15ThorRuntime
+
+
+def build_engine(model, **options: Any) -> Alpamayo15Thor:
+    """The Thor engine for a loaded official model: the runtime validates ``options`` (see
+    ``Alpamayo15ThorRuntime``), prepares the weights and allocates the persistent buffers; the pipeline runs requests
+    on it (``sample_trajectories``) and captures its graphs through it (``capture``)."""
+    return Alpamayo15Thor(Alpamayo15ThorRuntime(model, **options))
 
 
 class Alpamayo15TorchFrontendThor:
@@ -32,12 +42,12 @@ class Alpamayo15TorchFrontendThor:
     Args:
         checkpoint: Hugging Face id or local directory of the Alpamayo 1.5 weights.
         hardware: ``None`` or ``"thor"``.
-        max_prompt, max_new_tokens, top_p, temperature: see ``Alpamayo15Thor``;
+        max_prompt, max_new_tokens, top_p, temperature: see ``Alpamayo15ThorRuntime``;
             the defaults are the official inference settings.
         max_samples: largest ``num_traj_samples`` served by ``infer``.
         capture: capture the decode and diffusion CUDA graphs at construction
             (for ``num_traj_samples=1``; other counts are captured on first use).
-        engine_kwargs: extra keyword arguments for ``Alpamayo15Thor``.
+        engine_kwargs: extra keyword arguments for ``Alpamayo15ThorRuntime`` (preset, tiers, ...).
     """
 
     def __init__(self, checkpoint: str = "nvidia/Alpamayo-1.5-10B", *, hardware: str | None = None,
@@ -61,7 +71,7 @@ class Alpamayo15TorchFrontendThor:
         kwargs = {"max_prompt": max_prompt, "max_new_tokens": max_new_tokens, "max_samples": max_samples,
                   "top_p": top_p, "temperature": temperature}
         kwargs.update(engine_kwargs or {})
-        self.engine = Alpamayo15Thor(self.model, **kwargs)
+        self.engine = build_engine(self.model, **kwargs)
         if capture:
             self.engine.capture()
 

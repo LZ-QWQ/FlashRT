@@ -8,7 +8,9 @@ DFlash draft and samples the trajectory with adaptive action caching, on a W4A8
 (ParoQuant) language model and a fine-tuned action expert. This frontend keeps
 that algorithm, with every control explicit, and executes its primitives (all
 of them by default, or those selected in ``backends``) with
-:class:`flash_rt.models.alpamayo15_flashdrive.pipeline_thor.FlashDriveThor`.
+:class:`flash_rt.models.alpamayo15_flashdrive.pipeline_thor.FlashDriveThor` (the primitives' computation) over a
+:class:`flash_rt.models.alpamayo15_flashdrive.runtime_thor.FlashDriveThorRuntime` (backend choices, prepared weights,
+persistent buffers, per-stream state and CUDA graphs), both built by :func:`attach_flashdrive_backend`.
 
 FlashDrive's ``scripts/infer.py`` also sets
 ``torch.set_float32_matmul_precision("high")`` for the process; this frontend
@@ -37,6 +39,7 @@ from typing import Any
 import torch
 
 from flash_rt.models.alpamayo15_flashdrive.pipeline_thor import BF16, DEV, FlashDriveThor, euler_cache_schedule
+from flash_rt.models.alpamayo15_flashdrive.runtime_thor import FlashDriveThorRuntime
 
 
 def load_flashdrive(base: str, paro: str, dflash: str, *, torch_compile: str | None = None) -> torch.nn.Module:
@@ -79,6 +82,14 @@ def load_flashdrive(base: str, paro: str, dflash: str, *, torch_compile: str | N
     return model
 
 
+def attach_flashdrive_backend(model, **backends: Any) -> FlashDriveThor:
+    """The FlashRT backend of a loaded FlashDrive model: the runtime validates ``backends`` (see
+    ``FlashDriveThorRuntime``) and prepares the weights and buffers, the pipeline's primitives are installed in
+    place of FlashDrive's (FlashDrive's orchestration keeps driving every window). Returns the installed pipeline
+    (``reset`` ends a stream)."""
+    return FlashDriveThor(FlashDriveThorRuntime(model, **backends)).install()
+
+
 @dataclass(frozen=True)
 class FlashDriveRollout:
     """FlashDrive's rollout controls (defaults: FlashDrive ``scripts/infer.py``).
@@ -117,7 +128,7 @@ class Alpamayo15FlashDriveTorchFrontendThor:
         checkpoints: base, W4A8 (``-PARO``) and DFlash draft locations.
         hardware: ``None`` or ``"thor"``.
         rollout: FlashDrive's algorithm controls.
-        backends: per-primitive execution choice passed to ``FlashDriveThor``
+        backends: per-primitive execution choice passed to ``FlashDriveThorRuntime``
             (default: every group on FlashRT with fused W4A8 activations and
             the tcgen05 prefill GEMM; groups set to ``"flashdrive"`` keep
             FlashDrive's execution).
@@ -148,7 +159,7 @@ class Alpamayo15FlashDriveTorchFrontendThor:
         self._to_streaming = convert_to_streaming_window
         self.rollout = rollout
         self.model = load_flashdrive(checkpoints.base, checkpoints.paro, checkpoints.dflash, torch_compile=torch_compile)
-        self.engine = FlashDriveThor(self.model, **(backends or {}))
+        self.engine = attach_flashdrive_backend(self.model, **(backends or {}))
         self.processor = helper.get_processor(self.model.tokenizer)
         tok = self.processor.tokenizer
         self._vs = tok.convert_tokens_to_ids("<|vision_start|>")

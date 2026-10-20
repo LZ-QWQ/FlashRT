@@ -15,7 +15,9 @@ from flash_rt.models.alpamayo15_flashdrive.pipeline_thor import (  # noqa: E402
     FlashDriveThor,
     contiguous_runs,
     euler_cache_schedule,
+    rope_rows,
     rotate_keys_fp32,
+    sync_kvlm_all,
 )
 
 BF16 = torch.bfloat16
@@ -103,10 +105,11 @@ def test_contiguous_runs_of_streaming_rows():
 
 def test_backend_requires_flashdrive_model():
     _fd()
+    from flash_rt.models.alpamayo15_flashdrive.runtime_thor import FlashDriveThorRuntime
     with pytest.raises(TypeError, match="FlashDrive model"):
-        FlashDriveThor(torch.nn.Linear(2, 2), expert="flashdrive")
+        FlashDriveThorRuntime(torch.nn.Linear(2, 2), expert="flashdrive")
     with pytest.raises(ValueError, match="unknown expert backend"):
-        FlashDriveThor(torch.nn.Linear(2, 2), expert="sdpa")
+        FlashDriveThorRuntime(torch.nn.Linear(2, 2), expert="sdpa")
 
 
 def test_action_rejects_unsupported_requests():
@@ -166,7 +169,7 @@ def test_reset_clears_flashdrive_stream_state():
 # ---------------------------------------------------------------------------
 # kernels (GPU)
 # ---------------------------------------------------------------------------
-from flash_rt.models.alpamayo15_flashdrive.pipeline_thor import FLASHDRIVE_KERNEL_SYMBOLS  # noqa: E402
+from flash_rt.models.alpamayo15_flashdrive.runtime_thor import FLASHDRIVE_KERNEL_SYMBOLS  # noqa: E402
 
 
 def _kernels():
@@ -560,7 +563,7 @@ def test_fa4_call_patterns_match_flashdrive_masks():
         pytest.skip(f"FA4 unavailable: {fa4_backend.status()}")
     torch.manual_seed(17)
     S, Hq, Hk, D = 96, 32, 8, 128
-    eng = SimpleNamespace(_fa4=fa4, n_heads=Hq, head_dim=D, scale=D ** -0.5,
+    eng = SimpleNamespace(rt=SimpleNamespace(fa4=fa4, n_heads=Hq, head_dim=D, scale=D ** -0.5),
                           _v_view=lambda st, li: st["v"][li].permute(0, 2, 1, 3))
     eng._attend_runs = lambda *args: FlashDriveThor._attend_runs(eng, *args)
     kvlm = torch.randn(1, S, Hk, D, device="cuda").to(BF16)                      # rotated keys [S, Hk, D]
@@ -682,8 +685,7 @@ def _release_model():
     torch.cuda.empty_cache()
 
 
-@pytest.mark.skipif(not _CKPT, reason="set FLASHRT_FLASHDRIVE_CKPT to the z-lab checkpoint directory")
-@pytest.mark.usefixtures("_release_model")
+_needs_ckpt = pytest.mark.skipif(not _CKPT, reason="set FLASHRT_FLASHDRIVE_CKPT to the z-lab checkpoint directory")
 
 
 @pytest.mark.parametrize("M,N,K", [(1, 1024, 4096), (8, 4096, 4096), (7, 1024, 12288), (16, 2048, 4096), (13, 256, 1024)])
@@ -993,20 +995,22 @@ def test_draft_qkv_prep_matches_flashdrive_draft_attention():
     dict(expert="flashrt", vision="flashrt", prefill="flashrt", decode="flashrt", w4a8="fused", pdl=False),
     dict(expert="flashrt", vision="flashrt", prefill="flashrt", decode="flashrt", w4a8="fused", pdl=True),
 ], ids=["all_flashrt_pdl_off", "all_flashrt_pdl_on"])
+@_needs_ckpt
+@pytest.mark.usefixtures("_release_model")
 def test_backend_primitives_are_repeatable(backends):
     """Every FlashRT primitive, called twice on identical cache / RNG state, returns identical bits and writes identical
     cache rows (run-to-run reproducibility of the stream)."""
     _kernels()
     from alpamayo1_5 import helper
     from flashdrive.streaming import convert_to_streaming_window
-    from flash_rt.frontends.torch.alpamayo15_flashdrive_thor import load_flashdrive
+    from flash_rt.frontends.torch.alpamayo15_flashdrive_thor import attach_flashdrive_backend, load_flashdrive
 
     torch.set_float32_matmul_precision("high")
     root = _CKPT
     model = load_flashdrive(f"{root}/Alpamayo-1.5-10B", f"{root}/Alpamayo-1.5-10B-PARO", f"{root}/Alpamayo-1.5-10B-DFlash")
     names = ["_action", "_encode", "_dflash_prefill", "_shift_streaming_kv_cache", "_dflash_block_step", "_dflash_traj_forward"]
     ref = {n: getattr(model, n) for n in names}
-    eng = FlashDriveThor(model, **backends)
+    eng = attach_flashdrive_backend(model, **backends)
     frt = {n: getattr(model, n) for n in names if getattr(model, n) is not ref[n]}
     gen = torch.cuda.default_generators[torch.cuda.current_device()]
     mismatches = []
@@ -1027,20 +1031,21 @@ def test_backend_primitives_are_repeatable(backends):
     def wrap(n):
         def f(*a, **k):
             pre, rng = snap(), gen.get_state()
-            kvlm_pre = eng._st["kvlm"].clone() if eng._st is not None and "kvlm" in eng._st else None
+            st_ = eng.rt.active_stream
+            kvlm_pre = st_["kvlm"].clone() if st_ is not None and "kvlm" in st_ else None
             out1 = frt[n](*a, **k)
             t1, post1 = tensors(out1), snap()
-            kvlm1 = eng._st["kvlm"].clone() if kvlm_pre is not None else None
+            kvlm1 = eng.rt.active_stream["kvlm"].clone() if kvlm_pre is not None else None
             if pre is not None:
                 restore(pre)
             if kvlm_pre is not None:
-                eng._st["kvlm"].copy_(kvlm_pre)
+                eng.rt.active_stream["kvlm"].copy_(kvlm_pre)
             gen.set_state(rng)
             out2 = frt[n](*a, **k)
             t2, post2 = tensors(out2), snap()
             same_out = all(torch.equal(x, y) for x, y in zip(t1, t2)) and len(t1) == len(t2)
             same_cache = post1 is None or all(torch.equal(a1, a2) and torch.equal(b1, b2) for (a1, b1), (a2, b2) in zip(post1, post2))
-            same_kvlm = kvlm1 is None or torch.equal(kvlm1, eng._st["kvlm"])
+            same_kvlm = kvlm1 is None or torch.equal(kvlm1, eng.rt.active_stream["kvlm"])
             if not (same_out and same_cache and same_kvlm):
                 mismatches.append((n, same_out, same_cache, same_kvlm))
             return out2
@@ -1072,11 +1077,13 @@ def test_backend_primitives_are_repeatable(backends):
     dict(expert="flashrt", vision="flashrt", prefill="flashrt", decode="flashrt", w4a8="fused"),
     dict(expert="flashdrive", vision="flashdrive", prefill="flashrt", decode="flashrt", w4a8="flashdrive"),
 ], ids=["all_flashrt", "mixed"])
+@_needs_ckpt
+@pytest.mark.usefixtures("_release_model")
 def test_backend_primitives_match_flashdrive_on_identical_state(backends):
     _kernels()
     from alpamayo1_5 import helper
     from flashdrive.streaming import convert_to_streaming_window
-    from flash_rt.frontends.torch.alpamayo15_flashdrive_thor import load_flashdrive
+    from flash_rt.frontends.torch.alpamayo15_flashdrive_thor import attach_flashdrive_backend, load_flashdrive
 
     torch.set_float32_matmul_precision("high")
     root = _CKPT
@@ -1084,7 +1091,7 @@ def test_backend_primitives_match_flashdrive_on_identical_state(backends):
     names = ["_action", "_encode", "_dflash_prefill", "_shift_streaming_kv_cache", "_dflash_block_step",
              "_dflash_traj_forward"]
     ref = {n: getattr(model, n) for n in names}
-    eng = FlashDriveThor(model, **backends)
+    eng = attach_flashdrive_backend(model, **backends)
     frt = {n: getattr(model, n) for n in names if getattr(model, n) is not ref[n]}   # primitives the backend replaced
     gen = torch.cuda.default_generators[torch.cuda.current_device()]
     seen = {n: [] for n in frt}
@@ -1098,10 +1105,10 @@ def test_backend_primitives_match_flashdrive_on_identical_state(backends):
             l.keys.copy_(k); l.values.copy_(v)
 
     def kvlm_is_rotated_cache():
-        st = eng._stream()
+        st = eng.rt.stream()
         fresh = torch.empty_like(st["kvlm"][0])
-        for li in range(eng.n_layers):
-            eng._rope_rows(st, li, fresh, st["cos"], st["sin"], 0, st["S"])
+        for li in range(eng.rt.n_layers):
+            rope_rows(eng.rt, st, li, fresh, st["cos"], st["sin"], 0, st["S"])
             if not torch.equal(fresh, st["kvlm"][li]):
                 return False
         return True
@@ -1148,7 +1155,7 @@ def test_backend_primitives_match_flashdrive_on_identical_state(backends):
             seen[n].append(rec)
             restore(post); gen.set_state(rng_ref)
             del pre, post_f
-            eng._sync_kvlm_all(eng._stream())            # continue from FlashDrive's state
+            sync_kvlm_all(eng.rt, eng.rt.stream())       # continue from FlashDrive's state
             return out
         return f
     for n in frt:
@@ -1185,4 +1192,73 @@ def test_backend_primitives_match_flashdrive_on_identical_state(backends):
         proposals = [rec["proposal_eq"] for rec in seen["_dflash_block_step"]]
         assert sum(proposals) >= 0.8 * len(proposals)      # greedy draft proposals from the same context
     del eng, model
+    gc.collect(); torch.cuda.empty_cache()
+
+
+@_needs_ckpt
+@pytest.mark.usefixtures("_release_model")
+def test_backend_stream_lifecycle_buffers_graphs_and_reset():
+    """The backend's resources over two streams of the same windows: no stream state before the first window; the
+    per-stream graphs captured once (the same graph objects and buffers after the third window as after the
+    second); each window's inputs reaching the graphs (different frames, different outputs); ``reset`` ends the
+    stream (no state, FlashDrive's cache dropped) and the next stream, started from the same seed, captures its own
+    graphs and reproduces the first stream bit for bit; the runtime's expert buffers persist across streams."""
+    _kernels()
+    from alpamayo1_5 import helper
+    from flashdrive.streaming import convert_to_streaming_window
+    from flash_rt.frontends.torch.alpamayo15_flashdrive_thor import attach_flashdrive_backend, load_flashdrive
+
+    torch.set_float32_matmul_precision("high")
+    root = _CKPT
+    model = load_flashdrive(f"{root}/Alpamayo-1.5-10B", f"{root}/Alpamayo-1.5-10B-PARO", f"{root}/Alpamayo-1.5-10B-DFlash")
+    eng = attach_flashdrive_backend(model)
+    rt = eng.rt
+    assert rt.active_stream is None
+    expert_ptrs = {k: v.data_ptr() for k, v in rt.expert_buffers().items()}
+    proc = helper.get_processor(model.tokenizer)
+    vs, ve = (proc.tokenizer.convert_tokens_to_ids(t) for t in ("<|vision_start|>", "<|vision_end|>"))
+    frames = torch.randint(0, 256, (4, 8, 3, 1080, 1920), dtype=torch.uint8, generator=torch.Generator().manual_seed(0))
+    hist = (torch.zeros(1, 1, 16, 3), torch.eye(3).expand(1, 1, 16, 3, 3).contiguous())
+
+    def state_of(st):
+        """The stream's graphs and the addresses of its buffers (cache views, decode state, work buffers)."""
+        bufs = {("st", k): v.data_ptr() for k, v in st.items() if torch.is_tensor(v)}
+        for key, d in st["keep"].items():
+            if isinstance(d, dict):
+                bufs.update({(str(key), k): v.data_ptr() for k, v in d.items() if torch.is_tensor(v)})
+        return {k: id(g) for k, g in st["graphs"].items()}, bufs
+
+    def run_stream():
+        torch.manual_seed(0)
+        outs, states = [], []
+        for k in range(5):
+            msgs = helper.create_message(frames[:, k:k + 4].flatten(0, 1), camera_indices=torch.tensor([0, 1, 2, 6]))
+            t = proc.apply_chat_template(msgs, tokenize=True, add_generation_prompt=False, continue_final_message=True,
+                                         return_dict=True, return_tensors="pt")
+            w = {"tokenized_data": t, "ego_history_xyz": hist[0], "ego_history_rot": hist[1]}
+            if k:
+                w = convert_to_streaming_window(w, vs, ve)
+            with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+                xyz, _, extra = model.sample_trajectories_streaming(
+                    helper.to_device(w, "cuda"), num_traj_samples=1, return_extra=True,
+                    diffusion_kwargs={"inference_step": 8, "cache_steps": [3, 4, 5, 6], "int_method": "euler_with_cache"})
+            outs.append(None if xyz is None else (xyz.clone(), str(extra["cot"].reshape(-1)[0])))
+            states.append(state_of(rt.active_stream))
+        return outs, states
+
+    outs1, states1 = run_stream()
+    st1 = rt.active_stream
+    assert outs1[0] is None and all(o is not None for o in outs1[1:])            # the first window only prefills
+    (g3, b3), (g4, b4) = states1[3], states1[4]                                  # captured once, buffers kept:
+    assert all(g4[k] == v for k, v in g3.items()) and all(b4[k] == v for k, v in b3.items())
+    assert not torch.equal(outs1[1][0], outs1[2][0])                             # new frames reach the graphs
+    eng.reset()
+    assert rt.active_stream is None and model._past_key_values is None
+    outs2, states2 = run_stream()
+    assert rt.active_stream is not st1
+    assert not set(states2[4][0].values()) & set(states1[4][0].values())        # the new stream's own graphs
+    for o1, o2 in zip(outs1[1:], outs2[1:]):
+        assert torch.equal(o1[0], o2[0]) and o1[1] == o2[1]
+    assert {k: v.data_ptr() for k, v in rt.expert_buffers().items()} == expert_ptrs
+    del eng, model, st1
     gc.collect(); torch.cuda.empty_cache()
