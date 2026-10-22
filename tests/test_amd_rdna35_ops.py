@@ -102,34 +102,35 @@ class _Rdna35TestKernels:
             x.shape[1], self._stream(x))
 
 
-def _require_gfx1151():
+def _require_rdna_device():
     torch = pytest.importorskip("torch")
     if getattr(torch.version, "hip", None) is None:
         pytest.skip("requires ROCm PyTorch")
     if not torch.cuda.is_available():
         pytest.skip("requires a visible ROCm device")
     arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
-    if arch.split(":", 1)[0] != "gfx1151":
-        pytest.skip("requires gfx1151")
+    if arch.split(":", 1)[0] not in ("gfx1100", "gfx1151", "gfx1201"):
+        pytest.skip("requires gfx1100, gfx1151 or gfx1201")
     return torch
 
 
-def _require_rdna35_hip():
-    torch = _require_gfx1151()
-    try:
-        from flash_rt.amd import flash_rt_amd_kernels as fvk
+def _require_rdna_hip(*, gfx11_wmma=False):
+    torch = _require_rdna_device()
+    from flash_rt.amd import flash_rt_amd_kernels as fvk
+    from flash_rt.amd.hardware.rdna.capabilities import RDNA3, RDNA35, RDNA4
 
-        info = dict(fvk.build_info())
-        if info.get("backend") != "rdna35" or info.get("wave_size") != 32:
-            raise RuntimeError("extension is not an RDNA 3.5 build")
-        kernels = _Rdna35TestKernels(fvk, torch)
-    except (ImportError, RuntimeError) as exc:
-        pytest.skip(f"RDNA 3.5 HIP extension is not available: {exc}")
-    return torch, kernels
+    arch = torch.cuda.get_device_properties(0).gcnArchName
+    target = {t.gpu_arch: t for t in (RDNA3, RDNA35, RDNA4)}[arch.split(":", 1)[0]]
+    # Once a supported device is visible, a missing/mismatched extension is
+    # a failed qualification, not a reason to skip all numerical tests.
+    target.validate(fvk, arch)
+    if gfx11_wmma and not target.gfx11_wmma:
+        pytest.skip("gfx12 uses SDPA/hipBLASLt instead of gfx11 WMMA")
+    return torch, _Rdna35TestKernels(fvk, torch)
 
 
 def test_bf16_gemm_matches_torch_reference():
-    torch, kernels = _require_rdna35_hip()
+    torch, kernels = _require_rdna_hip()
     from flash_rt.amd.hardware.rdna35 import Rdna35GemmBackend
 
     generator = torch.Generator(device="cuda").manual_seed(7)
@@ -154,7 +155,7 @@ def test_bf16_gemm_matches_torch_reference():
 
 
 def test_bf16_gemm_supports_strided_output_rows():
-    torch, kernels = _require_rdna35_hip()
+    torch, kernels = _require_rdna_hip()
     from flash_rt.amd.hardware.rdna35 import Rdna35GemmBackend
 
     generator = torch.Generator(device="cuda").manual_seed(9)
@@ -181,7 +182,7 @@ def test_bf16_gemm_supports_strided_output_rows():
 
 
 def test_split_ffn_views_use_safe_activation_fallback():
-    torch, kernels = _require_rdna35_hip()
+    torch, kernels = _require_rdna_hip()
     import torch.nn.functional as F
     from flash_rt.amd.hardware.rdna35.ops import Rdna35TensorOps
 
@@ -202,7 +203,7 @@ def test_split_ffn_views_use_safe_activation_fallback():
 
 
 def test_gemm_backend_does_not_mutate_torch_tunable_state():
-    torch, kernels = _require_rdna35_hip()
+    torch, kernels = _require_rdna_hip()
     from flash_rt.amd.hardware.rdna35 import Rdna35GemmBackend
 
     enabled = torch.cuda.tunable.is_enabled()
@@ -216,7 +217,7 @@ def test_gemm_backend_does_not_mutate_torch_tunable_state():
 
 
 def test_pipeline_fallback_matches_float32_reference():
-    torch, kernels = _require_rdna35_hip()
+    torch, kernels = _require_rdna_hip()
     import torch.nn.functional as F
     from flash_rt.amd.hardware.rdna35.ops import Rdna35TensorOps
 
@@ -238,7 +239,7 @@ def test_pipeline_fallback_matches_float32_reference():
 
 
 def test_sdpa_gqa_shape_and_finiteness():
-    torch, kernels = _require_rdna35_hip()
+    torch, kernels = _require_rdna_hip()
     from flash_rt.amd.hardware.rdna35 import Rdna35AttentionBackend
 
     generator = torch.Generator(device="cuda").manual_seed(13)
@@ -255,7 +256,7 @@ def test_sdpa_gqa_shape_and_finiteness():
 
 
 def test_compact_sdpa_gqa_matches_padded_layout():
-    torch, kernels = _require_rdna35_hip()
+    torch, kernels = _require_rdna_hip()
     from flash_rt.amd.hardware.rdna35 import Rdna35AttentionBackend
 
     generator = torch.Generator(device="cuda").manual_seed(17)
@@ -284,7 +285,7 @@ def test_compact_sdpa_gqa_matches_padded_layout():
 
 @pytest.mark.parametrize("rows,position_start", [(15, 527), (559, 0)])
 def test_hip_qkv_rope_matches_aten(rows, position_start):
-    torch, kernels = _require_rdna35_hip()
+    torch, kernels = _require_rdna_hip()
 
     generator = torch.Generator(device="cuda").manual_seed(rows + 101)
     qkv = torch.randn(rows, 2560, generator=generator, device="cuda",
@@ -319,7 +320,7 @@ def test_hip_qkv_rope_matches_aten(rows, position_start):
 
 
 def test_hip_decoder_fusions_match_aten():
-    torch, kernels = _require_rdna35_hip()
+    torch, kernels = _require_rdna_hip()
     import torch.nn.functional as F
 
     generator = torch.Generator(device="cuda").manual_seed(137)
@@ -373,7 +374,7 @@ def test_hip_decoder_fusions_match_aten():
 
 
 def test_hip_large_shape_primitives_match_aten():
-    torch, kernels = _require_rdna35_hip()
+    torch, kernels = _require_rdna_hip()
     import torch.nn.functional as F
 
     generator = torch.Generator(device="cuda").manual_seed(173)
@@ -438,7 +439,7 @@ def test_hip_large_shape_primitives_match_aten():
 def test_hip_decoder_gqa_matches_sdpa(
     query_rows, query_heads, kv_rows, valid_prefix, suffix_start, split_key,
 ):
-    torch, kernels = _require_rdna35_hip()
+    torch, kernels = _require_rdna_hip()
     import torch.nn.functional as F
 
     generator = torch.Generator(device="cuda").manual_seed(
@@ -488,7 +489,7 @@ def test_hip_decoder_gqa_matches_sdpa(
     ],
 )
 def test_hip_encoder_gqa_matches_sdpa(rows, valid_kv_rows, query_heads):
-    torch, kernels = _require_rdna35_hip()
+    torch, kernels = _require_rdna_hip(gfx11_wmma=True)
     import torch.nn.functional as F
 
     generator = torch.Generator(device="cuda").manual_seed(
@@ -516,7 +517,7 @@ def test_hip_encoder_gqa_matches_sdpa(rows, valid_kv_rows, query_heads):
 
 
 def test_encoder_backend_routes_native_compact_and_padded(monkeypatch):
-    torch, kernels = _require_rdna35_hip()
+    torch, kernels = _require_rdna_hip(gfx11_wmma=True)
     import torch.nn.functional as F
     from flash_rt.amd.hardware.rdna35 import Rdna35AttentionBackend
 
@@ -552,7 +553,7 @@ def test_encoder_backend_routes_native_compact_and_padded(monkeypatch):
 
 
 def test_encoder_backend_routes_native_at_extended_row_limit(monkeypatch):
-    torch, _kernels = _require_rdna35_hip()
+    torch, _kernels = _require_rdna_hip()
     from flash_rt.amd.hardware.rdna35 import Rdna35AttentionBackend
 
     class RecordNativeLaunch:
@@ -580,7 +581,7 @@ def test_encoder_backend_routes_native_at_extended_row_limit(monkeypatch):
 
 
 def test_encoder_backend_keeps_dense_extended_shape_on_sdpa(monkeypatch):
-    torch, _kernels = _require_rdna35_hip()
+    torch, _kernels = _require_rdna_hip()
     import torch.nn.functional as F
     from flash_rt.amd.hardware.rdna35 import Rdna35AttentionBackend
 
@@ -613,7 +614,7 @@ def test_encoder_backend_keeps_dense_extended_shape_on_sdpa(monkeypatch):
 
 @pytest.mark.parametrize("keys_per_iteration", [1, 2, 4, 8])
 def test_hip_decoder_gqa_splitkey_variants(keys_per_iteration):
-    torch, kernels = _require_rdna35_hip()
+    torch, kernels = _require_rdna_hip()
     import torch.nn.functional as F
 
     generator = torch.Generator(device="cuda").manual_seed(
@@ -653,7 +654,7 @@ def test_hip_decoder_gqa_splitkey_variants(keys_per_iteration):
     ],
 )
 def test_hip_smallm_wmma_matches_torch(rows, inner, columns, with_bias):
-    torch, kernels = _require_rdna35_hip()
+    torch, kernels = _require_rdna_hip(gfx11_wmma=True)
 
     generator = torch.Generator(device="cuda").manual_seed(
         rows + inner + columns)
@@ -680,7 +681,7 @@ def test_hip_smallm_wmma_matches_torch(rows, inner, columns, with_bias):
 
 
 def test_hip_attention_and_smallm_support_graph_replay():
-    torch, kernels = _require_rdna35_hip()
+    torch, kernels = _require_rdna_hip(gfx11_wmma=True)
     import torch.nn.functional as F
 
     generator = torch.Generator(device="cuda").manual_seed(211)
@@ -738,7 +739,7 @@ def test_hip_attention_and_smallm_support_graph_replay():
 
 
 def test_hip_encoder_attention_supports_graph_replay():
-    torch, kernels = _require_rdna35_hip()
+    torch, kernels = _require_rdna_hip(gfx11_wmma=True)
     import torch.nn.functional as F
 
     generator = torch.Generator(device="cuda").manual_seed(217)
@@ -776,7 +777,7 @@ def test_hip_encoder_attention_supports_graph_replay():
 
 
 def test_hipblaslt_runner_supports_graph_replay():
-    torch, kernels = _require_rdna35_hip()
+    torch, kernels = _require_rdna_hip()
     from flash_rt.amd.hardware.rdna35 import Rdna35GemmBackend
 
     generator = torch.Generator(device="cuda").manual_seed(219)
@@ -806,7 +807,7 @@ def test_hipblaslt_runner_supports_graph_replay():
 
 @pytest.mark.parametrize("rows", [15, 48])
 def test_gemm_backend_routes_prepared_action_projection(monkeypatch, rows):
-    torch, kernels = _require_rdna35_hip()
+    torch, kernels = _require_rdna_hip(gfx11_wmma=True)
     from flash_rt.amd.hardware.rdna35 import Rdna35GemmBackend
 
     monkeypatch.setenv("FLASHRT_RDNA35_HIP_SMALLM", "1")
@@ -831,7 +832,7 @@ def test_gemm_backend_routes_prepared_action_projection(monkeypatch, rows):
 
 
 def test_prepared_smallm_rejects_invalid_bias_before_raw_launch(monkeypatch):
-    torch, kernels = _require_rdna35_hip()
+    torch, kernels = _require_rdna_hip(gfx11_wmma=True)
     from flash_rt.amd.hardware.rdna35 import Rdna35GemmBackend
 
     monkeypatch.setenv("FLASHRT_RDNA35_HIP_SMALLM", "1")
@@ -847,7 +848,7 @@ def test_prepared_smallm_rejects_invalid_bias_before_raw_launch(monkeypatch):
 
 
 def test_gemm_backend_rejects_invalid_rank_before_stride_access():
-    torch, kernels = _require_rdna35_hip()
+    torch, kernels = _require_rdna_hip()
     from flash_rt.amd.hardware.rdna35 import Rdna35GemmBackend
 
     backend = Rdna35GemmBackend(kernels.fvk)
@@ -862,7 +863,7 @@ def test_gemm_backend_rejects_invalid_rank_before_stride_access():
 
 
 def test_native_attention_rejects_invalid_output_shape():
-    torch, kernels = _require_rdna35_hip()
+    torch, kernels = _require_rdna_hip()
     from flash_rt.amd.hardware.rdna35 import Rdna35AttentionBackend
 
     query = torch.zeros(15, 8, 256, device="cuda", dtype=torch.bfloat16)
@@ -879,7 +880,7 @@ def test_native_attention_rejects_invalid_output_shape():
 
 @pytest.mark.parametrize("rows", [15, 48])
 def test_gemm_backend_fuses_prepared_action_residual(monkeypatch, rows):
-    torch, kernels = _require_rdna35_hip()
+    torch, kernels = _require_rdna_hip(gfx11_wmma=True)
     from flash_rt.amd.hardware.rdna35 import Rdna35GemmBackend
 
     monkeypatch.setenv("FLASHRT_RDNA35_HIP_SMALLM", "1")

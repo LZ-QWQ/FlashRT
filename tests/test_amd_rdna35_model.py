@@ -1,4 +1,4 @@
-"""Checkpoint-gated Pi0.5 BF16 smoke tests for AMD RDNA 3.5."""
+"""Checkpoint-gated Pi0.5 BF16 smoke tests for AMD RDNA."""
 
 from __future__ import annotations
 
@@ -9,11 +9,11 @@ import pytest
 
 
 def _checkpoint():
-    path = os.environ.get("FLASH_RT_PI05_RDNA35_CKPT")
+    path = os.environ.get("FLASH_RT_PI05_RDNA_CKPT") or os.environ.get("FLASH_RT_PI05_RDNA35_CKPT")
     if not path:
-        pytest.skip("set FLASH_RT_PI05_RDNA35_CKPT for the RDNA 3.5 E2E test")
+        pytest.skip("set FLASH_RT_PI05_RDNA_CKPT for the RDNA E2E test")
     if not os.path.isfile(os.path.join(path, "model.safetensors")):
-        pytest.skip("RDNA 3.5 checkpoint directory lacks model.safetensors")
+        pytest.fail("RDNA checkpoint directory lacks model.safetensors")
     return path
 
 
@@ -23,13 +23,13 @@ def model():
     if getattr(torch.version, "hip", None) is None or not torch.cuda.is_available():
         pytest.skip("requires ROCm PyTorch and a visible device")
     arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
-    if arch.split(":", 1)[0] != "gfx1151":
-        pytest.skip("requires gfx1151")
+    if arch.split(":", 1)[0] not in ("gfx1100", "gfx1151", "gfx1201"):
+        pytest.skip("requires gfx1100, gfx1151 or gfx1201")
 
     import flash_rt
     loaded = flash_rt.load_model(
         _checkpoint(), framework="torch", config="pi05",
-        hardware="amd_rdna35", num_views=2, use_fp8=False,
+        hardware="auto", num_views=2, use_fp8=False,
         action_dim=int(os.environ["FLASH_RT_PI05_ACTION_DIM"]) if "FLASH_RT_PI05_ACTION_DIM" in os.environ else None)
     loaded.set_prompt("pick up the object", state=np.zeros(8, dtype=np.float32))
     return loaded
@@ -276,8 +276,8 @@ def test_native_attention_and_smallm_match_library_fallback(model):
     frontend = model.pipeline
     attention = frontend.pipeline.attn
     gemm = frontend.pipeline.gemm
-    if not attention.hip_gqa or not gemm._smallm_weights:
-        pytest.skip("enable HIP GQA and small-M to run native-path parity")
+    if not attention.hip_gqa:
+        pytest.skip("enable HIP GQA to run native-path parity")
 
     frontend._fill_images({"images": _images()})
     noise = torch.from_numpy(
