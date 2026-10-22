@@ -8,14 +8,15 @@ Per-model deployment guides:
 
 | Model | Guide | Status |
 |---|---|---|
-| Pi0.5 | [deployment_amd_pi05.md](deployment_amd_pi05.md) | CDNA4 FP8/BF16; RDNA 3.5 BF16 |
+| Pi0.5 | [deployment_amd_pi05.md](deployment_amd_pi05.md) | CDNA4 FP8/BF16; RDNA 3/3.5/4 BF16 |
 | GROOT N1.7 | [deployment_amd_groot_n17.md](deployment_amd_groot_n17.md) | FP8 backbone + bf16 DiT |
 
 ## Supported hardware
 
 The native HIP extension has architecture-selected source sets for gfx942
-(CDNA3 / MI300), gfx950 (CDNA4 / MI350), and gfx1151 (RDNA 3.5 / Radeon
-8060S). RDNA implementations remain in the existing `csrc/amd` layout and
+(CDNA3 / MI300), gfx950 (CDNA4 / MI350), gfx1100 (RDNA 3 / W7900D),
+gfx1151 (RDNA 3.5 / Radeon 8060S), and gfx1201 (RDNA 4 / AI PRO R9700).
+RDNA implementations remain in the existing `csrc/amd` layout and
 use an `_rdna` filename suffix; they do not compile or reuse the CDNA
 wave64/MFMA kernels.
 
@@ -26,7 +27,8 @@ wrong results rather than a slow fallback, so the restriction is enforced at
 build time and frontend initialization:
 
 - **At build time** — `scripts/amd/build_amd.sh` accepts the exact gfx942,
-  gfx950, and gfx1151 source sets and rejects other `GPU_ARCH` values. Set
+  gfx950, gfx1151, gfx1100, and gfx1201 source sets and rejects other
+  `GPU_ARCH` values. Set
   `FLASHRT_AMD_ALLOW_ARCH=1` to override when bringing up a port to a
   future architecture.
 - **At CDNA frontend init** — the frontend reads the extension's
@@ -37,8 +39,9 @@ build time and frontend initialization:
   an explicit AMD hardware target on the other generation fails immediately instead
   of computing garbage.
 - **At RDNA frontend init** — the Pi0.5 frontend requires an extension whose
-  `build_info()` reports the RDNA source set, wave32, and gfx1151, and also
-  requires the visible device to be gfx1151. A CDNA extension cannot be
+  `build_info()` reports the selected RDNA backend, wave32, and the exact
+  gfx target, with a matching visible device. RDNA3/4 also check the compiled
+  WMMA capability. A CDNA extension cannot be
   loaded through the RDNA route, or vice versa.
 
 ## Build
@@ -53,6 +56,9 @@ bash scripts/amd/build_amd.sh gfx950
 bash scripts/amd/build_amd.sh gfx942
 # or, on RDNA 3.5:
 PYTHON=.venv/bin/python bash scripts/amd/build_amd.sh gfx1151
+# or, on W7900D / AI PRO R9700 (one target per checkout):
+bash scripts/amd/build_amd.sh gfx1100
+# bash scripts/amd/build_amd.sh gfx1201
 ```
 
 Output: `flash_rt/amd/flash_rt_amd_kernels*.so`. CMake selects the source
@@ -79,6 +85,155 @@ Dependencies:
 
   If a deployment measures roughly 6 ms above the published numbers,
   check that aiter is importable in the serving environment first.
+
+## Pi0.5 on RDNA 3 and RDNA 4
+
+Initial support is limited to `config="pi05"`, `framework="torch"`, BF16,
+and these exact build/device pairs:
+
+| Validated GPU | ISA / hardware name | Encoder attention / action projection |
+|---|---|---|
+| Radeon Pro W7900D | `gfx1100` / `amd_rdna3` | Existing gfx11 WMMA / small-M WMMA |
+| Radeon AI PRO R9700 | `gfx1201` / `amd_rdna4` | PyTorch SDPA / hipBLASLt BF16 |
+
+The gfx12 build excludes the two gfx11-only WMMA translation units and their
+bindings. Its providers always use the library paths for those operations,
+even if `FLASHRT_RDNA35_HIP_ENCODER_ATTN=1` or `FLASHRT_RDNA35_HIP_SMALLM=1`.
+Other wave32 BF16 operators and decoder attention reuse the RDNA source set.
+The frontend validates the selected ISA, backend, wave size and WMMA
+capability before loading weights. FP4, FP16, FA4 and other model/framework
+combinations are not supported. The historical `use_fp8=True` API default
+is explicitly disabled with a warning; pass `use_fp8=False` for BF16.
+
+The new targets reuse the existing RDNA Pi0.5 frontend lifecycle and the
+model-owned tensor pipeline. Halo keeps its existing initialization checks
+and defaults. The CUDA and CDNA runtime routes are unchanged. Existing
+`FLASHRT_RDNA35_*` controls retain their names; default `predict()` is eager
+with `cache_frames=1` (fresh vision/encoder work on every frame).
+
+### Environment and validation
+
+Both discrete GPUs were validated with ROCm 10.1.0, Python 3.13.13,
+`torch==2.14.0+rocm10.1.0` and
+`triton==3.8.0+git669b31ac.rocm10.1.0` from
+`https://stable.repo.amd.com/rocm/whl-next`. The PyTorch installation included
+the `device-gfx1100` and `device-gfx1201` extras. The HIP module links against
+ROCm's hipBLASLt; NumPy, safetensors, SentencePiece and pybind11 are also
+required. These are the tested versions, not a claim of a minimum version.
+Import PyTorch before directly importing the native extension; the new public
+hardware routes initialize the ROCm wheel libraries in that order.
+
+Checkpoint: [Fisher-Wang/pi05-libero-pytorch](https://huggingface.co/Fisher-Wang/pi05-libero-pytorch),
+revision `ab107fbe6661e8abfec0f13dc27bfd3fafe24c69`,
+`model.safetensors` SHA256
+`0f8c489e37b01c72251c45f2e73595894f3933fc6297f4f1cf95fc8737db4c74`.
+This FP32 checkpoint is converted to BF16 by the existing loader. LIBERO
+requires `action_dim=7`; its action horizon is 10. Configure the local
+PaliGemma SentencePiece tokenizer as described in the
+[Pi0.5 guide](deployment_amd_pi05.md).
+
+```bash
+export FLASH_RT_PI05_RDNA_CKPT=/path/to/pi05-libero-pytorch
+export FLASH_RT_PI05_ACTION_DIM=7
+export FLASH_RT_PALIGEMMA_TOKENIZER=/path/to/paligemma_tokenizer.model
+export OMP_NUM_THREADS=8
+python -m pytest \
+  tests/test_amd_rdna_targets.py tests/test_amd_rdna35_routing.py \
+  tests/test_amd_rdna35_ops.py tests/test_amd_rdna35_model.py \
+  tests/test_amd_arch_gate.py tests/test_amd_routing.py \
+  tests/test_pi05_torch_pipeline.py tests/test_amd_no_global_patching.py \
+  tests/test_amd_cdna3_capabilities.py -q -ra -p no:cacheprovider
+```
+
+The `rdna35_ops/model` filenames are retained for existing users and commands;
+they now exercise the shared operators/model on all three RDNA targets.
+`FLASH_RT_PI05_RDNA35_CKPT` remains accepted as a legacy checkpoint variable.
+RDNA3/4-specific routing and capability contracts live in
+`test_amd_rdna_targets.py`; Halo routing and CDNA tests stay separate.
+
+The above suite passed 184 tests on W7900D and 161 on R9700 (17 / 40 skips).
+Both ran ten real-checkpoint cases: finite actions, fixed-noise determinism,
+eager/full/decoder graph parity, prompt/state cache invalidation, temporal
+cache scheduling and native/library numerical parity. Graph parity is exact;
+the existing native/library acceptance bound is cosine >= 0.999. R9700 skips
+23 gfx11-only WMMA cases. Remaining skips cover unavailable hardware,
+optional Hugging Face dependencies and the independent OpenPI reference
+fixture. Halo also rebuilt successfully on its existing ROCm 10.0 environment
+(178 passed, 23 skipped; no checkpoint configured). CUDA routing is covered by
+mocked API regression tests; CUDA/CDNA device execution was not revalidated.
+This is synthetic-input correctness evidence, not a LIBERO task-success result.
+
+### Reproduce inference and timing
+
+With the environment variables above, this runs the public BF16 API and
+separately measures the internal full-pipeline graph. Build/import, weight
+loading, graph capture and lazy GEMM autotuning are outside the timed loops.
+No `FLASHRT_RDNA35_*` overrides were used.
+
+```python
+import os
+import time
+import numpy as np
+import torch
+import flash_rt
+
+torch.manual_seed(17)
+model = flash_rt.load_model(
+    os.environ["FLASH_RT_PI05_RDNA_CKPT"], config="pi05", framework="torch",
+    hardware="auto", use_fp8=False, num_views=2, num_steps=10,
+    action_dim=7, cache_frames=1)
+rng = np.random.default_rng(17)
+images = [rng.integers(0, 256, (224, 224, 3), dtype=np.uint8) for _ in range(2)]
+state = np.zeros(8, dtype=np.float32)
+
+def predict():
+    return model.predict(images=images, prompt="pick up the object", state=state)
+
+actions = predict()
+assert actions.shape == (10, 7) and np.isfinite(actions).all()
+print("actions:", actions.shape, actions[0])
+
+def measure(run):
+    for _ in range(20):
+        run()
+    samples = []
+    for _ in range(50):
+        torch.cuda.synchronize()
+        started = time.perf_counter()
+        run()
+        torch.cuda.synchronize()
+        samples.append((time.perf_counter() - started) * 1000)
+    return np.percentile(samples, [50, 95])
+
+print("predict median/p95 ms:", measure(predict))
+frontend = model.pipeline
+frontend._fill_images({"images": images})
+noise = torch.from_numpy(rng.standard_normal((10, 32)).astype(np.float32)).to(
+    device="cuda", dtype=torch.bfloat16)
+eager = frontend.forward_with_fixed_noise(frontend._image_buf, noise).clone()
+graph = frontend.forward_with_fixed_noise(
+    frontend._image_buf, noise, use_graph=True).clone()
+torch.testing.assert_close(graph, eager, atol=0, rtol=0)
+print("full graph replay median/p95 ms:", measure(frontend.pipeline._graph.replay))
+```
+
+Measurements on the validated checkpoint, batch 1, two 224x224 RGB views,
+ten denoising steps, action shape `(10, 7)`, zero eight-dimensional state,
+`"pick up the object"` prompt (143 tokens; encoder length 655), seed 17,
+20 warmups and 50 measured iterations:
+
+| GPU | Full `predict()` median / p95 | Full graph replay median / p95 |
+|---|---|---|
+| W7900D | 88.91 / 89.73 ms | 86.27 / 86.48 ms |
+| AI PRO R9700 | 57.88 / 59.64 ms | 56.01 / 56.17 ms |
+
+Both metrics are synchronized host wall time. `predict()` includes image
+preparation, input transfers and CPU action postprocessing/output. Graph
+replay excludes those steps and reuses fixed GPU inputs; it is not the
+public API latency. Graph output matched eager output exactly on both GPUs.
+These are initial support measurements on shared servers, without performance
+tuning or an upstream speedup claim. W7900D had one 323.60 ms `predict()`
+outlier; its mean was 93.72 ms (R9700 mean: 58.15 ms).
 
 ## Layout
 
@@ -112,7 +267,8 @@ decoder-only frames that reuse the last encoded K/V prefix.
 ## Hardware routing
 
 Auto-detection uses the device's `gcnArchName`: gfx942 maps to `amd_cdna3`,
-gfx950 maps to `amd_cdna4`, and gfx1151 maps to `amd_rdna35`. An unregistered
+gfx950 maps to `amd_cdna4`, gfx1151 maps to `amd_rdna35`, gfx1100 maps
+to `amd_rdna3`, and gfx1201 maps to `amd_rdna4`. An unregistered
 ROCm architecture raises rather than falling through to an NVIDIA table entry.
 
 ```python
@@ -138,7 +294,7 @@ Expected failures:
 |---|---|
 | Extension not built | `ImportError` naming `flash_rt_amd_kernels` and the build command |
 | CDNA build/device mismatch | `RuntimeError` naming the device and build architectures |
-| RDNA build/backend/wave size/device mismatch | `RuntimeError` naming the required gfx1151 RDNA source set |
+| RDNA build/backend/wave size/device mismatch | `RuntimeError` naming the required RDNA source set and gfx target |
 | Model/framework not ported to AMD | `RuntimeError` from pipeline resolution |
 | Thor-only options (`use_fp4_decoder`, `use_fa4`) | `ValueError` naming the supported hardware |
 
@@ -164,6 +320,7 @@ belong to the CDNA runtime. The RDNA Pi0.5 backend has its own
 python -m pytest tests/test_amd_routing.py tests/test_amd_extension.py \
                  tests/test_amd_hip_graph.py tests/test_amd_kernel_parity.py \
                  tests/test_amd_pi05_model.py \
+                 tests/test_amd_rdna_targets.py \
                  tests/test_amd_rdna35_routing.py \
                  tests/test_amd_rdna35_ops.py \
                  tests/test_amd_rdna35_model.py -v
@@ -177,8 +334,9 @@ python -m pytest tests/test_amd_routing.py tests/test_amd_extension.py \
 | `test_amd_kernel_parity.py` | numerical parity of the kernel surface against torch references on real-distribution inputs, including FP8 byte-exactness and the seqused fixed-shape attention path | no ROCm device or extension |
 | `test_amd_pi05_model.py` | end-to-end model load, graph capture, pinned-noise determinism, exact/fixed prompt modes, FP8 and BF16 | no checkpoint (see the per-model guide for the environment variables) |
 | `test_amd_rdna35_routing.py` | gfx1151 routing, lazy imports, BF16/profile contracts, and CDNA/Triton isolation | torch unavailable; hardware-only cases require gfx1151 |
-| `test_amd_rdna35_ops.py` | RDNA native-kernel parity, validation, graph replay, and library fallbacks | no gfx1151 ROCm device or RDNA extension |
-| `test_amd_rdna35_model.py` | RDNA Pi0.5 finite output, determinism, full-graph parity, and optimized/fallback parity | no gfx1151 checkpoint |
+| `test_amd_rdna_targets.py` | RDNA3/4 routing, exact build/device/capability matching, gfx12 library fallbacks, CUDA route isolation and legacy Halo initialization | numerical cases require gfx1100 or gfx1201 |
+| `test_amd_rdna35_ops.py` | RDNA native-kernel parity, validation, graph replay, and library fallbacks | no supported RDNA device; gfx11 WMMA-only cases skip on gfx1201; a missing/mismatched extension fails |
+| `test_amd_rdna35_model.py` | RDNA Pi0.5 finite output, determinism, full-graph parity, and optimized/fallback parity | no supported RDNA device or checkpoint |
 | `test_amd_groot_routing.py` | GROOT N1.7 pipeline-map entry, precision-tier contracts, attention-backend site/layer validation | extension-dependent cases skip without the `.so` |
 | `test_amd_groot_model.py` | GROOT N1.7 end-to-end: kernel backbone, finite actions, pinned-noise determinism, optional reference cosine | no checkpoint |
 
