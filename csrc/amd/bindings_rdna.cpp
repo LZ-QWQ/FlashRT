@@ -1,5 +1,5 @@
 // ================================================================
-// FlashRT AMD -- pybind11 bindings for RDNA 3.5 BF16 kernels
+// FlashRT AMD -- pybind11 bindings for RDNA BF16 kernels
 //
 // The Python-facing names include `_rdna` so a caller cannot accidentally
 // route an RDNA implementation through a CDNA capability check. Like the
@@ -42,7 +42,7 @@ static void *to_ptr(uintptr_t address) {
 
 // ── Kernel declarations ──
 // Definitions live beside their CDNA counterparts under kernels/, attention/,
-// and gemm/. Only this reduced BF16 surface is built for gfx1151.
+// and gemm/. RDNA targets build this reduced BF16 surface.
 
 void qkv_rope_rdna(const __hip_bfloat16 *qkv, const __hip_bfloat16 *rope_cos,
                    const __hip_bfloat16 *rope_sin, __hip_bfloat16 *q_out,
@@ -91,6 +91,7 @@ void attention_decoder_gqa_splitkey_rdna(
     const __hip_bfloat16 *value, __hip_bfloat16 *output, int query_rows,
     int kv_rows, int query_heads, int head_dim, int valid_prefix,
     int suffix_start, float scale, int keys_per_iteration, hipStream_t stream);
+#ifdef FLASHRT_AMD_GFX11_WMMA
 void attention_encoder_gqa_rdna(const __hip_bfloat16 *query,
                                 const __hip_bfloat16 *key,
                                 const __hip_bfloat16 *value,
@@ -108,15 +109,22 @@ void smallm_wmma_bf16_residual_rdna(const __hip_bfloat16 *input,
                                     __hip_bfloat16 *output, int rows,
                                     int columns, int inner, hipStream_t stream);
 
+#endif
+
 PYBIND11_MODULE(flash_rt_amd_kernels, module) {
-  module.doc() = "FlashRT AMD RDNA 3.5 BF16 kernels (raw-pointer ABI)";
+  module.doc() = "FlashRT AMD RDNA BF16 kernels (raw-pointer ABI)";
 
   // ── Runtime/build identity ──
 
   module.def("build_info", []() {
     py::dict info;
     info["platform"] = "hip";
-    info["backend"] = "rdna35";
+    info["backend"] = FLASHRT_AMD_RDNA_BACKEND;
+#ifdef FLASHRT_AMD_GFX11_WMMA
+    info["gfx11_wmma"] = true;
+#else
+    info["gfx11_wmma"] = false;
+#endif
     info["wave_size"] = 32;
 #ifdef FLASHRT_AMD_GPU_ARCH
     info["gpu_arch"] = FLASHRT_AMD_GPU_ARCH;
@@ -336,6 +344,7 @@ PYBIND11_MODULE(flash_rt_amd_kernels, module) {
                    keys_per_iteration, to_stream(stream));
              });
 
+#ifdef FLASHRT_AMD_GFX11_WMMA
   module.def("attention_encoder_gqa_rdna",
              [](uintptr_t output, uintptr_t query, uintptr_t key,
                 uintptr_t value, int query_rows, int valid_kv_rows,
@@ -373,4 +382,5 @@ PYBIND11_MODULE(flash_rt_amd_kernels, module) {
                    typed_ptr<__hip_bfloat16>(output), rows, columns, inner,
                    to_stream(stream));
              });
+#endif
 }

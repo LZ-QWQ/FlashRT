@@ -805,6 +805,34 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                 f"-DGPU_ARCH={'gfx942' if arch == 'amd_cdna3' else 'gfx950'} && "
                 "cmake --build build-amd -j\n"
                 "See docs/deployment_amd.md.") from exc
+    elif arch in ("amd_rdna3", "amd_rdna4"):
+        if (config, framework) != ("pi05", "torch"):
+            raise ValueError(f"{arch} supports config='pi05', framework='torch' only")
+        if (use_fp4 or use_fp16 or use_fa4 or use_fp4_decoder
+                or use_fp4_encoder_attn or use_fp4_siglip_ffn):
+            raise ValueError(f"{arch} supports BF16 only; FP4, FP16 and FA4 are unavailable")
+        rdna_gfx = {"amd_rdna3": "gfx1100",
+                    "amd_rdna4": "gfx1201"}[arch]
+        # ROCm wheel libraries must initialize before the toolkit-linked DSO.
+        # Loading both runtimes in the opposite order can abort the process.
+        import torch  # noqa: F401
+        try:
+            import flash_rt.amd.flash_rt_amd_kernels  # noqa: F401
+        except ImportError as exc:
+            raise ImportError(
+                "flash_rt.amd.flash_rt_amd_kernels is not built for the "
+                f"{arch} backend. Build it with:\n"
+                f"    bash scripts/amd/build_amd.sh {rdna_gfx}\n"
+                "See docs/deployment_amd.md."
+            ) from exc
+        # The initial RDNA tier is intentionally BF16. load_model's
+        # historical default is use_fp8=True; coerce that default explicitly
+        # rather than routing to the gfx950 FP8 kernels.
+        if use_fp8:
+            use_fp8 = False
+            logger.warning(
+                f"{arch} backend currently supports BF16 only; "
+                "disabling use_fp8.")
     elif arch == "amd_rdna35":
         try:
             import flash_rt.amd.flash_rt_amd_kernels  # noqa: F401
@@ -1151,7 +1179,7 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         from types import SimpleNamespace
         sig = SimpleNamespace(parameters=parameters)
     kwargs: dict = {"num_views": num_views}
-    if arch == "amd_rdna35" and "action_dim" in sig.parameters and action_dim is not None:
+    if arch in ("amd_rdna3", "amd_rdna35", "amd_rdna4") and "action_dim" in sig.parameters and action_dim is not None:
         kwargs["action_dim"] = action_dim
     if "hardware" in sig.parameters:
         kwargs["hardware"] = arch

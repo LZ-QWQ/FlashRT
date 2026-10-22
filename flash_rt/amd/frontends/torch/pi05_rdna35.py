@@ -66,6 +66,10 @@ def _build_time_embeddings(num_steps: int) -> torch.Tensor:
 class Pi05TorchFrontendAmdRdna35:
     """Correctness-first Pi0.5 frontend for AMD RDNA 3.5."""
 
+    _hardware = "amd_rdna35"
+    _pipeline_class = Pi05PipelineRdna35
+    _gfx11_wmma = True
+
     _VIEW_KEYS = ("image", "wrist_image", "wrist_image_right")
 
     def __init__(
@@ -80,36 +84,7 @@ class Pi05TorchFrontendAmdRdna35:
         hardware: Optional[str] = None,
         action_dim: Optional[int] = None,
     ):
-        if hardware not in (None, "amd_rdna35"):
-            raise ValueError(
-                "Pi05TorchFrontendAmdRdna35 requires hardware='amd_rdna35', "
-                f"got {hardware!r}")
-        if use_fp8:
-            raise ValueError("amd_rdna35 currently supports BF16 only")
-        if not torch.cuda.is_available() or getattr(torch.version, "hip", None) is None:
-            raise RuntimeError("amd_rdna35 requires a ROCm build of PyTorch")
-        device_arch = str(
-            getattr(torch.cuda.get_device_properties(0), "gcnArchName", "unknown"))
-        if device_arch.split(":", 1)[0] != "gfx1151":
-            raise RuntimeError(
-                "Pi05TorchFrontendAmdRdna35 is gfx1151-only: running device "
-                f"architecture is {device_arch!r}")
-
-        from flash_rt.amd import flash_rt_amd_kernels as fvk
-
-        build_info = dict(fvk.build_info())
-        build_arch = str(build_info.get("gpu_arch", "")).split(":", 1)[0]
-        extension_device_arch = str(fvk.device_arch()).split(":", 1)[0]
-        if (
-            build_info.get("backend") != "rdna35"
-            or build_info.get("wave_size") != 32
-        ):
-            raise RuntimeError(
-                "flash_rt_amd_kernels was not built with the RDNA source set")
-        if build_arch != "gfx1151" or extension_device_arch != "gfx1151":
-            raise RuntimeError(
-                "RDNA 3.5 HIP kernels require a gfx1151 build and device: "
-                f"build={build_arch!r} device={extension_device_arch!r}")
+        fvk = self._validate_backend(hardware, use_fp8)
 
         checkpoint_dir = pathlib.Path(checkpoint_dir)
         checkpoint = checkpoint_dir / "model.safetensors"
@@ -146,7 +121,7 @@ class Pi05TorchFrontendAmdRdna35:
         if not isinstance(chunk_size, int) or isinstance(chunk_size, bool) or chunk_size < 1:
             raise ValueError(f"chunk_size must be positive, got {chunk_size}")
 
-        self.hardware = "amd_rdna35"
+        self.hardware = self._hardware
         self.num_views = int(num_views)
         self.num_steps = int(num_steps)
         self.max_prompt_len = int(max_prompt_len)
@@ -197,14 +172,15 @@ class Pi05TorchFrontendAmdRdna35:
         }
         del cpu_weights
 
-        gemm = Rdna35GemmBackend(fvk, self.dtype)
+        gemm = Rdna35GemmBackend(
+            fvk, self.dtype, supports_smallm=self._gfx11_wmma)
         gemm.prepare_smallm_weight(
             self.weights["decoder_action_out_proj_w"])
-        self.pipeline = Pi05PipelineRdna35(
+        self.pipeline = self._pipeline_class(
             self.weights,
             fvk,
             gemm,
-            Rdna35AttentionBackend(fvk),
+            Rdna35AttentionBackend(fvk, supports_encoder=self._gfx11_wmma),
             num_views=self.num_views,
             max_prompt_len=self.max_prompt_len,
             chunk_size=self.chunk_size,
@@ -218,6 +194,39 @@ class Pi05TorchFrontendAmdRdna35:
             dtype=self.dtype, device="cuda")
         self._noise_buf = torch.empty(
             self.chunk_size, ACTION_DIM, dtype=self.dtype, device="cuda")
+
+    def _validate_backend(self, hardware, use_fp8):
+        if hardware not in (None, "amd_rdna35"):
+            raise ValueError(
+                "Pi05TorchFrontendAmdRdna35 requires hardware='amd_rdna35', "
+                f"got {hardware!r}")
+        if use_fp8:
+            raise ValueError("amd_rdna35 currently supports BF16 only")
+        if not torch.cuda.is_available() or getattr(torch.version, "hip", None) is None:
+            raise RuntimeError("amd_rdna35 requires a ROCm build of PyTorch")
+        device_arch = str(
+            getattr(torch.cuda.get_device_properties(0), "gcnArchName", "unknown"))
+        if device_arch.split(":", 1)[0] != "gfx1151":
+            raise RuntimeError(
+                "Pi05TorchFrontendAmdRdna35 is gfx1151-only: running device "
+                f"architecture is {device_arch!r}")
+
+        from flash_rt.amd import flash_rt_amd_kernels as fvk
+
+        build_info = dict(fvk.build_info())
+        build_arch = str(build_info.get("gpu_arch", "")).split(":", 1)[0]
+        extension_device_arch = str(fvk.device_arch()).split(":", 1)[0]
+        if (
+            build_info.get("backend") != "rdna35"
+            or build_info.get("wave_size") != 32
+        ):
+            raise RuntimeError(
+                "flash_rt_amd_kernels was not built with the RDNA source set")
+        if build_arch != "gfx1151" or extension_device_arch != "gfx1151":
+            raise RuntimeError(
+                "RDNA 3.5 HIP kernels require a gfx1151 build and device: "
+                f"build={build_arch!r} device={extension_device_arch!r}")
+        return fvk
 
     @staticmethod
     def _checkpoint_action_horizon(checkpoint_dir: pathlib.Path) -> int:

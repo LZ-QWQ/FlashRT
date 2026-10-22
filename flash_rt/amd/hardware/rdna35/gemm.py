@@ -10,7 +10,8 @@ import torch
 class Rdna35GemmBackend:
     """Run BF16 GEMMs through an instance-local hipBLASLt algorithm cache."""
 
-    def __init__(self, kernels, dtype: torch.dtype = torch.bfloat16):
+    def __init__(self, kernels, dtype: torch.dtype = torch.bfloat16, *,
+                 supports_smallm: bool = True):
         if dtype is not torch.bfloat16:
             raise TypeError(f"RDNA 3.5 GEMM supports BF16 only, got {dtype}")
         self.dtype = dtype
@@ -31,7 +32,8 @@ class Rdna35GemmBackend:
                     "FLASHRT_RDNA35_GEMM_ALGOS must be a positive integer")
             self._runner.enable_lazy_autotune(pool)
         self.hip_smallm = (
-            os.getenv("FLASHRT_RDNA35_HIP_SMALLM", "1") == "1"
+            supports_smallm
+            and os.getenv("FLASHRT_RDNA35_HIP_SMALLM", "1") == "1"
         )
         self._smallm_weights: dict[
             int, tuple[torch.Tensor, torch.Tensor]
