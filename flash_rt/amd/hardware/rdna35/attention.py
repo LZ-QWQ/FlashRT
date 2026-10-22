@@ -11,10 +11,11 @@ import torch.nn.functional as F
 class Rdna35AttentionBackend:
     """BF16 attention backend with shape-specialized RDNA 3.5 kernels."""
 
-    def __init__(self, kernels):
+    def __init__(self, kernels, *, supports_encoder: bool = True):
         self.fvk = kernels
         self.hip_encoder_gqa = (
-            os.getenv("FLASHRT_RDNA35_HIP_ENCODER_ATTN", "1") == "1"
+            supports_encoder
+            and os.getenv("FLASHRT_RDNA35_HIP_ENCODER_ATTN", "1") == "1"
         )
         self.hip_gqa = os.getenv("FLASHRT_RDNA35_HIP_GQA", "1") == "1"
         self.hip_gqa_split_key = (

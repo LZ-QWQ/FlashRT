@@ -34,6 +34,7 @@ import pytest
 def _amd_ext_importable() -> bool:
     """True iff any compiled AMD source set is importable."""
     try:
+        import torch  # noqa: F401 — initialize ROCm wheel libraries first
         import flash_rt.amd.flash_rt_amd_kernels  # noqa: F401
         return True
     except ImportError:
@@ -43,9 +44,10 @@ def _amd_ext_importable() -> bool:
 def _amd_cdna_ext_importable() -> bool:
     """True iff the compiled AMD module is the CDNA4 source set."""
     try:
+        import torch  # noqa: F401 — initialize ROCm wheel libraries first
         from flash_rt.amd import flash_rt_amd_kernels
 
-        return flash_rt_amd_kernels.build_info().get("backend") != "rdna35"
+        return flash_rt_amd_kernels.build_info().get("gpu_arch") in {"gfx942", "gfx950"}
     except ImportError:
         return False
 
@@ -134,7 +136,8 @@ def test_detect_arch_maps_gfx942_to_amd_cdna3(monkeypatch, gcn):
 
 @pytest.mark.parametrize("gcn", [
     "gfx90a",                   # MI200
-    "gfx1100",                  # RDNA3
+    "gfx11000",                 # RDNA3 prefix trap
+    "gfx12010",                 # RDNA4 prefix trap
     "gfx9500",                  # prefix trap: startswith() would wrongly pass
 ])
 def test_detect_arch_refuses_unregistered_rocm(monkeypatch, gcn):

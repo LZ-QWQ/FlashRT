@@ -213,14 +213,15 @@ def test_legacy_model_exports_keep_their_provider(monkeypatch):
 def cpu_rdna_frontend(small_model, monkeypatch):
     import numpy as np
     from flash_rt.api import VLAModel
-    from flash_rt.amd.frontends.torch import pi05_rdna35 as frontend_module
+    from flash_rt.amd.frontends.torch import pi05_rdna as frontend_module
+    from flash_rt.amd.frontends.torch.pi05_rdna35 import Pi05TorchFrontendAmdRdna35
 
     pipeline = model.Pi05TorchPipeline(
         small_model.weights, TorchTensorOps(), TorchGemmBackend(),
         TorchAttentionBackend(2), num_views=2, max_prompt_len=3,
         chunk_size=3, num_steps=2, device='cpu',
     )
-    frontend = object.__new__(frontend_module.Pi05TorchFrontendAmdRdna35)
+    frontend = object.__new__(Pi05TorchFrontendAmdRdna35)
     frontend.num_views = 2
     frontend._cache_frames = 2
     frontend._frame_count = 0
@@ -303,7 +304,7 @@ def test_failed_refresh_retry_uses_full_pipeline(cpu_rdna_frontend, change):
 
 @pytest.mark.parametrize('failure', ['decode', 'synchronize', 'postprocess'])
 def test_inference_failure_invalidates_cache(cpu_rdna_frontend, monkeypatch, failure):
-    from flash_rt.amd.frontends.torch import pi05_rdna35 as frontend_module
+    from flash_rt.amd.frontends.torch import pi05_rdna as frontend_module
     f = cpu_rdna_frontend
     f.public.predict(f.images, prompt='A')
     def fail(*args, **kwargs):
