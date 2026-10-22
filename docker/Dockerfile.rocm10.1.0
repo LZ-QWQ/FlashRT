@@ -1,0 +1,44 @@
+ARG ROCM_IMAGE=rocm/dev-ubuntu-24.04:10.1.0-full@sha256:5ed1362ea542a928651e4c710b44024ebe98870f74159cb70f0265aec8ef0abe
+FROM ${ROCM_IMAGE} AS environment
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+      build-essential cmake git pkg-config python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+# Optional download mirror for networks that cannot reach GitHub releases.
+ARG UV_PYTHON_INSTALL_MIRROR
+ENV UV_PYTHON_INSTALL_DIR=/opt/python
+RUN python3 -m venv /opt/uv \
+    && /opt/uv/bin/python -m pip install --no-cache-dir "uv==0.13.0" \
+    && /opt/uv/bin/uv python install 3.13.13 \
+    && /opt/uv/bin/uv venv --python 3.13.13 --seed /opt/venv
+
+ENV VIRTUAL_ENV=/opt/venv \
+    ROCM_PATH=/opt/rocm \
+    PATH=/opt/venv/bin:/opt/rocm/bin:${PATH} \
+    LD_LIBRARY_PATH=/opt/rocm/lib
+
+RUN python -m pip install --no-cache-dir \
+      --index-url https://stable.repo.amd.com/rocm/whl-next \
+      "torch[device-gfx1100,device-gfx1151,device-gfx1201]==2.14.0+rocm10.1.0" \
+      "triton==3.8.0+git669b31ac.rocm10.1.0"
+
+RUN python -m pip install --no-cache-dir \
+      "setuptools>=77,<82" wheel ninja "pybind11>=2.13,<4" \
+      "numpy>=2,<3" pyyaml safetensors sentencepiece pillow \
+      pytest ml_dtypes \
+    && python -m pip check \
+    && python -c "import sys, torch, triton; from importlib.metadata import version; assert sys.version_info[:2] == (3, 13); assert torch.__version__ == '2.14.0+rocm10.1.0'; assert torch.version.hip and torch.version.cuda is None; assert version('triton') == '3.8.0+git669b31ac.rocm10.1.0'"
+
+WORKDIR /workspace/FlashRT
+
+FROM environment AS flashrt
+# Build one architecture per image: gfx1100, gfx1151 or gfx1201.
+ARG GPU_ARCH
+COPY . .
+RUN test -n "${GPU_ARCH}" \
+    && python -m pip install --no-cache-dir --no-deps --no-build-isolation -e . \
+    && bash scripts/amd/build_amd.sh "${GPU_ARCH}" \
+    && python -m pip check
+CMD ["bash"]

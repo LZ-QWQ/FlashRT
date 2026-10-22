@@ -232,6 +232,9 @@ selection; compare arms under the same affinity and data protocol.
 
 # Pi0.5 on AMD RDNA 3.5 (gfx1151)
 
+For the ROCm 10.1 dev container and the W7900/gfx1100 and R9700/gfx1201
+BF16 ports, see [the shared RDNA guide](deployment_amd_rdna.md).
+
 This is the BF16 Pi0.5 backend for the integrated Radeon 8060S GPU in
 Ryzen AI Max+ 395 (the GPUs in AMD Ryzen™ AI Embedded X100 Series processors
 share the same RDNA 3.5 architecture). Its public hardware key is

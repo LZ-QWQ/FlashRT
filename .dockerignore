@@ -31,3 +31,8 @@ results/
 work/
 outputs/
 .env*
+
+# Local AMD build dependencies are installed inside the image.
+.pydeps/
+core
+core.*

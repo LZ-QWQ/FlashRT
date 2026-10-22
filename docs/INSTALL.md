@@ -353,3 +353,11 @@ capability issue until the exact cuBLASLt version, GPU, descriptor
 shape/layout, and epilogue have been checked. Prefer the validated
 Docker/NGC stack when debugging FP8 cuBLASLt heuristic failures, and
 include `cublasLtGetVersion()` in bug reports.
+
+## AMD RDNA Pi0.5
+
+For W7900/W7900D (`gfx1100`), Strix Halo (`gfx1151`) and AI PRO R9700
+(`gfx1201`), use the standalone AMD build and BF16 torch frontend.
+[docker/Dockerfile.rocm10.1.0](../docker/Dockerfile.rocm10.1.0) builds from
+the ROCm Ubuntu dev base with AMD PyTorch/Triton packages. See
+[RDNA deployment](deployment_amd_rdna.md) for target selection and tests.

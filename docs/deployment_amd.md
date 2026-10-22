@@ -14,8 +14,9 @@ Per-model deployment guides:
 ## Supported hardware
 
 The native HIP extension has architecture-selected source sets for gfx942
-(CDNA3 / MI300), gfx950 (CDNA4 / MI350), and gfx1151 (RDNA 3.5 / Radeon
-8060S). RDNA implementations remain in the existing `csrc/amd` layout and
+(CDNA3 / MI300), gfx950 (CDNA4 / MI350), gfx1100 (RDNA 3 / W7900),
+gfx1151 (RDNA 3.5 / Radeon 8060S), and gfx1201 (RDNA 4 / AI PRO R9700).
+RDNA implementations remain in the existing `csrc/amd` layout and
 use an `_rdna` filename suffix; they do not compile or reuse the CDNA
 wave64/MFMA kernels.
 
@@ -26,7 +27,8 @@ wrong results rather than a slow fallback, so the restriction is enforced at
 build time and frontend initialization:
 
 - **At build time** — `scripts/amd/build_amd.sh` accepts the exact gfx942,
-  gfx950, and gfx1151 source sets and rejects other `GPU_ARCH` values. Set
+  gfx950, gfx1100, gfx1151, and gfx1201 source sets and rejects other
+  `GPU_ARCH` values. Set
   `FLASHRT_AMD_ALLOW_ARCH=1` to override when bringing up a port to a
   future architecture.
 - **At CDNA frontend init** — the frontend reads the extension's
@@ -37,9 +39,13 @@ build time and frontend initialization:
   an explicit AMD hardware target on the other generation fails immediately instead
   of computing garbage.
 - **At RDNA frontend init** — the Pi0.5 frontend requires an extension whose
-  `build_info()` reports the RDNA source set, wave32, and gfx1151, and also
-  requires the visible device to be gfx1151. A CDNA extension cannot be
+  `build_info()` reports the selected RDNA source set, wave32, and its exact
+  gfx target and WMMA capability, with a matching visible device. A CDNA
+  extension cannot be
   loaded through the RDNA route, or vice versa.
+
+For the BF16 RDNA container, target matrix and correctness gates, see
+[Pi0.5 RDNA deployment](deployment_amd_rdna.md).
 
 ## Build
 
@@ -85,12 +91,12 @@ Dependencies:
 ```
 csrc/amd/                    standalone HIP tree (own CMake entry point)
   bindings.cpp               pybind module flash_rt_amd_kernels
-  bindings_rdna.cpp          gfx1151-only pybind surface
+  bindings_rdna.cpp          architecture-selected wave32 BF16 surface
   gemm/                      hipBLASLt + CDNA MFMA / RDNA WMMA kernels
   arch.h                     FP8 format, datatype, and capability selection
   attention/                 CDNA and `_rdna` encoder/decoder attention
   kernels/                   norm / activation / quantize / fusion families;
-                              `_rdna` files are selected only for gfx1151
+                              `_rdna` files are selected for RDNA targets
 flash_rt/amd/
   core/hip_buffer.py         ctypes device memory over libamdhip64
   core/hip_graph.py          ctypes HIP graph capture / instantiate / replay
@@ -98,8 +104,9 @@ flash_rt/amd/
   hardware/rdna35/           BF16 attention and GEMM providers
   models/<model>/pipeline.py pointer-only forward passes
   frontends/torch/<model>.py weight load, calibration, capture, infer
-  models/pi05_rdna35/        BF16 RDNA Pi0.5 pipeline
-  frontends/torch/pi05_rdna35.py
+  models/pi05_rdna/          shared BF16 RDNA compute binding
+  models/pi05_rdna3|rdna35|rdna4/  thin target bindings
+  frontends/torch/pi05_rdna*.py  shared lifecycle and thin target frontends
 ```
 
 The pybind entry points keep the same `uintptr_t` pointer + stream ABI as the
@@ -112,8 +119,8 @@ decoder-only frames that reuse the last encoded K/V prefix.
 ## Hardware routing
 
 Auto-detection uses the device's `gcnArchName`: gfx942 maps to `amd_cdna3`,
-gfx950 maps to `amd_cdna4`, and gfx1151 maps to `amd_rdna35`. An unregistered
-ROCm architecture raises rather than falling through to an NVIDIA table entry.
+gfx950 maps to `amd_cdna4`, gfx1100 to `amd_rdna3`, gfx1151 to `amd_rdna35`,
+and gfx1201 to `amd_rdna4`. An unregistered ROCm architecture raises rather than falling through to an NVIDIA table entry.
 
 ```python
 import flash_rt
@@ -138,7 +145,7 @@ Expected failures:
 |---|---|
 | Extension not built | `ImportError` naming `flash_rt_amd_kernels` and the build command |
 | CDNA build/device mismatch | `RuntimeError` naming the device and build architectures |
-| RDNA build/backend/wave size/device mismatch | `RuntimeError` naming the required gfx1151 RDNA source set |
+| RDNA build/backend/wave size/device mismatch | `RuntimeError` naming the required RDNA source set and gfx target |
 | Model/framework not ported to AMD | `RuntimeError` from pipeline resolution |
 | Thor-only options (`use_fp4_decoder`, `use_fa4`) | `ValueError` naming the supported hardware |
 
@@ -177,8 +184,8 @@ python -m pytest tests/test_amd_routing.py tests/test_amd_extension.py \
 | `test_amd_kernel_parity.py` | numerical parity of the kernel surface against torch references on real-distribution inputs, including FP8 byte-exactness and the seqused fixed-shape attention path | no ROCm device or extension |
 | `test_amd_pi05_model.py` | end-to-end model load, graph capture, pinned-noise determinism, exact/fixed prompt modes, FP8 and BF16 | no checkpoint (see the per-model guide for the environment variables) |
 | `test_amd_rdna35_routing.py` | gfx1151 routing, lazy imports, BF16/profile contracts, and CDNA/Triton isolation | torch unavailable; hardware-only cases require gfx1151 |
-| `test_amd_rdna35_ops.py` | RDNA native-kernel parity, validation, graph replay, and library fallbacks | no gfx1151 ROCm device or RDNA extension |
-| `test_amd_rdna35_model.py` | RDNA Pi0.5 finite output, determinism, full-graph parity, and optimized/fallback parity | no gfx1151 checkpoint |
+| `test_amd_rdna35_ops.py` | RDNA native-kernel parity, validation, graph replay, and library fallbacks | no supported RDNA ROCm device; missing extensions fail |
+| `test_amd_rdna35_model.py` | RDNA Pi0.5 finite output, determinism, full-graph parity, and optimized/fallback parity | no RDNA checkpoint |
 | `test_amd_groot_routing.py` | GROOT N1.7 pipeline-map entry, precision-tier contracts, attention-backend site/layer validation | extension-dependent cases skip without the `.so` |
 | `test_amd_groot_model.py` | GROOT N1.7 end-to-end: kernel backbone, finite actions, pinned-noise determinism, optional reference cosine | no checkpoint |
 

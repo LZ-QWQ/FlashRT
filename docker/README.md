@@ -194,3 +194,10 @@ it while building with `--build-context tokenizer_cache=/path/to/tokenizer-direc
 (the directory must contain `paligemma_tokenizer.model`).
 Only if the official URL is unavailable, add
 `--build-arg TOKENIZER_URL=https://modelscope.cn/models/AI-ModelScope/paligemma-3b-mix-448/resolve/master/tokenizer.model`.
+
+## AMD RDNA (ROCm 10.1)
+
+`Dockerfile.rocm10.1.0` uses the pinned Ubuntu 24.04 ROCm dev base and
+AMD PyTorch/Triton wheels. Build with `--build-arg GPU_ARCH=gfx1100`,
+`gfx1151` or `gfx1201`. See [the RDNA guide](../docs/deployment_amd_rdna.md)
+for build/run commands and checkpoint qualification.

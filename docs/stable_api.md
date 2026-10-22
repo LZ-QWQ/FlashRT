@@ -35,7 +35,7 @@ def load_model(
     decode_cuda_graph: bool = False,
     decode_graph_steps: int = 80,
     max_decode_steps: int = 256,
-    hardware: str = "auto",         # "auto" | "thor" | "rtx_sm120" | "rtx_sm89" | "rtx_sm87" | "amd_cdna4" | "amd_rdna35" | "apple_mps"
+    hardware: str = "auto",         # "auto" | "thor" | "rtx_sm120" | "rtx_sm89" | "rtx_sm87" | "amd_cdna4" | "amd_rdna3" | "amd_rdna35" | "amd_rdna4" | "apple_mps"
     # GROOT-specific:
     embodiment_tag: str | None = None,
     action_horizon: int | None = None,
@@ -138,6 +138,13 @@ Returns a `VLAModel` wrapping the appropriate frontend for the detected
   `calibrate` / `infer` with both `state_prompt_mode` graphs; the RL and
   CFG-batched extensions raise `NotImplementedError`. Build and usage:
   `docs/deployment_amd.md`.
+- `hardware="amd_rdna3"` (`gfx1100`), `"amd_rdna35"` (`gfx1151`) and
+  `"amd_rdna4"` (`gfx1201`) support Pi0.5 / torch / BF16. `hardware="auto"`
+  detects these exact targets. Use `use_fp8=False`, `precision="auto"` and
+  an explicit `action_dim` (or checkpoint `output_action_dim`). FP4, FP16,
+  FA4 and other model/framework routes raise. RDNA4 uses SDPA encoder
+  attention and hipBLASLt action projection; gfx11 WMMA is not built for it.
+  Build, input and validation contracts: [RDNA deployment](deployment_amd_rdna.md).
 - `hardware="apple_mps"` (auto-detected on Apple Silicon when MPS is
   available and CUDA/Ascend are unavailable) supports only `config="pi05"`,
   `framework="torch"`. Execution is BF16 eager with `precision="auto"` or
