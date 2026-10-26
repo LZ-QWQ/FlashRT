@@ -21,7 +21,7 @@ class RdnaCapabilities:
         return gemm(kernels, dtype), attention(kernels)
 
 
-RDNA3 = RdnaCapabilities("amd_rdna3", "gfx1100")
+RDNA3 = RdnaCapabilities("amd_rdna3", "gfx1100", streamed_smallm_max_rows=16)
 RDNA35 = RdnaCapabilities("amd_rdna35", "gfx1151")
 RDNA4 = RdnaCapabilities("amd_rdna4", "gfx1201", streamed_smallm_max_rows=16)
 _TARGETS = {target.gpu_arch: target for target in (RDNA3, RDNA35, RDNA4)}

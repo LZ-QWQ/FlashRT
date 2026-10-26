@@ -62,11 +62,16 @@ def test_frontend_hardware_matches_visible_isa(model):
     assert model.pipeline.hardware == _ARCH_TO_HARDWARE[_visible_rdna_arch()]
 
 
-def test_rdna4_routes_decoder_projections_to_smallm(model):
-    if _visible_rdna_arch() != "gfx1201":
-        pytest.skip("decoder small-M routing is gfx1201-only")
+def test_smallm_weight_preparation_matches_the_rdna_target(model):
     frontend = model.pipeline
     gemm = frontend.pipeline.gemm
+    prepare_decoder = (
+        _visible_rdna_arch() in ("gfx1100", "gfx1201")
+        and frontend.chunk_size <= 16 and gemm.hip_smallm
+    )
+    action_weight = frontend.weights["decoder_action_out_proj_w"]
+    assert (gemm._prepared_weight_nt(action_weight) is not None) == gemm.hip_smallm
+    expected_count = int(gemm.hip_smallm)
     for name in (
         "decoder_attn_qkv_w",
         "decoder_attn_o_w",
@@ -75,8 +80,11 @@ def test_rdna4_routes_decoder_projections_to_smallm(model):
     ):
         stacked = frontend.weights[name]
         for index in range(stacked.shape[0]):
-            assert gemm._prepared_weight_nt(stacked[index]) is not None, (
+            assert (gemm._prepared_weight_nt(stacked[index]) is not None) == prepare_decoder, (
                 name, index)
+            expected_count += int(prepare_decoder)
+    # In particular, Halo must retain only its original action projection.
+    assert len(gemm._smallm_weights) == expected_count
 
 
 def test_actions_are_finite_and_match_checkpoint_profile(model):
