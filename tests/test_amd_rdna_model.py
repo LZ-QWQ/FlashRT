@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 _ARCH_TO_HARDWARE = {
+    "gfx1100": "amd_rdna3",
     "gfx1151": "amd_rdna35",
     "gfx1201": "amd_rdna4",
 }
@@ -19,7 +20,8 @@ _LIBERO_PROMPT = "pick up the black bowl and place it on the plate"
 
 
 def _checkpoint():
-    path = os.environ.get("FLASH_RT_PI05_RDNA35_CKPT")
+    path = (os.environ.get("FLASH_RT_PI05_RDNA_CKPT")
+            or os.environ.get("FLASH_RT_PI05_RDNA35_CKPT"))
     if not path:
         pytest.skip("set FLASH_RT_PI05_RDNA35_CKPT for the RDNA E2E test")
     if not os.path.isfile(os.path.join(path, "model.safetensors")):
@@ -34,7 +36,7 @@ def _visible_rdna_arch():
     arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
     base = arch.split(":", 1)[0]
     if base not in _ARCH_TO_HARDWARE:
-        pytest.skip("requires gfx1151 or gfx1201")
+        pytest.skip("requires gfx1100, gfx1151 or gfx1201")
     return base
 
 

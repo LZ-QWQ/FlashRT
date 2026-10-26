@@ -1,9 +1,6 @@
-"""AMD RDNA 3.5 providers for the BF16 Pi0.5 backend."""
+"""gfx1151 bindings to the shared RDNA BF16 providers."""
 
-from .attention import Rdna35AttentionBackend
-from .gemm import Rdna35GemmBackend
+from ..rdna.attention import RdnaAttentionBackend as Rdna35AttentionBackend
+from ..rdna.gemm import RdnaGemmBackend as Rdna35GemmBackend
 
-__all__ = [
-    "Rdna35AttentionBackend",
-    "Rdna35GemmBackend",
-]
+__all__ = ["Rdna35AttentionBackend", "Rdna35GemmBackend"]

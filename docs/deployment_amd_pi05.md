@@ -473,7 +473,7 @@ part of the source distribution.
 semantics: vision layers, prefix encoding, decoder layers and denoising steps.
 It accepts tensor-operation, GEMM and attention providers. The RDNA module is
 only a constructor binding; it contains no model traversal. Native operation
-selection lives in `flash_rt.amd.hardware.rdna35.ops`, `gemm` and `attention`.
+selection lives in `flash_rt.amd.hardware.rdna.ops`, `gemm` and `attention`.
 The explicit portable torch provider runs the same model pipeline in CPU contract
 tests. It is a refactor regression tool, not an independent model oracle.
 Existing legacy RTX/Thor/CDNA production pipelines retain their routes; this
