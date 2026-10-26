@@ -235,7 +235,7 @@ selection; compare arms under the same affinity and data protocol.
 The shared BF16 Pi0.5 frontend supports W7900D (`gfx1100` / `amd_rdna3`),
 Radeon 8060S (`gfx1151` / `amd_rdna35`) and R9700 (`gfx1201` / `amd_rdna4`).
 
-The original RDNA 3.5 target is the integrated Radeon 8060S GPU in
+The RDNA 3.5 target is the integrated Radeon 8060S GPU in
 Ryzen AI Max+ 395 (the GPUs in AMD Ryzen™ AI Embedded X100 Series processors
 share the same RDNA 3.5 architecture). Its public hardware key is
 `amd_rdna35`; `gfx1151` is used only for build-time and runtime hardware
@@ -300,7 +300,7 @@ uses wave32, and targets gfx1151 before loading the checkpoint.
 ### RDNA container quick start
 
 Build the image for your target using
-[`docker/Dockerfile.rocm`](../docker/Dockerfile.rocm), as described in the
+[`docker/Dockerfile.rocm.rdna`](../docker/Dockerfile.rocm.rdna), as described in the
 [AMD build guide](deployment_amd.md#rdna-container). The same ROCm 10.1.0,
 PyTorch 2.14.0, torchvision and Triton environment supports all three RDNA
 targets; each image contains an extension for one exact ISA.
@@ -345,11 +345,8 @@ actions = model.predict(images=[base_image, wrist_image],
                         prompt="pick up the object", state=state_vector)
 ```
 
-Validated with the ROCm 10.1.0 Ubuntu 24.04 development environment,
-Python 3.13.13 and `torch==2.14.0+rocm10.1.0` from
-`https://stable.repo.amd.com/rocm/whl-next`. The same package environment
-was used for R9700. Existing gfx1151 environments remain supported; changing
-packages is separate from the code regression comparison.
+The [RDNA container](#rdna-container-quick-start) provides the ROCm 10.1.0 /
+PyTorch 2.14.0 build and runtime environment for this target.
 
 The target keeps hipBLASLt for general GEMMs and SDPA for vision attention.
 For `chunk_size <= 16`, the decoder QKV, output, merged gate/up and down
@@ -615,15 +612,13 @@ only a constructor binding; it contains no model traversal. Native operation
 selection lives in `flash_rt.amd.hardware.rdna.ops`, `gemm` and `attention`.
 `capabilities_rdna.py` validates the exact ISA and selects the `rdna3`, `rdna35`
 or `rdna4` providers at setup. The shared frontend is `frontends/torch/pi05_rdna.py`
-and its thin model binding is `models/pi05_rdna/pipeline.py`. Internal
-`pi05_rdna35` modules and the shared `Rdna35*` provider classes were renamed
-to RDNA names; `hardware.rdna35.{attention,gemm,ops}` remain import aliases.
-The public hardware keys, the extension `build_info()` labels and the
-existing `FLASHRT_RDNA35_*` controls retain their meanings.
+and its thin model binding is `models/pi05_rdna/pipeline.py`.
+For compatibility, `hardware.rdna35.{attention,gemm,ops}` re-export the shared
+providers under the `Rdna35*` class names. The public hardware keys,
+extension `build_info()` labels and `FLASHRT_RDNA35_*` controls remain supported.
 The explicit portable torch provider runs the same model pipeline in CPU contract
 tests. It is a refactor regression tool, not an independent model oracle.
-Existing legacy RTX/Thor/CDNA production pipelines retain their routes; this
-change does not claim to migrate all legacy implementations.
+RTX, Thor and CDNA use their own production pipelines.
 
 Safetensors conversion and prompt embedding are shared by the CDNA and RDNA
 frontends through `flash_rt.frontends.torch.pi05_checkpoint`. Importing them
@@ -663,4 +658,4 @@ FLASH_RT_PI05_REFERENCE="<openpi-fixture.npz>" \
   python -m pytest tests/test_amd_rdna_model.py -k independent_reference -q
 ```
 
-No independent fixture was executed as part of this source-only restructuring.
+A skipped reference test does not establish parity with OpenPI.

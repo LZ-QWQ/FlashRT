@@ -1,6 +1,7 @@
-# FlashRT RDNA source build, linux/amd64. Build from the repository root:
-#   docker build -f docker/Dockerfile.rocm --build-arg GPU_ARCH=gfx1100 -t flashrt:rocm-gfx1100 .
+# FlashRT Pi0.5 BF16 on RDNA, linux/amd64. Build from the repository root:
+#   docker build -f docker/Dockerfile.rocm.rdna --build-arg GPU_ARCH=gfx1100 -t flashrt:rocm-gfx1100 .
 # Use gfx1151 for Strix Halo or gfx1201 for R9700. No GPU is needed to build.
+# Use --target environment for the shared development environment.
 FROM rocm/dev-ubuntu-24.04:10.1.0-full@sha256:5ed1362ea542a928651e4c710b44024ebe98870f74159cb70f0265aec8ef0abe AS environment
 
 RUN apt-get update \
@@ -9,6 +10,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 ENV UV_PYTHON_INSTALL_DIR=/opt/python
+# The AMD wheels below use Python 3.13; keep them in a dedicated environment.
 RUN python3 -m venv /opt/uv \
     && /opt/uv/bin/python -m pip install --no-cache-dir "uv==0.13.0" \
     && /opt/uv/bin/uv python install 3.13.13 \
@@ -35,9 +37,7 @@ RUN python -m pip install --no-cache-dir \
       --index-url https://stable.repo.amd.com/rocm/whl-next \
       "torchvision[device-all]==0.29.0a0+rocm10.1.0" \
     && python -m pip check \
-    && python -c "import sys, importlib.metadata as m, torch, torchvision, triton; assert sys.version_info[:3] == (3, 13, 13); assert torch.__version__ == '2.14.0+rocm10.1.0'; assert torch.version.hip and torch.version.cuda is None; assert m.version('torchvision') == '0.29.0a0+rocm10.1.0'; assert m.version('triton') == '3.8.0+git669b31ac.rocm10.1.0'" \
-    && mkdir -p /opt/flashrt-environment \
-    && python -m pip freeze > /opt/flashrt-environment/requirements.freeze.txt
+    && python -c "import torch, torchvision, triton"
 
 WORKDIR /workspace/FlashRT
 CMD ["bash"]
@@ -49,8 +49,7 @@ COPY . .
 RUN case "${GPU_ARCH}" in gfx1100|gfx1151|gfx1201) ;; \
       *) echo "GPU_ARCH must be gfx1100, gfx1151 or gfx1201" >&2; exit 2 ;; esac \
     && python -m pip install --no-cache-dir --no-deps --no-build-isolation -e . \
-    && SLURM_CPUS_PER_TASK="${BUILD_JOBS}" bash scripts/amd/build_amd.sh "${GPU_ARCH}" \
-    && python -m pip check
+    && SLURM_CPUS_PER_TASK="${BUILD_JOBS}" bash scripts/amd/build_amd.sh "${GPU_ARCH}"
 
 ARG SOURCE_REVISION=unknown
 LABEL org.opencontainers.image.title="FlashRT ROCm RDNA" \

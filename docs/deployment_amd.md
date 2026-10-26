@@ -43,8 +43,8 @@ build time and frontend initialization:
   `build_info()` reports the RDNA source set and wave32, with `gpu_arch`
   matching the PyTorch device and extension device (`gfx1100` for `amd_rdna3`,
   `gfx1151` for `amd_rdna35`, `gfx1201` for `amd_rdna4`). Required native
-  entry points are checked before loading weights. The historical source-set
-  label `build_info()["backend"] == "rdna35"` is retained for all three targets.
+  entry points are checked before loading weights. For compatibility,
+  `build_info()["backend"]` reports `"rdna35"` for all three targets.
   A CDNA extension cannot be loaded through the RDNA route, or vice versa.
 
 ## Build
@@ -92,16 +92,16 @@ Dependencies:
 
 ### RDNA container
 
-[`docker/Dockerfile.rocm`](../docker/Dockerfile.rocm) provides a shared
+[`docker/Dockerfile.rocm.rdna`](../docker/Dockerfile.rocm.rdna) provides a shared
 Ubuntu 24.04 / ROCm 10.1.0 environment with Python 3.13.13, AMD PyTorch
-2.14.0, matching torchvision and Triton. It follows the ROCm development
-image approach in [FreeToken PR #535](https://github.com/FlashML-org/FreeToken/pull/535),
-with FlashRT's build and model dependencies. CUDA images are unchanged.
+2.14.0, matching torchvision and Triton. It includes the dependencies for
+building, testing and running Pi0.5 BF16 on gfx1100, gfx1151 and gfx1201.
+For CDNA setup, follow the instructions above.
 
 Build from the repository root, choosing exactly one RDNA target:
 
 ```bash
-docker build -f docker/Dockerfile.rocm \
+docker build -f docker/Dockerfile.rocm.rdna \
   --build-arg GPU_ARCH=gfx1100 --build-arg BUILD_JOBS=8 \
   --build-arg SOURCE_REVISION="$(git rev-parse HEAD)" \
   -t flashrt:rocm-gfx1100 .
@@ -110,8 +110,8 @@ docker build -f docker/Dockerfile.rocm \
 Use `gfx1151` for Strix Halo or `gfx1201` for R9700 and adjust the tag.
 The standalone AMD extension is built and import-checked without requiring
 a GPU during the image build. The `environment` stage can also be built
-with `--target environment` for development. Installed Python versions are
-recorded in `/opt/flashrt-environment/requirements.freeze.txt`.
+with `--target environment` for development. Dependencies are checked once
+after installation; the existing AMD build script checks the compiled extension.
 For GPU access, model mounts and a Pi0.5 smoke test, see the
 [RDNA container instructions](deployment_amd_pi05.md#rdna-container-quick-start).
 
