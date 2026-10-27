@@ -1,4 +1,4 @@
-"""Parity checks for the correctness-first RDNA 3.5 providers."""
+"""Parity checks for the shared RDNA wave32 providers."""
 
 from __future__ import annotations
 
@@ -666,8 +666,9 @@ def test_encoder_backend_keeps_dense_extended_shape_on_sdpa(monkeypatch):
     ("rows", "valid_prefix", "expected"),
     [(661, 661, "sdpa"), (712, 661, "native")],
 )
-def test_gfx12_encoder_keeps_dense_prefix_on_sdpa(
-    monkeypatch, rows, valid_prefix, expected,
+@pytest.mark.parametrize("arch", ["gfx1100", "gfx1201"])
+def test_discrete_rdna_encoder_keeps_dense_prefix_on_sdpa(
+    monkeypatch, rows, valid_prefix, expected, arch,
 ):
     torch, _kernels = _require_rdna35_hip()
     import torch.nn.functional as F
@@ -675,10 +676,10 @@ def test_gfx12_encoder_keeps_dense_prefix_on_sdpa(
 
     launched = []
 
-    class Gfx12Kernels:
+    class TargetKernels:
         @staticmethod
         def build_info():
-            return {"gpu_arch": "gfx1201"}
+            return {"gpu_arch": arch}
 
         @staticmethod
         def attention_encoder_gqa_rdna(*_args):
@@ -693,7 +694,10 @@ def test_gfx12_encoder_keeps_dense_prefix_on_sdpa(
     query = torch.zeros(rows, 8, 256, device="cuda", dtype=torch.bfloat16)
     key = torch.zeros(rows, 1, 256, device="cuda", dtype=torch.bfloat16)
 
-    Rdna35AttentionBackend(Gfx12Kernels()).gqa(
+    from flash_rt.amd.hardware.rdna3 import Rdna3AttentionBackend
+
+    backend = Rdna3AttentionBackend if arch == "gfx1100" else Rdna35AttentionBackend
+    backend(TargetKernels()).gqa(
         query, key, torch.zeros_like(key),
         valid_prefix=valid_prefix, prefix_capacity=rows)
     assert launched == [expected]
@@ -1025,4 +1029,44 @@ def test_gemm_backend_fuses_prepared_action_residual(monkeypatch, rows):
 
     projected = torch.addmm(bias, x, weight).to(torch.bfloat16)
     reference = (residual.float() + projected.float()).to(torch.bfloat16)
+    torch.testing.assert_close(output, reference, atol=7e-2, rtol=3e-2)
+
+
+@pytest.mark.parametrize("rows", [1, 10, 16, 17, 48])
+@pytest.mark.parametrize("inner,columns", [(1024, 2560), (2048, 1024), (1024, 8192), (4096, 1024)])
+def test_decoder_projection_shapes_preserve_bf16_residual_rounding(rows, inner, columns):
+    torch, kernels = _require_rdna35_hip()
+    generator = torch.Generator(device="cuda").manual_seed(rows + inner + columns)
+    x = torch.randn(rows, inner, device="cuda", dtype=torch.bfloat16, generator=generator)
+    weight_nt = torch.randn(columns, inner, device="cuda", dtype=torch.bfloat16, generator=generator)
+    bias = torch.randn(columns, device="cuda", dtype=torch.bfloat16, generator=generator)
+    projection = torch.empty(rows, columns, device="cuda", dtype=torch.bfloat16)
+    residual = torch.randn(rows, columns, device="cuda", dtype=torch.bfloat16, generator=generator)
+    output = residual.clone()
+
+    kernels.smallm_gemm(projection, x, weight_nt, bias)
+    reference = (x.float() @ weight_nt.float().t() + bias.float()).bfloat16()
+    torch.testing.assert_close(projection, reference, atol=7e-2, rtol=3e-2)
+    kernels.smallm_gemm(output, x, weight_nt, bias, accumulate=True)
+    torch.testing.assert_close(output, projection + residual, atol=0, rtol=0)
+
+
+def test_streamed_projection_replays_updated_inputs():
+    torch, kernels = _require_rdna35_hip()
+    x = torch.randn(10, 1024, device="cuda", dtype=torch.bfloat16)
+    weight_nt = torch.randn(2560, 1024, device="cuda", dtype=torch.bfloat16)
+    output = torch.empty(10, 2560, device="cuda", dtype=torch.bfloat16)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        kernels.smallm_gemm(output, x, weight_nt)
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        kernels.smallm_gemm(output, x, weight_nt)
+    x.normal_()
+    graph.replay()
+    torch.cuda.synchronize()
+    reference = (x.float() @ weight_nt.float().t()).bfloat16()
     torch.testing.assert_close(output, reference, atol=7e-2, rtol=3e-2)

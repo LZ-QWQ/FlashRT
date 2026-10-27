@@ -36,8 +36,8 @@ from flash_rt.amd.models.pi05_rdna.pipeline import (
 from flash_rt.core.utils.actions import unnormalize_actions
 from flash_rt.core.utils.norm_stats import load_norm_stats, pi05_candidates
 
-# Per-layer decoder projections routed to small-M WMMA on gfx1201.
-_RDNA4_SMALLM_DECODER_WEIGHTS = (
+# Per-layer decoder projections for targets that enable streamed small-M.
+_SMALLM_DECODER_WEIGHTS = (
     "decoder_attn_qkv_w",
     "decoder_attn_o_w",
     "decoder_ffn_gate_up_w",
@@ -194,10 +194,9 @@ class Pi05TorchFrontendAmdRdna:
         gemm.prepare_smallm_weight(
             self.weights["decoder_action_out_proj_w"])
         if self.chunk_size <= caps.streamed_smallm_max_rows:
-            # On R9700 the streamed small-M kernel beats hipBLASLt on these
-            # weight-bandwidth-bound projections. The transposed copies add
-            # about 0.6 GB.
-            for name in _RDNA4_SMALLM_DECODER_WEIGHTS:
+            # Prepare persistent transposes for streamed decoder projections
+            # before graph capture.
+            for name in _SMALLM_DECODER_WEIGHTS:
                 for layer_weight in self.weights[name]:
                     gemm.prepare_smallm_weight(layer_weight)
         self.pipeline = Pi05PipelineRdna(

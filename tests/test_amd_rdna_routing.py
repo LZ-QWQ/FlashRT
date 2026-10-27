@@ -1,4 +1,4 @@
-"""Routing and fail-closed contracts for the AMD RDNA 3.5 backend."""
+"""Routing and fail-closed contracts for the AMD RDNA wave32 targets."""
 
 from __future__ import annotations
 
@@ -382,5 +382,5 @@ def test_rdna_target_rejects_unregistered_isa(arch):
 def test_streamed_smallm_policy_stays_on_validated_target():
     from flash_rt.amd.hardware.capabilities_rdna import RDNA3, RDNA35, RDNA4
 
-    assert RDNA3.streamed_smallm_max_rows == RDNA35.streamed_smallm_max_rows == 0
-    assert RDNA4.streamed_smallm_max_rows == 16
+    assert RDNA35.streamed_smallm_max_rows == 0
+    assert RDNA3.streamed_smallm_max_rows == RDNA4.streamed_smallm_max_rows == 16
