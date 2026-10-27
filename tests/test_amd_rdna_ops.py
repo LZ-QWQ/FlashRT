@@ -102,7 +102,7 @@ class _Rdna35TestKernels:
             x.shape[1], self._stream(x))
 
 
-_WAVE32_ARCHS = frozenset({"gfx1151", "gfx1201"})
+_WAVE32_ARCHS = frozenset({"gfx1100", "gfx1151", "gfx1201"})
 
 
 def _require_wave32_device():
@@ -113,21 +113,18 @@ def _require_wave32_device():
         pytest.skip("requires a visible ROCm device")
     arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
     if arch.split(":", 1)[0] not in _WAVE32_ARCHS:
-        pytest.skip("requires gfx1151 or gfx1201")
+        pytest.skip("requires gfx1100, gfx1151 or gfx1201")
     return torch
 
 
 def _require_rdna35_hip():
     torch = _require_wave32_device()
-    try:
-        from flash_rt.amd import flash_rt_amd_kernels as fvk
+    from flash_rt.amd import flash_rt_amd_kernels as fvk
+    from flash_rt.amd.hardware.capabilities_rdna import load_capabilities
 
-        info = dict(fvk.build_info())
-        if info.get("backend") != "rdna35" or info.get("wave_size") != 32:
-            raise RuntimeError("extension is not an RDNA 3.5 build")
-        kernels = _Rdna35TestKernels(fvk, torch)
-    except (ImportError, RuntimeError) as exc:
-        pytest.skip(f"RDNA 3.5 HIP extension is not available: {exc}")
+    arch = torch.cuda.get_device_properties(0).gcnArchName
+    load_capabilities(fvk, arch)
+    kernels = _Rdna35TestKernels(fvk, torch)
     return torch, kernels
 
 

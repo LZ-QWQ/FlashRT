@@ -1,5 +1,5 @@
 // ================================================================
-// FlashRT AMD -- fused BF16 decoder GQA (RDNA 3.5, wave32)
+// FlashRT AMD -- fused BF16 decoder GQA (RDNA, wave32)
 // Portions of the split-key online-softmax variant are adapted from Comfy
 // Kitchen's Apache-2.0 HIP flash-decode implementation.
 //

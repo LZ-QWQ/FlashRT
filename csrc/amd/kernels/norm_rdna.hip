@@ -1,5 +1,5 @@
 // ================================================================
-// FlashRT AMD -- BF16 normalization kernels (RDNA 3.5, wave32)
+// FlashRT AMD -- BF16 normalization kernels (RDNA, wave32)
 //
 // Covers the normalization surface used by the RDNA Pi0.5 pipeline:
 //   LayerNorm, RMSNorm, AdaRMSNorm, residual+RMSNorm, and
