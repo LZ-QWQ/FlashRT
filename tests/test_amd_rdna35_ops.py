@@ -477,6 +477,57 @@ def test_hip_decoder_gqa_matches_sdpa(
     torch.testing.assert_close(output, reference, atol=3e-2, rtol=3e-2)
 
 
+def test_row_owned_decoder_is_repeatable_with_padded_kv():
+    torch, kernels = _require_rdna35_hip()
+    generator = torch.Generator(device="cuda").manual_seed(1277)
+    query = torch.randn(15, 8, 256, generator=generator, device="cuda",
+                        dtype=torch.bfloat16)
+    key = torch.randn(727, 1, 256, generator=generator, device="cuda",
+                      dtype=torch.bfloat16)
+    value = torch.randn(727, 1, 256, generator=generator, device="cuda",
+                        dtype=torch.bfloat16)
+    scores = query.float().transpose(0, 1) @ key[:, 0].float().T / 16
+    scores[:, :, 527:712] = float("-inf")
+    reference = (scores.softmax(dim=-1) @ value[:, 0].float()).transpose(0, 1)
+    reference = reference.reshape(15, 2048).to(torch.bfloat16)
+
+    # Uneven masked work exposed reuse of reduction scratch before all waves
+    # had read it. Repeated launches must agree, including the first launch.
+    outputs = torch.empty(256, 15, 2048, device="cuda", dtype=torch.bfloat16)
+    for output in outputs:
+        kernels.decoder_gqa(output, query, key, value, 527, 712, split_key=False)
+    torch.testing.assert_close(
+        outputs, reference.expand_as(outputs), atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(
+        outputs, outputs[:1].expand_as(outputs), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("width", [1000, 1024, 2048, 4096])
+def test_generic_layer_norm_is_repeatable(width):
+    torch, kernels = _require_rdna35_hip()
+    import torch.nn.functional as F
+
+    generator = torch.Generator(device="cuda").manual_seed(width)
+    x = torch.randn(512, width, generator=generator, device="cuda",
+                    dtype=torch.bfloat16) * 3 + 1
+    weight = torch.randn(width, generator=generator, device="cuda",
+                         dtype=torch.bfloat16)
+    bias = torch.randn(width, generator=generator, device="cuda",
+                       dtype=torch.bfloat16)
+    reference = F.layer_norm(
+        x.float(), (width,), weight.float(), bias.float()).to(torch.bfloat16)
+
+    # Widths other than 1152 use the generic kernel, whose variance reduction
+    # must not overwrite mean scratch that another wave has not read yet.
+    outputs = torch.empty(64, 512, width, device="cuda", dtype=torch.bfloat16)
+    for output in outputs:
+        kernels.layer_norm(output, x, weight, bias, 1e-6)
+    torch.testing.assert_close(
+        outputs, reference.expand_as(outputs), atol=8e-3, rtol=3e-2)
+    torch.testing.assert_close(
+        outputs, outputs[:1].expand_as(outputs), atol=0, rtol=0)
+
+
 @pytest.mark.parametrize(
     "rows,valid_kv_rows,query_heads",
     [
