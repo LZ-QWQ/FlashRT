@@ -94,7 +94,7 @@ Dependencies:
 ### RDNA container
 
 [`docker/Dockerfile.rocm.rdna`](../docker/Dockerfile.rocm.rdna) provides a shared
-Ubuntu 24.04 / ROCm 10.1.0 environment with Python 3.13.13, AMD PyTorch
+Ubuntu 24.04 / ROCm 10.1.0 environment with Ubuntu's Python 3.12, AMD PyTorch
 2.14.0, matching torchvision and Triton. It includes the dependencies for
 building, testing and running Pi0.5 BF16 on gfx1100, gfx1151 and gfx1201.
 For CDNA setup, follow the instructions above.
