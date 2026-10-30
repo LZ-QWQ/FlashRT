@@ -416,6 +416,27 @@ class GrootN17TorchFrontendOrin(GrootN17TorchFrontendRtxFP16):
         self._cfg = cfg
         return cfg
 
+    def set_hf_processor(self, processor) -> None:
+        """Inject an offline official processor for preparation and decoding."""
+        processor.eval()
+        self._hf_proc_cached = processor
+        self._prepared_metadata = None
+
+    def prepare_observation(self, observation):
+        """Prepare the same raw observation bundle used by the RDNA frontend.
+
+        This optional helper performs official processor transforms only.
+        Existing set_prompt/aux/frames and GPU image processing are unchanged.
+        """
+        from flash_rt.models.groot_n17.observation import prepare_observation
+
+        state, aux = prepare_observation(
+            self._hf_processor(), observation, self.embodiment_tag,
+            num_views=self.num_views, metadata=getattr(self, "_prepared_metadata", None))
+        self._prepared_metadata = {k: v.clone() for k, v in aux.items()
+                                   if k not in ("pixel_values", "attention_mask")}
+        return state, aux
+
     def _read_processor_geometry(self) -> dict:
         """The image-transform parameters this checkpoint actually ships.
 
