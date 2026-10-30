@@ -10,15 +10,16 @@ import torch
 class Rdna35GemmBackend:
     """Run BF16 GEMMs through an instance-local hipBLASLt algorithm cache."""
 
-    def __init__(self, kernels, dtype: torch.dtype = torch.bfloat16):
+    def __init__(self, kernels, dtype: torch.dtype = torch.bfloat16, *, autotune=None):
         if dtype is not torch.bfloat16:
             raise TypeError(f"RDNA 3.5 GEMM supports BF16 only, got {dtype}")
         self.dtype = dtype
         self.fvk = kernels
         self._runner = kernels.RdnaGemmRunner()
-        self.autotune = (
-            os.getenv("FLASHRT_RDNA35_GEMM_AUTOTUNE", "1") == "1"
-        )
+        # Targets may require a fixed heuristic for numerical reproducibility.
+        # Existing callers retain the environment-controlled tuning policy.
+        self.autotune = (os.getenv("FLASHRT_RDNA35_GEMM_AUTOTUNE", "1") == "1"
+                         if autotune is None else autotune)
         if self.autotune:
             try:
                 pool = int(os.getenv("FLASHRT_RDNA35_GEMM_ALGOS", "16"))
